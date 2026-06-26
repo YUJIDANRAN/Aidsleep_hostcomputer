@@ -1,0 +1,27 @@
+文件: C:\Users\liudi\Desktop\Host_computer_6\Host_computer_6\Host_computer_6\Result\eeg_20260626_153505\eeg_raw.csv
+样本数: 29994  |  采样率: 499.9 Hz  |  时长: 60.00 s
+带通滤波: 0.5-40.0 Hz (零相位 sosfiltfilt)
+
+节律       频段(Hz)                   绝对功率        相对功率(%)
+------------------------------------------------------
+δ          0.5-4.0     1.483491e+02          42.06
+θ          4.0-8.0     5.477293e+01          15.53
+α          8.0-13.0    4.046079e+01          11.47
+β         13.0-30.0    9.063288e+01          25.70
+gamma     30.0-40.0    1.846494e+01           5.24
+------------------------------------------------------
+合计       0.5-40.0         3.526806e+02         100.00
+图片已保存: C:\Users\liudi\Desktop\Host_computer_6\Host_computer_6\Host_computer_6\Result\eeg_20260626_153505\eeg_raw_band_power.png
+波形图已保存: C:\Users\liudi\Desktop\Host_computer_6\Host_computer_6\Host_computer_6\Result\eeg_20260626_153505\eeg_raw_band_waveform.png
+FFT 图已保存: C:\Users\liudi\Desktop\Host_computer_6\Host_computer_6\Host_computer_6\Result\eeg_20260626_153505\eeg_raw_fft.png
+
+时间段 A: 20–30 s  |  时间段 B: 50–60 s
+功率比 = B / A（段2 / 段1）
+节律                A绝对          B绝对        绝对比       A相对%       B相对%        相对比
+------------------------------------------------------------------------------
+δ          1.3476e+02   1.2855e+02      0.954      43.53      38.01      0.873
+θ          3.6914e+01   5.1324e+01      1.390      11.92      15.17      1.273
+α          4.1920e+01   3.9428e+01      0.941      13.54      11.66      0.861
+β          7.9576e+01   9.9054e+01      1.245      25.70      29.29      1.139
+gamma      1.6404e+01   1.9862e+01      1.211       5.30       5.87      1.108
+段间对比图已保存: C:\Users\liudi\Desktop\Host_computer_6\Host_computer_6\Host_computer_6\Result\eeg_20260626_153505\eeg_raw_segment_compare.png
