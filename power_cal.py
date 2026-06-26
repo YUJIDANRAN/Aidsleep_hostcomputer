@@ -207,6 +207,25 @@ def read_eeg_column(xlsx_path: str | Path, column: int = 0) -> np.ndarray:
     return values
 
 
+def read_eeg_signal(data_path: str | Path, column: int = 0) -> np.ndarray:
+    """读取 xlsx 或 csv 中的 EEG 原始序列（csv 优先 ch1_raw 列）。"""
+    path = Path(data_path)
+    if path.suffix.lower() in {".csv", ".txt"}:
+        frame = pd.read_csv(path)
+        if "ch1_raw" in frame.columns:
+            series = frame["ch1_raw"]
+        else:
+            series = frame.iloc[:, column]
+        values = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=np.float64)
+    else:
+        values = read_eeg_column(path, column=column)
+    if values.size < int(DEFAULT_SAMPLE_RATE):
+        raise ValueError(
+            f"有效样本过少 ({values.size})，请检查 {path.name} 是否包含 EEG 数据"
+        )
+    return values
+
+
 def bandpass_filter(
     signal: np.ndarray,
     sample_rate: float,
@@ -749,7 +768,7 @@ def run_analysis(
     if not path.is_file():
         raise FileNotFoundError(f"找不到文件: {path.resolve()}")
 
-    raw = read_eeg_column(path)
+    raw = read_eeg_signal(path)
     analysis = compute_band_powers(raw, sample_rate=sample_rate)
     result = analysis.result
     duration = len(raw) / sample_rate

@@ -2,12 +2,16 @@
 
 from __future__ import annotations  ## 前向引用类型
 
+import csv  ## 定时测试 EEG raw 导出
+import io  ## 捕获 power_cal 分析输出
 import os  ## 环境变量读串口
 import sys  ## 路径与退出
 import time  ## 状态栏刷新节流
+from contextlib import redirect_stdout
 from collections import deque  ## 波形点缓冲
+from datetime import datetime  ## CSV 文件名时间戳
 from pathlib import Path  ## 项目根路径
-from typing import Deque, Dict, Iterable, Optional  ## 类型标注
+from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
 
@@ -25,6 +29,7 @@ from power_cal import (  ## 节律滤波与频段定义
     DEFAULT_SAMPLE_RATE,
     EEG_BANDS,
     RhythmStreamProcessor,
+    run_analysis,
 )
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
@@ -70,6 +75,12 @@ AUDIO_DEFAULT_RIGHT_FREQ_HZ = "10"
 AUDIO_DEFAULT_DURATION_SEC = "5"
 AUDIO_DEFAULT_LEFT_PHASE_DEG = "0"
 AUDIO_DEFAULT_RIGHT_PHASE_DEG = "90"
+DEFAULT_EEG_CSV_DIR = _ROOT / "Result"  ## timeEdit 定时测试默认 CSV 目录
+TEST_WARMUP_SEC = 10.0  ## 有定时测试时，开始后前 10 s 不保存数据
+DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)，对应 compare_segments[0][0]
+DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
+DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
+DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
 RAW_DISPLAY_RATE = 100  ## 波形显示约 100 点/秒
 RAW_DECIM_FACTOR = max(1, int(MCU_SAMPLE_RATE / RAW_DISPLAY_RATE))  ## 500→100 降采样比
 RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
@@ -746,7 +757,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             on_stopped=self._audio_stopped.emit,
         )
         self._setup_audio_ui_defaults()
+        self._setup_timed_test_ui()
+        self._setup_compare_segments_ui()
         self._running = False  ## 默认不采集
+        self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
+        self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
+        self._eeg_raw_record: List[int] = []  ## 定时测试期间记录的 CH1 raw
         self._sample_count = 0  ## EEG 已处理样本数
         self._osc_sample_count = 0  ## 振子已处理样本数
         self._no_data_ticks = 0  ## EEG 无数据 poll 计数
@@ -838,6 +854,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._osc_proc.reset()
             self._osc_decim_counter = 0
             self._osc_waveform.clear()
+        if self._running:
+            self._begin_timed_test_if_configured()
         self._refresh_capture_button()
         if self._running:
             self._log("默认 raw 模式，已自动开始采集")
@@ -852,6 +870,262 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_waveform.raise_()
         self._waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
+
+    def _setup_timed_test_ui(self) -> None:
+        """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时、lineEdit_3 保存路径。"""
+        self.ui.timeEdit.setDisplayFormat("HH:mm:ss")
+        self.ui.timeEdit.setTime(QtCore.QTime(0, 0, 0))
+        self.ui.lineEdit_13.setPlaceholderText("秒(优先)")
+        self.ui.lcdNumber.setDigitCount(6)
+        self.ui.lcdNumber.display(0)
+        if not self.ui.lineEdit_3.text().strip():
+            self.ui.lineEdit_3.setPlaceholderText("留空→Result/时间戳文件夹/")
+
+    def _setup_compare_segments_ui(self) -> None:
+        """lineEdit/lineEdit_2=段A起止，lineEdit_11/lineEdit_12=段B起止（秒）。"""
+        defaults = (
+            (self.ui.lineEdit, DEFAULT_SEGMENT_A_START, "A起"),
+            (self.ui.lineEdit_2, DEFAULT_SEGMENT_A_END, "A止"),
+            (self.ui.lineEdit_11, DEFAULT_SEGMENT_B_START, "B起"),
+            (self.ui.lineEdit_12, DEFAULT_SEGMENT_B_END, "B止"),
+        )
+        for edit, value, hint in defaults:
+            if not edit.text().strip():
+                edit.setText(value)
+            edit.setPlaceholderText(hint)
+
+    def _read_compare_segments_from_ui(
+        self,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """读取四段输入，对应 power_cal.compare_segments = ((A起,A止), (B起,B止))。"""
+        edits = (
+            self.ui.lineEdit,
+            self.ui.lineEdit_2,
+            self.ui.lineEdit_11,
+            self.ui.lineEdit_12,
+        )
+        texts = [edit.text().strip() for edit in edits]
+        if not all(texts):
+            return None
+        try:
+            a_start, a_end, b_start, b_end = (float(text) for text in texts)
+        except ValueError:
+            return None
+        if a_start >= a_end or b_start >= b_end:
+            return None
+        return ((a_start, a_end), (b_start, b_end))
+
+    def _run_post_test_power_analysis(self, csv_path: Path, sample_rate: float) -> None:
+        """测试结束后自动运行 power_cal.run_analysis（段间功率对比等）。"""
+        compare_segments = self._read_compare_segments_from_ui()
+        if compare_segments is None:
+            self._log("段间对比时间未填全或无效，跳过 power_cal 分析")
+            return
+        range_a, range_b = compare_segments
+        self._log(
+            f"开始 power_cal 分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
+            f"段B {range_b[0]:g}–{range_b[1]:g}s"
+        )
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                run_analysis(
+                    csv_path,
+                    sample_rate,
+                    show_plot=False,
+                    save_plot=True,
+                    show_waveform=False,
+                    save_waveform=True,
+                    waveform_seconds=None,
+                    waveform_time_range=None,
+                    show_fft=False,
+                    save_fft=True,
+                    fft_time_range=None,
+                    compare_segments=compare_segments,
+                    show_segment_compare=False,
+                    save_segment_compare=True,
+                )
+            report = buffer.getvalue().strip()
+            if report:
+                for line in report.splitlines():
+                    self._log(line)
+                report_path = csv_path.parent / "eeg_analysis_report.txt"
+                report_path.write_text(report + "\n", encoding="utf-8")
+                self._log(f"分析报告已保存: {report_path}")
+            self._log(f"分析图表已保存至: {csv_path.parent}")
+        except Exception as exc:
+            self._log(f"power_cal 分析失败: {exc}")
+
+    def _finalize_timed_test(self) -> None:
+        """保存 EEG raw CSV 并自动运行段间功率分析。"""
+        saved = self._save_eeg_raw_csv()
+        self._reset_timed_test_state()
+        if saved is not None:
+            csv_path, sample_rate = saved
+            self._run_post_test_power_analysis(csv_path, sample_rate)
+
+    def _read_time_edit_duration_sec(self) -> Optional[float]:
+        """读取 timeEdit；00:00:00 表示未设置。"""
+        t = self.ui.timeEdit.time()
+        total = t.hour() * 3600 + t.minute() * 60 + t.second()
+        if total <= 0:
+            return None
+        return float(total)
+
+    @staticmethod
+    def _parse_seconds_text(text: str) -> Optional[float]:
+        raw = text.strip()
+        if not raw:
+            return None
+        try:
+            seconds = float(raw)
+        except ValueError:
+            return None
+        if seconds <= 0:
+            return None
+        return seconds
+
+    def _read_test_duration_sec(self) -> Optional[float]:
+        """读取测试记录时长：lineEdit_13(秒) 与 timeEdit 均有值时以 lineEdit_13 为准。"""
+        line13_sec = self._parse_seconds_text(self.ui.lineEdit_13.text())
+        time_edit_sec = self._read_time_edit_duration_sec()
+        if line13_sec is not None and time_edit_sec is not None:
+            return line13_sec
+        if line13_sec is not None:
+            return line13_sec
+        return time_edit_sec
+
+    def _is_test_recording_phase(self) -> bool:
+        """预热结束且仍在定时测试窗口内。"""
+        if (
+            self._test_duration_sec is None
+            or self._test_started_at is None
+            or not self._running
+        ):
+            return False
+        elapsed = time.monotonic() - self._test_started_at
+        return TEST_WARMUP_SEC <= elapsed < TEST_WARMUP_SEC + self._test_duration_sec
+
+    def _test_total_elapsed_sec(self) -> float:
+        if self._test_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._test_started_at)
+
+    def _format_duration_hms(self, duration: float) -> str:
+        total = int(duration)
+        return (
+            f"{total // 3600:02d}:"
+            f"{(total % 3600) // 60:02d}:"
+            f"{total % 60:02d}"
+        )
+
+    def _begin_timed_test_if_configured(self) -> None:
+        """启动采集时：若设置了时长，则 10 s 预热后再计时并保存 EEG raw。"""
+        duration = self._read_test_duration_sec()
+        self._test_duration_sec = duration
+        self._test_started_at = time.monotonic() if duration is not None else None
+        self._eeg_raw_record.clear()
+        if duration is None:
+            self.ui.lcdNumber.display(0)
+            return
+        self._update_test_countdown_lcd()
+        self._log(
+            f"定时测试: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
+            f"之后记录 {self._format_duration_hms(duration)}，"
+            f"到时自动停止并保存 EEG raw CSV"
+        )
+
+    def _reset_timed_test_state(self) -> None:
+        self._test_duration_sec = None
+        self._test_started_at = None
+        self._eeg_raw_record.clear()
+        self.ui.lcdNumber.display(0)
+
+    def _update_test_countdown_lcd(self) -> None:
+        if self._test_duration_sec is None or self._test_started_at is None:
+            self.ui.lcdNumber.display(0)
+            return
+        elapsed = self._test_total_elapsed_sec()
+        if elapsed < TEST_WARMUP_SEC:
+            warmup_left = int(TEST_WARMUP_SEC - elapsed + 0.999)
+            self.ui.lcdNumber.display(warmup_left)
+            return
+        recording_elapsed = elapsed - TEST_WARMUP_SEC
+        remaining = max(0.0, self._test_duration_sec - recording_elapsed)
+        secs = int(remaining + 0.999)
+        hh = secs // 3600
+        mm = (secs % 3600) // 60
+        ss = secs % 60
+        self.ui.lcdNumber.display(hh * 10000 + mm * 100 + ss)
+
+    def _is_timed_test_finished(self) -> bool:
+        if self._test_duration_sec is None or self._test_started_at is None:
+            return False
+        return self._test_total_elapsed_sec() >= TEST_WARMUP_SEC + self._test_duration_sec
+
+    def _resolve_eeg_csv_path(self) -> Path:
+        """每次在目录下新建时间戳子文件夹，再写入 CSV。"""
+        raw = self.ui.lineEdit_3.text().strip()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir_name = f"eeg_{stamp}"
+        csv_name = "eeg_raw.csv"
+
+        if not raw:
+            session_dir = DEFAULT_EEG_CSV_DIR / session_dir_name
+            session_dir.mkdir(parents=True, exist_ok=True)
+            return session_dir / csv_name
+
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = _ROOT / path
+        if path.suffix.lower() == ".csv":
+            session_dir = path.parent / session_dir_name
+            session_dir.mkdir(parents=True, exist_ok=True)
+            return session_dir / path.name
+        session_dir = path / session_dir_name
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir / csv_name
+
+    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, float]]:
+        if not self._eeg_raw_record:
+            self._log("定时测试结束，但没有 EEG raw 数据可保存")
+            return None
+        path = self._resolve_eeg_csv_path()
+        sample_rate = float(MCU_SAMPLE_RATE)
+        measured = self._rhythm.measured_sample_rate
+        if measured is not None and measured > 0:
+            sample_rate = measured
+        try:
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["index", "time_s", "ch1_raw"])
+                for index, value in enumerate(self._eeg_raw_record):
+                    writer.writerow([index, index / sample_rate, value])
+            self._log(
+                f"EEG raw 已保存: {path} "
+                f"({len(self._eeg_raw_record)} 点 @ {sample_rate:.0f} Hz)"
+            )
+            return path, sample_rate
+        except OSError as exc:
+            self._log(f"保存 EEG raw CSV 失败: {exc}")
+            return None
+
+    def _stop_capture_due_to_timeout(self) -> None:
+        """定时到时：停止采集并保存 CSV。"""
+        if not self._running:
+            return
+        self._running = False
+        if self._link is not None:
+            self._link.discard_pending_input()
+        if self._osc_link is not None:
+            self._osc_link.discard_pending_input()
+        if self._test_duration_sec is not None:
+            self._finalize_timed_test()
+        else:
+            self._reset_timed_test_state()
+        self._refresh_capture_button()
+        self._update_status_bar()
+        self._log("定时测试到时，已自动停止采集")
 
     def _setup_audio_ui_defaults(self) -> None:
         """音频区默认值：左 lineEdit_7 / 右 lineEdit_6，相位 lineEdit_9/10，时长 lineEdit_8。"""
@@ -1306,6 +1580,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def on_toggle_capture(self) -> None:
         """启动/停止采集。"""
+        stopping = self._running
         self._running = not self._running
         if self._running:
             eeg_ok = self._open_serial()
@@ -1342,6 +1617,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     self._log(f"振子已丢弃暂停期间积压的 {flushed} 字节")
             else:
                 self._osc_link.discard_pending_input()
+        if self._running:
+            self._begin_timed_test_if_configured()
+        elif stopping and self._test_duration_sec is not None:
+            self._finalize_timed_test()
         self._refresh_capture_button()
         self._update_status_bar()
         view_label = "振子" if self._active_view == "osc" else "EEG"
@@ -1370,6 +1649,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             band = None if mode == "raw" else mode
 
             for sample in samples:
+                if self._is_test_recording_phase():
+                    self._eeg_raw_record.append(sample.channel1)
                 self._sample_count += 1
                 self._decim_counter += 1
                 value = self._rhythm.push(sample.channel1, band)
@@ -1472,6 +1753,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         try:
             self._poll_eeg_serial()
             self._poll_osc_serial()
+            if (
+                self._running
+                and self._test_duration_sec is not None
+                and self._is_timed_test_finished()
+            ):
+                self._stop_capture_due_to_timeout()
+                return
+            if self._running and self._test_duration_sec is not None:
+                self._update_test_countdown_lcd()
             now = time.monotonic()
             if now - self._last_status_update >= 0.2:
                 self._last_status_update = now
