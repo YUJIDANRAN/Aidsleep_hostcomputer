@@ -1,12 +1,16 @@
 """
-立体声正弦波输出控制：左/右声道频率、相位与播放时长。
+立体声正弦波输出控制：左/右声道频率、相位与播放时长；
+助眠闭环：Alpha 波谷相位锁定短促 burst 刺激。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
+
+import numpy as np
 
 from audiio import (
     DEFAULT_AMPLITUDE,
@@ -14,6 +18,22 @@ from audiio import (
     StereoSineAudioOutput,
     default_output_device,
 )
+
+try:
+    import sounddevice as sd
+except ImportError:  # pragma: no cover
+    sd = None  # type: ignore[assignment]
+
+SLEEP_AID_WARMUP_SEC = 15.0
+SLEEP_AID_MIN_INTERVAL_SEC = 0.5
+SLEEP_AID_ERP_LATENCY_SEC = 0.062
+SLEEP_AID_AUDIO_LATENCY_SEC = 0.0  ## 音频线直连振子：模拟传输可忽略（非蓝牙）
+SLEEP_AID_FILTER_DELAY_SEC = 0.030
+SLEEP_AID_PLAY_LATENCY = "low"  ## sounddevice 低延迟输出（声卡缓冲仍须实测标定）
+SLEEP_AID_TRIGGER_TOLERANCE_SEC = 0.004
+SLEEP_AID_BURST_FREQ_HZ = 1000.0
+SLEEP_AID_BURST_DURATION_MS = 20.0
+SLEEP_AID_BURST_AMPLITUDE = 0.3
 
 
 @dataclass(frozen=True)
@@ -163,3 +183,167 @@ class StereoAudioController:
         """程序退出前释放音频资源。"""
         with self._lock:
             self._stop_locked(notify=False)
+
+
+@dataclass(frozen=True)
+class AlphaPhaseSnapshot:
+    """Alpha Hilbert 瞬时相位与下一波谷预测。"""
+
+    ready: bool
+    phase_rad: float = 0.0
+    inst_freq_hz: float = 10.0
+    seconds_to_trough: float = 0.0
+
+
+@dataclass(frozen=True)
+class SleepAidParams:
+    """助眠闭环 burst 参数。"""
+
+    warmup_sec: float = SLEEP_AID_WARMUP_SEC
+    min_interval_sec: float = SLEEP_AID_MIN_INTERVAL_SEC
+    erp_latency_sec: float = SLEEP_AID_ERP_LATENCY_SEC
+    audio_latency_sec: float = SLEEP_AID_AUDIO_LATENCY_SEC
+    filter_delay_sec: float = SLEEP_AID_FILTER_DELAY_SEC
+    trigger_tolerance_sec: float = SLEEP_AID_TRIGGER_TOLERANCE_SEC
+    burst_freq_hz: float = SLEEP_AID_BURST_FREQ_HZ
+    burst_duration_ms: float = SLEEP_AID_BURST_DURATION_MS
+    burst_amplitude: float = SLEEP_AID_BURST_AMPLITUDE
+
+
+def make_tone_burst_stereo(
+    *,
+    sample_rate: float = DEFAULT_SAMPLE_RATE,
+    frequency_hz: float = SLEEP_AID_BURST_FREQ_HZ,
+    duration_ms: float = SLEEP_AID_BURST_DURATION_MS,
+    amplitude: float = SLEEP_AID_BURST_AMPLITUDE,
+) -> np.ndarray:
+    """生成 Hanning 包络立体声 tone burst，形状 (frames, 2)。"""
+    frames = max(1, int(sample_rate * duration_ms / 1000.0))
+    t = np.arange(frames, dtype=np.float64) / sample_rate
+    envelope = np.hanning(frames)
+    mono = amplitude * envelope * np.sin(2.0 * np.pi * frequency_hz * t)
+    stereo = np.column_stack([mono, mono]).astype(np.float32)
+    return stereo
+
+
+class SleepAidStimulusController:
+    """
+    助眠音效：按 Alpha 波谷预测发出短 burst。
+    暖机期内不触发；相邻触发最小间隔 500 ms。
+    """
+
+    def __init__(
+        self,
+        params: Optional[SleepAidParams] = None,
+        sample_rate: float = DEFAULT_SAMPLE_RATE,
+        device: Optional[int | str] = None,
+        on_triggered: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        if sd is None:
+            raise ImportError(
+                "sounddevice is required for sleep-aid burst: pip install sounddevice"
+            )
+        self._params = params or SleepAidParams()
+        self._sample_rate = float(sample_rate)
+        if device is None:
+            device_idx, _ = default_output_device()
+            device = device_idx
+        self._device = device
+        self._on_triggered = on_triggered
+        self._burst = make_tone_burst_stereo(
+            sample_rate=self._sample_rate,
+            frequency_hz=self._params.burst_freq_hz,
+            duration_ms=self._params.burst_duration_ms,
+            amplitude=self._params.burst_amplitude,
+        )
+        self._lock = threading.Lock()
+        self._active = False
+        self._started_at = 0.0
+        self._last_trigger_at = 0.0
+        self._trigger_count = 0
+
+    @property
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    @property
+    def params(self) -> SleepAidParams:
+        return self._params
+
+    @property
+    def trigger_count(self) -> int:
+        with self._lock:
+            return self._trigger_count
+
+    @property
+    def total_latency_sec(self) -> float:
+        p = self._params
+        return p.erp_latency_sec + p.audio_latency_sec + p.filter_delay_sec
+
+    def warmup_remaining(self, now: Optional[float] = None) -> float:
+        """距暖机结束剩余秒数；未激活时返回 0。"""
+        with self._lock:
+            if not self._active:
+                return 0.0
+            t = time.monotonic() if now is None else now
+            return max(0.0, self._params.warmup_sec - (t - self._started_at))
+
+    def start(self) -> None:
+        with self._lock:
+            self._active = True
+            self._started_at = time.monotonic()
+            self._last_trigger_at = 0.0
+            self._trigger_count = 0
+
+    def stop(self) -> None:
+        with self._lock:
+            self._active = False
+
+    def shutdown(self) -> None:
+        self.stop()
+
+    def process_snapshot(
+        self,
+        snapshot: AlphaPhaseSnapshot,
+        now: Optional[float] = None,
+    ) -> bool:
+        """
+        根据相位快照判断是否触发 burst。
+        当 seconds_to_trough ≈ total_latency 时立即播放。
+        """
+        if not snapshot.ready:
+            return False
+        t = time.monotonic() if now is None else now
+        with self._lock:
+            if not self._active:
+                return False
+            if t - self._started_at < self._params.warmup_sec:
+                return False
+            if (
+                self._last_trigger_at > 0.0
+                and t - self._last_trigger_at < self._params.min_interval_sec
+            ):
+                return False
+
+            target = self.total_latency_sec
+            if abs(snapshot.seconds_to_trough - target) > self._params.trigger_tolerance_sec:
+                return False
+
+            self._last_trigger_at = t
+            self._trigger_count += 1
+            count = self._trigger_count
+
+        self._play_burst()
+        if self._on_triggered is not None:
+            self._on_triggered(float(count))
+        return True
+
+    def _play_burst(self) -> None:
+        sd.play(
+            self._burst,
+            samplerate=self._sample_rate,
+            device=self._device,
+            blocking=False,
+            latency=SLEEP_AID_PLAY_LATENCY,
+        )

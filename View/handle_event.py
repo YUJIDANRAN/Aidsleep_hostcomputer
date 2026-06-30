@@ -4,6 +4,7 @@ from __future__ import annotations  ## 前向引用类型
 
 import csv  ## 定时测试 EEG raw 导出
 import io  ## 捕获 power_cal 分析输出
+import math
 import os  ## 环境变量读串口
 import sys  ## 路径与退出
 import time  ## 状态栏刷新节流
@@ -13,7 +14,9 @@ from datetime import datetime  ## CSV 文件名时间戳
 from pathlib import Path  ## 项目根路径
 from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
+import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
+from scipy.signal import hilbert
 
 _ROOT = Path(__file__).resolve().parent.parent  ## 项目根目录
 _VIEW_DIR = Path(__file__).resolve().parent
@@ -42,6 +45,7 @@ from osc_data import (  ## 振子三轴加速度节律分析
 )
 from MainWindow import Ui_MainWindow  ## Designer 生成的 UI
 from ks1082_serial import (
+    EegCsvReplay,
     Ks1082Serial,
     MCU_SAMPLE_RATE,
     RAW_TYPICAL_AMP,
@@ -49,7 +53,12 @@ from ks1082_serial import (
     list_ports,
 )
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
-from controller import StereoAudioController, StereoAudioParams
+from controller import (
+    AlphaPhaseSnapshot,
+    SleepAidStimulusController,
+    StereoAudioController,
+    StereoAudioParams,
+)
 
 
 DEFAULT_SERIAL_PORT = "COM6"  ## EEG 默认串口
@@ -116,6 +125,64 @@ MIN_X_TIME_ZOOM = 0.2  ## X 最小缩放（时间窗最长）
 MIN_X_VISIBLE_POINTS = 50  ## X 至少显示点数，过少会连成三角折线
 MIN_Y_AMP = 20.0  ## Y 半幅下限
 MAX_Y_AMP = 200000.0  ## Y 半幅上限
+SLEEP_AID_HILBERT_WINDOW = int(MCU_SAMPLE_RATE * 0.5)  ## Hilbert 窗 0.5 s
+SLEEP_AID_MIN_HILBERT_SAMPLES = max(64, SLEEP_AID_HILBERT_WINDOW // 2)
+SLEEP_AID_ALPHA_FREQ_MIN_HZ = 7.0
+SLEEP_AID_ALPHA_FREQ_MAX_HZ = 14.0
+SLEEP_AID_TROUGH_PHASE_RAD = math.pi
+
+
+class AlphaPhaseTracker:
+    """Alpha 带通序列 → Hilbert 瞬时相位与下一波谷时间。"""
+
+    def __init__(
+        self,
+        sample_rate: float,
+        window: int = SLEEP_AID_HILBERT_WINDOW,
+    ) -> None:
+        self.sample_rate = float(sample_rate)
+        self.window = int(window)
+        self._buf: Deque[float] = deque(maxlen=self.window)
+
+    def reset(self) -> None:
+        self._buf.clear()
+
+    def push(self, alpha: float) -> AlphaPhaseSnapshot:
+        self._buf.append(float(alpha))
+        return self.snapshot()
+
+    def snapshot(self) -> AlphaPhaseSnapshot:
+        if len(self._buf) < SLEEP_AID_MIN_HILBERT_SAMPLES:
+            return AlphaPhaseSnapshot(ready=False)
+
+        arr = np.asarray(self._buf, dtype=np.float64)
+        analytic = hilbert(arr)
+        phases = np.unwrap(np.angle(analytic))
+        phase_rad = float(phases[-1] % (2.0 * math.pi))
+
+        tail = min(50, len(phases))
+        if tail >= 2:
+            dphase = phases[-1] - phases[-tail]
+            dt = (tail - 1) / self.sample_rate
+            inst_freq_hz = abs(dphase / (2.0 * math.pi * dt))
+            inst_freq_hz = float(
+                np.clip(
+                    inst_freq_hz,
+                    SLEEP_AID_ALPHA_FREQ_MIN_HZ,
+                    SLEEP_AID_ALPHA_FREQ_MAX_HZ,
+                )
+            )
+        else:
+            inst_freq_hz = 10.0
+
+        delta = (SLEEP_AID_TROUGH_PHASE_RAD - phase_rad) % (2.0 * math.pi)
+        seconds_to_trough = delta / (2.0 * math.pi * inst_freq_hz)
+        return AlphaPhaseSnapshot(
+            ready=True,
+            phase_rad=phase_rad,
+            inst_freq_hz=inst_freq_hz,
+            seconds_to_trough=seconds_to_trough,
+        )
 
 
 def _make_wave_pen(color: str) -> QtGui.QPen:
@@ -748,7 +815,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._port = ""  ## 当前已连接的 EEG 串口
         self._osc_port = ""  ## 当前已连接的振子串口
         self._baudrate = baudrate  ## 波特率
-        self._link: Optional[Ks1082Serial] = None  ## EEG 串口连接
+        self._link: Optional[Ks1082Serial | EegCsvReplay] = None  ## EEG 串口或 CSV 模拟
         self._osc_link: Optional[OscillatorSerial] = None  ## 振子串口连接
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
         self._osc_proc = OscStreamProcessor(sample_rate=OSC_SAMPLE_RATE)  ## 振子流式滤波
@@ -756,9 +823,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._audio_controller = StereoAudioController(
             on_stopped=self._audio_stopped.emit,
         )
+        self._sleep_aid_tracker = AlphaPhaseTracker(sample_rate=sample_rate)
+        try:
+            self._sleep_aid_controller = SleepAidStimulusController(
+                on_triggered=self._on_sleep_aid_burst,
+            )
+        except ImportError:
+            self._sleep_aid_controller = None
         self._setup_audio_ui_defaults()
         self._setup_timed_test_ui()
         self._setup_compare_segments_ui()
+        self._setup_eeg_replay_ui()
+        self._sleep_aid_last_warm_sec = -1
         self._running = False  ## 默认不采集
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
@@ -821,6 +897,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.pushButton_2.pressed.connect(self._switch_to_eeg_view)  ## 节律图页
         self.ui.pushButton_6.pressed.connect(self._switch_to_osc_view)  ## 振子页
         self.ui.pushButton_7.pressed.connect(self.on_toggle_audio)  ## 音频开始/停止
+        self.ui.pushButton_8.pressed.connect(self.on_toggle_sleep_aid)  ## 助眠闭环 burst
         self._poll_timer = QtCore.QTimer(self)  ## 串口轮询定时器
         self._poll_timer.setInterval(SERIAL_POLL_INTERVAL_MS)
         self._poll_timer.timeout.connect(self.on_poll_serial)
@@ -844,8 +921,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._apply_display_mode("raw")  ## 默认 EEG raw 波形参数
         self._apply_osc_display_mode("m_freq")  ## 默认振子 M_Fre 波形
         if self._link is not None and self._link.is_open:
-            self._running = True  ## 串口可用则自动采集，动态刷新 raw 波形
-            self._link._parser.reset()
+            self._running = True  ## 串口/CSV 可用则自动采集，动态刷新 raw 波形
+            if isinstance(self._link, Ks1082Serial):
+                self._link._parser.reset()
+            else:
+                self._link.reset_playback()
             self._rhythm.reset()
             self._decim_counter = 0
             self._waveform.clear()
@@ -870,6 +950,34 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_waveform.raise_()
         self._waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
+
+    def _setup_eeg_replay_ui(self) -> None:
+        """lineEdit_14：填写 eeg_raw.csv 路径时以文件模拟串口输入。"""
+        edit = self.ui.lineEdit_14
+        if not edit.text().strip():
+            edit.setPlaceholderText("eeg_raw.csv 路径")
+        edit.setToolTip(
+            "填写已保存的 EEG CSV（如 Result/eeg_xxx/eeg_raw.csv）时，"
+            "不读 EEG 串口，按 500 Hz 回放模拟输入"
+        )
+
+    def _resolve_eeg_replay_csv_path(self, text: str) -> Optional[Path]:
+        raw = text.strip().strip('"').strip("'")
+        if not raw:
+            return None
+        path = Path(raw)
+        if path.is_file():
+            return path.resolve()
+        if not path.is_absolute():
+            for base in (_ROOT, _ROOT / "Result", Path.cwd()):
+                candidate = (base / path).resolve()
+                if candidate.is_file():
+                    return candidate
+        resolved = path.resolve()
+        return resolved if resolved.is_file() else None
+
+    def _ui_eeg_csv_path(self) -> str:
+        return self.ui.lineEdit_14.text().strip()
 
     def _setup_timed_test_ui(self) -> None:
         """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时、lineEdit_3 保存路径。"""
@@ -1141,6 +1249,85 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 edit.setText(value)
             edit.setPlaceholderText(hint)
         self._refresh_audio_button()
+        self._refresh_sleep_aid_button()
+
+    def _refresh_sleep_aid_button(self) -> None:
+        btn = self.ui.pushButton_8
+        active = (
+            self._sleep_aid_controller is not None
+            and self._sleep_aid_controller.is_active
+        )
+        if active:
+            warm = self._sleep_aid_controller.warmup_remaining()
+            if warm > 0.0:
+                btn.setText(f"暖机 {warm:.0f}s")
+            else:
+                btn.setText("停止助眠")
+            btn.setStyleSheet(
+                "QPushButton { font-size:14px; font-weight:bold; border:none;"
+                "border-radius:8px; min-height:41px;"
+                "background-color:#C62828; color:#FFFFFF; }"
+            )
+        else:
+            btn.setText("助眠音效")
+            btn.setStyleSheet(
+                "QPushButton { font-size:14px; font-weight:bold; border:none;"
+                "border-radius:8px; min-height:41px;"
+                "background-color:#2E7D32; color:#FFFFFF; }"
+            )
+
+    @QtCore.pyqtSlot()
+    def on_toggle_sleep_aid(self) -> None:
+        """pushButton_8：Alpha 波谷相位锁定短 burst。"""
+        if self._sleep_aid_controller is None:
+            self._log("助眠模块不可用: 请 pip install sounddevice")
+            return
+        if self._sleep_aid_controller.is_active:
+            self._sleep_aid_controller.stop()
+            self._refresh_sleep_aid_button()
+            self._log(
+                f"助眠音效已停止，共触发 {self._sleep_aid_controller.trigger_count} 次"
+            )
+            return
+        if self._audio_controller.is_playing:
+            self._audio_controller.stop()
+            self._refresh_audio_button()
+            self._log("已停止连续音频，避免与助眠 burst 冲突")
+        if not self._running:
+            self._log("请先开始 EEG 采集后再开启助眠音效")
+            return
+
+        self._sleep_aid_tracker.reset()
+        self._rhythm.reset()
+        self._sleep_aid_controller.start()
+        self._apply_display_mode("alpha")
+        self.ui.checkBox.blockSignals(True)
+        self.ui.checkBox.setChecked(True)
+        self.ui.checkBox.blockSignals(False)
+        self._refresh_sleep_aid_button()
+        p = self._sleep_aid_controller.params
+        self._log(
+            "助眠音效已启动: "
+            f"暖机 {p.warmup_sec:g}s，最小间隔 {p.min_interval_sec:g}s，"
+            f"ERP 延迟 {p.erp_latency_sec * 1000:g} ms，"
+            f"burst {p.burst_freq_hz:g} Hz / {p.burst_duration_ms:g} ms"
+        )
+
+    def _on_sleep_aid_burst(self, count: float) -> None:
+        self._log(f"助眠 burst #{int(count)}")
+
+    def _process_sleep_aid_sample(self, alpha: float) -> None:
+        if self._sleep_aid_controller is None or not self._sleep_aid_controller.is_active:
+            return
+        snapshot = self._sleep_aid_tracker.push(alpha)
+        self._sleep_aid_controller.process_snapshot(snapshot)
+        warm = self._sleep_aid_controller.warmup_remaining()
+        if warm > 0.0 and int(warm) != getattr(self, "_sleep_aid_last_warm_sec", -1):
+            self._sleep_aid_last_warm_sec = int(warm)
+            self._refresh_sleep_aid_button()
+        elif warm <= 0.0 and getattr(self, "_sleep_aid_last_warm_sec", -1) != 0:
+            self._sleep_aid_last_warm_sec = 0
+            self._refresh_sleep_aid_button()
 
     def _read_audio_params(self) -> StereoAudioParams:
         """读取 groupBox_2 中频率/相位/时长并校验。"""
@@ -1172,6 +1359,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def on_toggle_audio(self) -> None:
         """pushButton_7：开始/停止立体声正弦波输出。"""
+        if self._sleep_aid_controller is not None and self._sleep_aid_controller.is_active:
+            self._sleep_aid_controller.stop()
+            self._refresh_sleep_aid_button()
+            self._log("已停止助眠音效，避免与连续音频冲突")
         if self._audio_controller.is_playing:
             self._audio_controller.stop()
             self._refresh_audio_button()
@@ -1489,10 +1680,40 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return port
 
     def _open_serial(self) -> bool:
-        """按 UI 串口框打开 EEG 串口；成功返回 True。"""
+        """打开 EEG 数据源：lineEdit_14 有 CSV 则回放文件，否则读串口。"""
+        csv_path = self._resolve_eeg_replay_csv_path(self._ui_eeg_csv_path())
+        if csv_path is not None:
+            try:
+                if (
+                    isinstance(self._link, EegCsvReplay)
+                    and self._link.is_open
+                    and Path(self._link.csv_path) == csv_path
+                ):
+                    return True
+                if self._link is not None:
+                    self._link.close()
+                replay = EegCsvReplay(csv_path)
+                replay.open()
+                self._link = replay
+                self._port = f"CSV:{csv_path.name}"
+                self._log(
+                    f"EEG CSV 模拟: {csv_path} "
+                    f"({replay.sample_count} 点 @ {replay.sample_rate:.0f} Hz)"
+                )
+                self._log(f"EEG 采样率 {replay.sample_rate:.0f} Hz，显示 {RAW_DISPLAY_RATE} Hz")
+                return True
+            except Exception as exc:
+                self._link = None
+                self._log(f"EEG CSV 加载失败 ({csv_path}): {exc}")
+                return False
+
         port = self._ui_serial_port()
         try:
-            if self._link is not None and self._link.is_open and self._link.port == port:
+            if (
+                isinstance(self._link, Ks1082Serial)
+                and self._link.is_open
+                and self._link.port == port
+            ):
                 return True
             if self._link is not None:
                 self._link.close()
@@ -1566,14 +1787,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             rx = self._rhythm.measured_sample_rate
             rx_text = f"{rx:.0f}" if rx is not None else "—"
             if mode == "raw":
+                src = "CSV" if isinstance(self._link, EegCsvReplay) else "串口"
                 self.ui.statusbar.showMessage(
-                    f"RAW CH1  |  显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
+                    f"RAW CH1 ({src})  |  显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
                 )
             else:
                 label = BAND_LABELS[mode]
                 low_hz, high_hz = EEG_BANDS[mode]
+                src = "CSV" if isinstance(self._link, EegCsvReplay) else "串口"
                 self.ui.statusbar.showMessage(
-                    f"{label} {low_hz:g}-{high_hz:g} Hz  |  "
+                    f"{label} {low_hz:g}-{high_hz:g} Hz ({src})  |  "
                     f"显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
                 )
 
@@ -1647,6 +1870,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._apply_display_mode(mode)
             plot_values: list[float] = []
             band = None if mode == "raw" else mode
+            sleep_aid = (
+                self._sleep_aid_controller is not None
+                and self._sleep_aid_controller.is_active
+            )
+            if sleep_aid:
+                band = "alpha"
 
             for sample in samples:
                 if self._is_test_recording_phase():
@@ -1654,6 +1883,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sample_count += 1
                 self._decim_counter += 1
                 value = self._rhythm.push(sample.channel1, band)
+                if sleep_aid:
+                    self._process_sleep_aid_sample(value)
                 if self._decim_counter >= RAW_DECIM_FACTOR:
                     self._decim_counter = 0
                     plot_values.append(value)
@@ -1667,11 +1898,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._no_data_ticks += 1
 
         if self._no_data_ticks == 50:
-            total = self._link.bytes_received
-            if total == 0:
-                self._log("EEG 串口无任何数据: 请检查 COM 口与接线")
+            if isinstance(self._link, EegCsvReplay):
+                if self._link.finished:
+                    self._log("EEG CSV 已播放完毕")
+                else:
+                    self._log("EEG CSV 回放等待中（请确认采集已启动）")
             else:
-                self._log(f"EEG 已收到 {total} 字节但未解析出波形")
+                total = self._link.bytes_received
+                if total == 0:
+                    self._log("EEG 串口无任何数据: 请检查 COM 口与接线")
+                else:
+                    self._log(f"EEG 已收到 {total} 字节但未解析出波形")
             self._no_data_ticks = 0
 
     def _poll_osc_serial(self) -> None:
@@ -1772,6 +2009,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._poll_timer.stop()
         self._audio_controller.shutdown()
+        if self._sleep_aid_controller is not None:
+            self._sleep_aid_controller.shutdown()
         if self._link is not None:
             self._link.close()
         if self._osc_link is not None:
