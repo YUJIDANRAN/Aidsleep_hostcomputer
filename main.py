@@ -1,8 +1,7 @@
-"""Application entry: run View/handle_event.py as __main__."""
+"""Application entry for source runs and PyInstaller builds."""
 
 from __future__ import annotations
 
-import runpy
 import sys
 from pathlib import Path
 
@@ -19,13 +18,12 @@ def _ensure_on_path(*dirs: Path) -> None:
 def main() -> None:
     view_dir = ROOT / "View"
     algo_dir = ROOT / "Algorithm"
-    target = view_dir / "handle_event.py"
-    if not target.is_file():
-        print(f"找不到文件: {target}", file=sys.stderr)
-        sys.exit(1)
-    _ensure_on_path(view_dir, algo_dir)
-    runpy.run_path(str(target), run_name="__main__")
+    ctrl_dir = ROOT / "Controller"
+    _ensure_on_path(ROOT, view_dir, algo_dir, ctrl_dir)
 
+    from handle_event import run_app
+
+    run_app()
 
 if __name__ == "__main__":
     main()

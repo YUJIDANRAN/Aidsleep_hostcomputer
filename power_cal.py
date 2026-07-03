@@ -22,6 +22,11 @@ DEFAULT_SAMPLE_RATE = float(
 
 BANDPASS_LOW_HZ = 0.5
 BANDPASS_HIGH_HZ = 40.0
+EEG_REJECT_SEGMENT_SEC = 1.0
+EEG_RAW_MIN_VALID = 50
+EEG_RAW_MAX_VALID = 4045
+EEG_SEGMENT_MAX_PTP = 1200.0
+EEG_SEGMENT_MAX_DEVIATION = 800.0
 
 # 在 0.5–40 Hz 带通范围内的标准节律划分
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
@@ -102,6 +107,18 @@ class SampleRateEstimator:
         if 50.0 <= rate <= 2000.0:
             return rate
         return None
+
+
+@dataclass
+class EegQualityInfo:
+    reject_mask: np.ndarray
+    reject_rate: float
+    has_tag: bool = False
+    source: str = "none"
+
+    @property
+    def has_rejection(self) -> bool:
+        return bool(self.has_tag and self.reject_mask.size and np.any(self.reject_mask))
 
 
 class RhythmStreamProcessor:
@@ -224,6 +241,110 @@ def read_eeg_signal(data_path: str | Path, column: int = 0) -> np.ndarray:
             f"有效样本过少 ({values.size})，请检查 {path.name} 是否包含 EEG 数据"
         )
     return values
+
+
+def build_threshold_rejection(
+    values: np.ndarray,
+    sample_rate: float,
+) -> EegQualityInfo:
+    """没有 CSV tag 时，按保存端同一规则现场计算阈值拒绝。"""
+    count = values.size
+    if count == 0:
+        return EegQualityInfo(np.zeros(0, dtype=bool), 0.0, has_tag=False)
+
+    reject_mask = np.zeros(count, dtype=bool)
+    segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
+    for start in range(0, count, segment_size):
+        end = min(count, start + segment_size)
+        segment = values[start:end].astype(np.float64, copy=False)
+        rejected = False
+
+        if np.any(segment <= EEG_RAW_MIN_VALID) or np.any(segment >= EEG_RAW_MAX_VALID):
+            rejected = True
+        if float(np.ptp(segment)) > EEG_SEGMENT_MAX_PTP:
+            rejected = True
+        median = float(np.median(segment))
+        max_dev = float(np.max(np.abs(segment - median)))
+        if max_dev > EEG_SEGMENT_MAX_DEVIATION:
+            rejected = True
+
+        if rejected:
+            reject_mask[start:end] = True
+
+    reject_rate = float(np.mean(reject_mask)) if reject_mask.size else 0.0
+    return EegQualityInfo(reject_mask, reject_rate, has_tag=True, source="computed")
+
+
+def read_eeg_quality(
+    data_path: str | Path,
+    expected_len: int,
+    raw_values: np.ndarray | None = None,
+    sample_rate: float = DEFAULT_SAMPLE_RATE,
+) -> EegQualityInfo:
+    """读取 CSV 中的阈值拒绝 tag；旧文件没有 tag 时返回 0 拒绝率。"""
+    path = Path(data_path)
+    empty = EegQualityInfo(np.zeros(expected_len, dtype=bool), 0.0, has_tag=False)
+    if path.suffix.lower() not in {".csv", ".txt"}:
+        return empty
+
+    frame = pd.read_csv(path)
+    if "is_rejected" not in frame.columns:
+        if raw_values is not None:
+            return build_threshold_rejection(raw_values, sample_rate)
+        return empty
+
+    flags = pd.to_numeric(frame["is_rejected"], errors="coerce").fillna(0)
+    mask = flags.to_numpy(dtype=np.float64) > 0
+    if mask.size < expected_len:
+        mask = np.pad(mask, (0, expected_len - mask.size), constant_values=False)
+    elif mask.size > expected_len:
+        mask = mask[:expected_len]
+
+    reject_rate = float(np.mean(mask)) if mask.size else 0.0
+    if "reject_rate" in frame.columns:
+        rates = pd.to_numeric(frame["reject_rate"], errors="coerce").dropna()
+        if not rates.empty:
+            reject_rate = float(rates.iloc[0])
+    return EegQualityInfo(mask, reject_rate, has_tag=True, source="csv")
+
+
+def _rejected_spans(
+    reject_mask: np.ndarray,
+    sample_rate: float,
+    *,
+    start_seconds: float = 0.0,
+    end_seconds: float | None = None,
+) -> list[tuple[float, float]]:
+    """把逐点 reject mask 合并成时间段，供波形图背景标注。"""
+    if reject_mask.size == 0 or not np.any(reject_mask):
+        return []
+
+    total_duration = reject_mask.size / sample_rate
+    view_start = max(0.0, start_seconds)
+    view_end = total_duration if end_seconds is None else min(end_seconds, total_duration)
+    if view_start >= view_end:
+        return []
+
+    i_start = max(0, int(view_start * sample_rate))
+    i_end = min(reject_mask.size, int(np.ceil(view_end * sample_rate)))
+    local = reject_mask[i_start:i_end]
+    spans: list[tuple[float, float]] = []
+    in_span = False
+    span_start = 0
+    for offset, rejected in enumerate(local):
+        if rejected and not in_span:
+            in_span = True
+            span_start = offset
+        elif not rejected and in_span:
+            abs_start = i_start + span_start
+            abs_end = i_start + offset
+            spans.append((abs_start / sample_rate, abs_end / sample_rate))
+            in_span = False
+    if in_span:
+        abs_start = i_start + span_start
+        abs_end = i_start + local.size
+        spans.append((abs_start / sample_rate, abs_end / sample_rate))
+    return spans
 
 
 def bandpass_filter(
@@ -447,6 +568,7 @@ def _setup_matplotlib() -> None:
 def plot_band_powers(
     analysis: PowerAnalysis,
     title: str = "EEG 各节律功率",
+    quality: EegQualityInfo | None = None,
     save_path: str | Path | None = None,
     show: bool = True,
 ) -> None:
@@ -465,7 +587,10 @@ def plot_band_powers(
     abs_pow = [result.absolute[n] for n in names]
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 11), constrained_layout=True)
-    fig.suptitle(title, fontsize=14, fontweight="bold")
+    quality_text = ""
+    if quality is not None and quality.has_tag:
+        quality_text = f" | 阈值拒绝率 {quality.reject_rate:.1%}"
+    fig.suptitle(f"{title}{quality_text}", fontsize=14, fontweight="bold")
 
     ax_psd = axes[0]
     ax_psd.plot(analysis.freqs, analysis.psd, color="#333333", lw=0.8, label="PSD")
@@ -693,6 +818,7 @@ def plot_band_waveforms(
     title: str = "EEG 各节律时域波形",
     time_range: tuple[float, float] | None = None,
     max_seconds: float | None = 10.0,
+    quality: EegQualityInfo | None = None,
     save_path: str | Path | None = None,
     show: bool = True,
 ) -> None:
@@ -718,22 +844,40 @@ def plot_band_waveforms(
     names = list(EEG_BANDS.keys())
     t0 = float(time_axis[0]) if time_axis.size else t_start
     t1 = float(time_axis[-1]) if time_axis.size else t_start
+    rejected_spans: list[tuple[float, float]] = []
+    if quality is not None and quality.has_rejection:
+        rejected_spans = _rejected_spans(
+            quality.reject_mask,
+            sample_rate,
+            start_seconds=t0,
+            end_seconds=t1,
+        )
 
     fig, axes = plt.subplots(len(names), 1, figsize=(12, 10), sharex=True, constrained_layout=True)
     if len(names) == 1:
         axes = [axes]
-    fig.suptitle(f"{title}（{t0:.1f}–{t1:.1f} s）", fontsize=14, fontweight="bold")
+    quality_text = ""
+    if quality is not None and quality.has_tag:
+        quality_text = f" | 阈值拒绝率 {quality.reject_rate:.1%}"
+    fig.suptitle(
+        f"{title}（{t0:.1f}–{t1:.1f} s）{quality_text}",
+        fontsize=14,
+        fontweight="bold",
+    )
 
     for ax, name in zip(axes, names):
         low, high = EEG_BANDS[name]
         y = sliced[name]
         ax.plot(time_axis, y, color=BAND_COLORS[name], lw=0.6)
+        for span_start, span_end in rejected_spans:
+            ax.axvspan(span_start, span_end, color="#D32F2F", alpha=0.12, lw=0)
         ax.set_ylabel(f"{BAND_LABELS[name]}\n({low:g}-{high:g} Hz)")
         ax.grid(True, alpha=0.25)
         ax.margins(x=0)
 
     axes[-1].set_xlabel("时间 (s)")
-    axes[0].set_title("各节律窄带滤波波形（自上而下：δ → γ）")
+    title_suffix = "；红色背景=阈值拒绝片段" if rejected_spans else ""
+    axes[0].set_title(f"各节律窄带滤波波形（自上而下：δ → γ）{title_suffix}")
 
     if save_path is not None:
         out = Path(save_path)
@@ -769,12 +913,24 @@ def run_analysis(
         raise FileNotFoundError(f"找不到文件: {path.resolve()}")
 
     raw = read_eeg_signal(path)
+    quality = read_eeg_quality(
+        path,
+        expected_len=len(raw),
+        raw_values=raw,
+        sample_rate=sample_rate,
+    )
     analysis = compute_band_powers(raw, sample_rate=sample_rate)
     result = analysis.result
     duration = len(raw) / sample_rate
 
     print(f"文件: {path.resolve()}")
     print(f"样本数: {len(raw)}  |  采样率: {sample_rate:g} Hz  |  时长: {duration:.2f} s")
+    if quality.has_tag:
+        rejected = int(np.count_nonzero(quality.reject_mask))
+        source_label = "CSV tag" if quality.source == "csv" else "现场计算"
+        print(
+            f"阈值拒绝: {quality.reject_rate:.1%} ({rejected}/{len(raw)} 点, {source_label})"
+        )
     print(f"带通滤波: {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz (零相位 sosfiltfilt)")
     print()
     print(format_results(result))
@@ -784,6 +940,7 @@ def run_analysis(
         plot_band_powers(
             analysis,
             title=f"EEG 节律功率 · {path.stem}",
+            quality=quality,
             save_path=plot_path,
             show=show_plot,
         )
@@ -797,6 +954,7 @@ def run_analysis(
             title=f"EEG 节律波形 · {path.stem}",
             time_range=waveform_time_range,
             max_seconds=waveform_seconds,
+            quality=quality,
             save_path=wf_path,
             show=show_waveform,
         )
@@ -814,24 +972,28 @@ def run_analysis(
 
     if compare_segments is not None:
         range_a, range_b = compare_segments
-        comparison = compare_segment_band_powers(raw, sample_rate, range_a, range_b)
-        print()
-        print(format_segment_comparison(comparison))
-        if show_segment_compare or save_segment_compare:
-            cmp_path = path.parent / f"{path.stem}_segment_compare.png" if save_segment_compare else None
-            plot_segment_power_comparison(
-                comparison,
-                title=f"段间节律功率 · {path.stem}",
-                save_path=cmp_path,
-                show=show_segment_compare,
-            )
+        try:
+            comparison = compare_segment_band_powers(raw, sample_rate, range_a, range_b)
+        except ValueError as exc:
+            print(f"跳过段间对比: {exc}")
+        else:
+            print()
+            print(format_segment_comparison(comparison))
+            if show_segment_compare or save_segment_compare:
+                cmp_path = path.parent / f"{path.stem}_segment_compare.png" if save_segment_compare else None
+                plot_segment_power_comparison(
+                    comparison,
+                    title=f"段间节律功率 · {path.stem}",
+                    save_path=cmp_path,
+                    show=show_segment_compare,
+                )
 
     return result
 
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"C:\Users\liudi\Desktop\信号质量检测gelin\jiyu0pen30close30_gelin.xlsx"
+    xlsx_file = r"E:\qt_project\pyqt\Host_computer_6\Host_computer_6\Sample\jiyu_open40_close120_1\eeg_raw_converted.csv"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)
@@ -843,7 +1005,7 @@ def main() -> None:
     save_fft = True
     fft_time_range = None  # None=整段 FFT；(10, 20) 仅对 10–20 s 画 FFT
     # 两段对比：计算相同节律功率比 B/A，并出对比图
-    compare_segments = ((120,180), (300, 360))  # (段A起止秒), (段B起止秒)；None 关闭
+    compare_segments = ((20, 30), (40, 50))  # (段A起止秒), (段B起止秒)；None 关闭
     show_segment_compare = True
     save_segment_compare = True
     # =====================================

@@ -90,6 +90,12 @@ DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)，对应 compare_segments[0]
 DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
 DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
 DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
+EEG_REJECT_SEGMENT_SEC = 1.0  ## 阈值拒绝按 1 s 切片打标签，不删除/拼接原始点
+EEG_REJECT_RATE_WARN = 0.20  ## 拒绝率超过 20% 时提示本次采集不宜用于分析
+EEG_RAW_MIN_VALID = 50  ## ADC 贴近下电源轨视为饱和/脱落风险
+EEG_RAW_MAX_VALID = 4045  ## ADC 贴近上电源轨视为饱和/脱落风险
+EEG_SEGMENT_MAX_PTP = 1200.0  ## 片内峰峰值阈值，单位 ADC count
+EEG_SEGMENT_MAX_DEVIATION = 800.0  ## 相对片内中位数的最大偏移阈值
 RAW_DISPLAY_RATE = 100  ## 波形显示约 100 点/秒
 RAW_DECIM_FACTOR = max(1, int(MCU_SAMPLE_RATE / RAW_DISPLAY_RATE))  ## 500→100 降采样比
 RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
@@ -130,6 +136,46 @@ SLEEP_AID_MIN_HILBERT_SAMPLES = max(64, SLEEP_AID_HILBERT_WINDOW // 2)
 SLEEP_AID_ALPHA_FREQ_MIN_HZ = 7.0
 SLEEP_AID_ALPHA_FREQ_MAX_HZ = 14.0
 SLEEP_AID_TROUGH_PHASE_RAD = math.pi
+
+
+def _build_eeg_rejection_tags(
+    values: List[int],
+    sample_rate: float,
+) -> Tuple[List[int], List[int], List[str], float]:
+    """按固定时间片做阈值拒绝，返回片段号、拒绝标记、原因与拒绝率。"""
+    count = len(values)
+    if count == 0:
+        return [], [], [], 0.0
+    segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
+    segment_ids = [0] * count
+    reject_flags = [0] * count
+    reject_reasons = [""] * count
+
+    for start in range(0, count, segment_size):
+        end = min(count, start + segment_size)
+        segment_id = start // segment_size
+        segment = np.asarray(values[start:end], dtype=np.float64)
+        reasons: list[str] = []
+
+        if np.any(segment <= EEG_RAW_MIN_VALID) or np.any(segment >= EEG_RAW_MAX_VALID):
+            reasons.append("rail_saturation")
+        ptp = float(np.ptp(segment))
+        if ptp > EEG_SEGMENT_MAX_PTP:
+            reasons.append(f"ptp>{EEG_SEGMENT_MAX_PTP:g}")
+        median = float(np.median(segment))
+        max_dev = float(np.max(np.abs(segment - median)))
+        if max_dev > EEG_SEGMENT_MAX_DEVIATION:
+            reasons.append(f"deviation>{EEG_SEGMENT_MAX_DEVIATION:g}")
+
+        rejected = 1 if reasons else 0
+        reason_text = ";".join(reasons)
+        for index in range(start, end):
+            segment_ids[index] = segment_id
+            reject_flags[index] = rejected
+            reject_reasons[index] = reason_text
+
+    reject_rate = sum(reject_flags) / count
+    return segment_ids, reject_flags, reject_reasons, reject_rate
 
 
 class AlphaPhaseTracker:
@@ -1023,8 +1069,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return None
         return ((a_start, a_end), (b_start, b_end))
 
-    def _run_post_test_power_analysis(self, csv_path: Path, sample_rate: float) -> None:
+    def _run_post_test_power_analysis(
+        self,
+        csv_path: Path,
+        sample_rate: float,
+        reject_rate: float,
+    ) -> None:
         """测试结束后自动运行 power_cal.run_analysis（段间功率对比等）。"""
+        if reject_rate > EEG_REJECT_RATE_WARN:
+            self._log(
+                f"拒绝率 {reject_rate:.1%} 超过 {EEG_REJECT_RATE_WARN:.0%}，跳过自动功率分析"
+            )
+            return
         compare_segments = self._read_compare_segments_from_ui()
         if compare_segments is None:
             self._log("段间对比时间未填全或无效，跳过 power_cal 分析")
@@ -1069,8 +1125,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         saved = self._save_eeg_raw_csv()
         self._reset_timed_test_state()
         if saved is not None:
-            csv_path, sample_rate = saved
-            self._run_post_test_power_analysis(csv_path, sample_rate)
+            csv_path, sample_rate, reject_rate = saved
+            self._run_post_test_power_analysis(csv_path, sample_rate, reject_rate)
 
     def _read_time_edit_duration_sec(self) -> Optional[float]:
         """读取 timeEdit；00:00:00 表示未设置。"""
@@ -1194,7 +1250,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         session_dir.mkdir(parents=True, exist_ok=True)
         return session_dir / csv_name
 
-    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, float]]:
+    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, float, float]]:
         if not self._eeg_raw_record:
             self._log("定时测试结束，但没有 EEG raw 数据可保存")
             return None
@@ -1203,17 +1259,44 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         measured = self._rhythm.measured_sample_rate
         if measured is not None and measured > 0:
             sample_rate = measured
+        segment_ids, reject_flags, reject_reasons, reject_rate = _build_eeg_rejection_tags(
+            self._eeg_raw_record,
+            sample_rate,
+        )
         try:
             with path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(["index", "time_s", "ch1_raw"])
+                writer.writerow(
+                    [
+                        "index",
+                        "time_s",
+                        "ch1_raw",
+                        "segment_id",
+                        "is_rejected",
+                        "reject_reason",
+                        "reject_rate",
+                    ]
+                )
                 for index, value in enumerate(self._eeg_raw_record):
-                    writer.writerow([index, index / sample_rate, value])
+                    writer.writerow(
+                        [
+                            index,
+                            index / sample_rate,
+                            value,
+                            segment_ids[index],
+                            reject_flags[index],
+                            reject_reasons[index],
+                            f"{reject_rate:.6f}",
+                        ]
+                    )
             self._log(
                 f"EEG raw 已保存: {path} "
                 f"({len(self._eeg_raw_record)} 点 @ {sample_rate:.0f} Hz)"
             )
-            return path, sample_rate
+            self._log(f"阈值拒绝率: {reject_rate:.1%}")
+            if reject_rate > EEG_REJECT_RATE_WARN:
+                self._log("拒绝率过高，本次数据不建议用于样本分析")
+            return path, sample_rate, reject_rate
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
             return None

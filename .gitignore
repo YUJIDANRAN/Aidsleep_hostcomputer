@@ -1,6 +1,15 @@
 # Runtime outputs
 /Result/
 
+# Sample inputs
+/Sample/
+
+# PyInstaller outputs
+/build/
+/dist/
+
+*.spec.bak
+
 # Local backup folders
 /Host_computer_6_nested_backup_*/
 
