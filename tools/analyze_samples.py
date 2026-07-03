@@ -56,6 +56,7 @@ def main() -> None:
         print(f"FILE {path.relative_to(ROOT)}")
         print(
             f"duration={duration:.2f}s reject={quality.reject_rate:.1%} "
+            f"suspicious={quality.suspicious_rate:.1%} "
             f"overall alpha={pct(overall['alpha'])} "
             f"delta={pct(overall['delta'])} beta={pct(overall['beta'])}"
         )

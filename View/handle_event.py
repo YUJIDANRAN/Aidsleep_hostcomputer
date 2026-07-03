@@ -32,6 +32,7 @@ from power_cal import (  ## 节律滤波与频段定义
     DEFAULT_SAMPLE_RATE,
     EEG_BANDS,
     RhythmStreamProcessor,
+    build_threshold_rejection,
     run_analysis,
 )
 from osc_data import (  ## 振子三轴加速度节律分析
@@ -141,41 +142,32 @@ SLEEP_AID_TROUGH_PHASE_RAD = math.pi
 def _build_eeg_rejection_tags(
     values: List[int],
     sample_rate: float,
-) -> Tuple[List[int], List[int], List[str], float]:
-    """按固定时间片做阈值拒绝，返回片段号、拒绝标记、原因与拒绝率。"""
+) -> Tuple[List[int], List[int], List[str], float, List[int], List[str], float]:
+    """按固定时间片做质量标记，返回坏段/可疑段 tag 与比例。"""
     count = len(values)
     if count == 0:
-        return [], [], [], 0.0
+        return [], [], [], 0.0, [], [], 0.0
     segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
-    segment_ids = [0] * count
-    reject_flags = [0] * count
-    reject_reasons = [""] * count
-
-    for start in range(0, count, segment_size):
-        end = min(count, start + segment_size)
-        segment_id = start // segment_size
-        segment = np.asarray(values[start:end], dtype=np.float64)
-        reasons: list[str] = []
-
-        if np.any(segment <= EEG_RAW_MIN_VALID) or np.any(segment >= EEG_RAW_MAX_VALID):
-            reasons.append("rail_saturation")
-        ptp = float(np.ptp(segment))
-        if ptp > EEG_SEGMENT_MAX_PTP:
-            reasons.append(f"ptp>{EEG_SEGMENT_MAX_PTP:g}")
-        median = float(np.median(segment))
-        max_dev = float(np.max(np.abs(segment - median)))
-        if max_dev > EEG_SEGMENT_MAX_DEVIATION:
-            reasons.append(f"deviation>{EEG_SEGMENT_MAX_DEVIATION:g}")
-
-        rejected = 1 if reasons else 0
-        reason_text = ";".join(reasons)
-        for index in range(start, end):
-            segment_ids[index] = segment_id
-            reject_flags[index] = rejected
-            reject_reasons[index] = reason_text
-
-    reject_rate = sum(reject_flags) / count
-    return segment_ids, reject_flags, reject_reasons, reject_rate
+    quality = build_threshold_rejection(np.asarray(values, dtype=np.float64), sample_rate)
+    segment_ids = [index // segment_size for index in range(count)]
+    reject_flags = quality.reject_mask.astype(int).tolist()
+    reject_reasons = quality.reject_reasons or [""] * count
+    suspicious_mask = (
+        quality.suspicious_mask
+        if quality.suspicious_mask is not None
+        else np.zeros(count, dtype=bool)
+    )
+    suspicious_flags = suspicious_mask.astype(int).tolist()
+    suspicious_reasons = quality.suspicious_reasons or [""] * count
+    return (
+        segment_ids,
+        reject_flags,
+        reject_reasons,
+        quality.reject_rate,
+        suspicious_flags,
+        suspicious_reasons,
+        quality.suspicious_rate,
+    )
 
 
 class AlphaPhaseTracker:
@@ -1259,10 +1251,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         measured = self._rhythm.measured_sample_rate
         if measured is not None and measured > 0:
             sample_rate = measured
-        segment_ids, reject_flags, reject_reasons, reject_rate = _build_eeg_rejection_tags(
-            self._eeg_raw_record,
-            sample_rate,
-        )
+        (
+            segment_ids,
+            reject_flags,
+            reject_reasons,
+            reject_rate,
+            suspicious_flags,
+            suspicious_reasons,
+            suspicious_rate,
+        ) = _build_eeg_rejection_tags(self._eeg_raw_record, sample_rate)
         try:
             with path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
@@ -1275,6 +1272,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         "is_rejected",
                         "reject_reason",
                         "reject_rate",
+                        "is_suspicious",
+                        "suspicious_reason",
+                        "suspicious_rate",
                     ]
                 )
                 for index, value in enumerate(self._eeg_raw_record):
@@ -1287,6 +1287,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                             reject_flags[index],
                             reject_reasons[index],
                             f"{reject_rate:.6f}",
+                            suspicious_flags[index],
+                            suspicious_reasons[index],
+                            f"{suspicious_rate:.6f}",
                         ]
                     )
             self._log(
@@ -1294,6 +1297,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"({len(self._eeg_raw_record)} 点 @ {sample_rate:.0f} Hz)"
             )
             self._log(f"阈值拒绝率: {reject_rate:.1%}")
+            self._log(f"可疑片段率: {suspicious_rate:.1%}")
             if reject_rate > EEG_REJECT_RATE_WARN:
                 self._log("拒绝率过高，本次数据不建议用于样本分析")
             return path, sample_rate, reject_rate

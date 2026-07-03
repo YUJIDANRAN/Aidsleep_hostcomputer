@@ -60,10 +60,21 @@ def convert_one(src: Path, sample_rate: float) -> dict[str, object]:
                 "is_rejected",
                 "reject_reason",
                 "reject_rate",
+                "is_suspicious",
+                "suspicious_reason",
+                "suspicious_rate",
             ]
         )
+        suspicious_mask = (
+            quality.suspicious_mask
+            if quality.suspicious_mask is not None
+            else np.zeros(len(raw_values), dtype=bool)
+        )
+        reject_reasons = quality.reject_reasons or [""] * len(raw_values)
+        suspicious_reasons = quality.suspicious_reasons or [""] * len(raw_values)
         for index, value in enumerate(raw_values):
             rejected = int(quality.reject_mask[index])
+            suspicious = int(suspicious_mask[index])
             writer.writerow(
                 [
                     index,
@@ -72,8 +83,11 @@ def convert_one(src: Path, sample_rate: float) -> dict[str, object]:
                     timestamps[index],
                     index // segment_size,
                     rejected,
-                    "threshold_reject" if rejected else "",
+                    reject_reasons[index],
                     f"{quality.reject_rate:.6f}",
+                    suspicious,
+                    suspicious_reasons[index],
+                    f"{quality.suspicious_rate:.6f}",
                 ]
             )
 
@@ -89,6 +103,7 @@ def convert_one(src: Path, sample_rate: float) -> dict[str, object]:
         "mean": float(np.mean(raw_values)) if len(raw_values) else "",
         "std": float(np.std(raw_values, ddof=1)) if len(raw_values) > 1 else "",
         "reject_rate": quality.reject_rate,
+        "suspicious_rate": quality.suspicious_rate,
     }
 
 
@@ -114,6 +129,7 @@ def main() -> None:
         "mean",
         "std",
         "reject_rate",
+        "suspicious_rate",
     ]
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -125,7 +141,8 @@ def main() -> None:
             f"{item['output']} | rows={item['rows']} "
             f"duration={item['duration_s']:.2f}s "
             f"range={item['min']}-{item['max']} "
-            f"reject={item['reject_rate']:.1%}"
+            f"reject={item['reject_rate']:.1%} "
+            f"suspicious={item['suspicious_rate']:.1%}"
         )
     print(f"summary: {summary_path.resolve()}")
 

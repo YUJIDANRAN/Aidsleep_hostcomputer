@@ -27,6 +27,9 @@ EEG_RAW_MIN_VALID = 50
 EEG_RAW_MAX_VALID = 4045
 EEG_SEGMENT_MAX_PTP = 1200.0
 EEG_SEGMENT_MAX_DEVIATION = 800.0
+EEG_ADAPTIVE_MAD_MULT = 5.0
+EEG_SUSPICIOUS_MIN_PTP = 250.0
+EEG_SUSPICIOUS_MIN_DIFF = 100.0
 
 # 在 0.5–40 Hz 带通范围内的标准节律划分
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
@@ -115,10 +118,23 @@ class EegQualityInfo:
     reject_rate: float
     has_tag: bool = False
     source: str = "none"
+    suspicious_mask: np.ndarray | None = None
+    suspicious_rate: float = 0.0
+    reject_reasons: list[str] | None = None
+    suspicious_reasons: list[str] | None = None
 
     @property
     def has_rejection(self) -> bool:
         return bool(self.has_tag and self.reject_mask.size and np.any(self.reject_mask))
+
+    @property
+    def has_suspicious(self) -> bool:
+        return bool(
+            self.has_tag
+            and self.suspicious_mask is not None
+            and self.suspicious_mask.size
+            and np.any(self.suspicious_mask)
+        )
 
 
 class RhythmStreamProcessor:
@@ -247,32 +263,94 @@ def build_threshold_rejection(
     values: np.ndarray,
     sample_rate: float,
 ) -> EegQualityInfo:
-    """没有 CSV tag 时，按保存端同一规则现场计算阈值拒绝。"""
+    """按 1 s 片段打质量标签：严重坏段 rejected，可疑段 suspicious。"""
     count = values.size
     if count == 0:
-        return EegQualityInfo(np.zeros(0, dtype=bool), 0.0, has_tag=False)
+        empty = np.zeros(0, dtype=bool)
+        return EegQualityInfo(empty, 0.0, has_tag=False, suspicious_mask=empty)
 
     reject_mask = np.zeros(count, dtype=bool)
+    suspicious_mask = np.zeros(count, dtype=bool)
+    reject_reasons = [""] * count
+    suspicious_reasons = [""] * count
     segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
+    segments: list[tuple[int, int, np.ndarray]] = []
+    ptp_values: list[float] = []
+    diff_values: list[float] = []
+
     for start in range(0, count, segment_size):
         end = min(count, start + segment_size)
         segment = values[start:end].astype(np.float64, copy=False)
-        rejected = False
+        segments.append((start, end, segment))
+        ptp_values.append(float(np.ptp(segment)))
+        diffs = np.diff(segment)
+        diff_values.append(float(np.max(np.abs(diffs))) if diffs.size else 0.0)
 
+    def _adaptive_threshold(metrics: list[float], floor: float) -> float:
+        if not metrics:
+            return floor
+        arr = np.asarray(metrics, dtype=np.float64)
+        median = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - median)))
+        return max(floor, median + EEG_ADAPTIVE_MAD_MULT * mad)
+
+    ptp_suspicious_threshold = _adaptive_threshold(
+        ptp_values,
+        EEG_SUSPICIOUS_MIN_PTP,
+    )
+    diff_suspicious_threshold = _adaptive_threshold(
+        diff_values,
+        EEG_SUSPICIOUS_MIN_DIFF,
+    )
+
+    for idx, (start, end, segment) in enumerate(segments):
+        reject_reason_parts: list[str] = []
+        suspicious_reason_parts: list[str] = []
         if np.any(segment <= EEG_RAW_MIN_VALID) or np.any(segment >= EEG_RAW_MAX_VALID):
-            rejected = True
-        if float(np.ptp(segment)) > EEG_SEGMENT_MAX_PTP:
-            rejected = True
+            reject_reason_parts.append("rail_saturation")
+        ptp = ptp_values[idx]
+        if ptp > EEG_SEGMENT_MAX_PTP:
+            reject_reason_parts.append(f"ptp>{EEG_SEGMENT_MAX_PTP:g}")
         median = float(np.median(segment))
         max_dev = float(np.max(np.abs(segment - median)))
         if max_dev > EEG_SEGMENT_MAX_DEVIATION:
-            rejected = True
+            reject_reason_parts.append(f"deviation>{EEG_SEGMENT_MAX_DEVIATION:g}")
 
-        if rejected:
+        max_diff = diff_values[idx]
+        if ptp > ptp_suspicious_threshold:
+            suspicious_reason_parts.append(
+                f"adaptive_ptp>{ptp_suspicious_threshold:g}"
+            )
+        if max_diff > diff_suspicious_threshold:
+            suspicious_reason_parts.append(
+                f"adaptive_diff>{diff_suspicious_threshold:g}"
+            )
+
+        if reject_reason_parts:
             reject_mask[start:end] = True
+            reason = ";".join(reject_reason_parts)
+            for point_idx in range(start, end):
+                reject_reasons[point_idx] = reason
+        elif suspicious_reason_parts:
+            suspicious_mask[start:end] = True
+            reason = ";".join(suspicious_reason_parts)
+            for point_idx in range(start, end):
+                suspicious_reasons[point_idx] = reason
 
     reject_rate = float(np.mean(reject_mask)) if reject_mask.size else 0.0
-    return EegQualityInfo(reject_mask, reject_rate, has_tag=True, source="computed")
+    suspicious_rate = (
+        float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
+    )
+    return EegQualityInfo(
+        reject_mask,
+        reject_rate,
+        has_tag=True,
+        source="computed",
+        suspicious_mask=suspicious_mask,
+        suspicious_rate=suspicious_rate,
+        reject_reasons=reject_reasons,
+        suspicious_reasons=suspicious_reasons,
+    )
 
 
 def read_eeg_quality(
@@ -283,7 +361,13 @@ def read_eeg_quality(
 ) -> EegQualityInfo:
     """读取 CSV 中的阈值拒绝 tag；旧文件没有 tag 时返回 0 拒绝率。"""
     path = Path(data_path)
-    empty = EegQualityInfo(np.zeros(expected_len, dtype=bool), 0.0, has_tag=False)
+    empty_mask = np.zeros(expected_len, dtype=bool)
+    empty = EegQualityInfo(
+        empty_mask,
+        0.0,
+        has_tag=False,
+        suspicious_mask=empty_mask.copy(),
+    )
     if path.suffix.lower() not in {".csv", ".txt"}:
         return empty
 
@@ -293,19 +377,76 @@ def read_eeg_quality(
             return build_threshold_rejection(raw_values, sample_rate)
         return empty
 
+    computed = (
+        build_threshold_rejection(raw_values, sample_rate)
+        if raw_values is not None
+        else None
+    )
+
+    def _fit_mask(mask: np.ndarray) -> np.ndarray:
+        if mask.size < expected_len:
+            return np.pad(mask, (0, expected_len - mask.size), constant_values=False)
+        if mask.size > expected_len:
+            return mask[:expected_len]
+        return mask
+
     flags = pd.to_numeric(frame["is_rejected"], errors="coerce").fillna(0)
-    mask = flags.to_numpy(dtype=np.float64) > 0
-    if mask.size < expected_len:
-        mask = np.pad(mask, (0, expected_len - mask.size), constant_values=False)
-    elif mask.size > expected_len:
-        mask = mask[:expected_len]
+    mask = _fit_mask(flags.to_numpy(dtype=np.float64) > 0)
 
     reject_rate = float(np.mean(mask)) if mask.size else 0.0
     if "reject_rate" in frame.columns:
         rates = pd.to_numeric(frame["reject_rate"], errors="coerce").dropna()
         if not rates.empty:
             reject_rate = float(rates.iloc[0])
-    return EegQualityInfo(mask, reject_rate, has_tag=True, source="csv")
+
+    if "is_suspicious" in frame.columns:
+        suspicious_flags = pd.to_numeric(
+            frame["is_suspicious"], errors="coerce"
+        ).fillna(0)
+        suspicious_mask = _fit_mask(
+            suspicious_flags.to_numpy(dtype=np.float64) > 0
+        )
+        suspicious_mask = suspicious_mask & ~mask
+        suspicious_rate = (
+            float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
+        )
+        if "suspicious_rate" in frame.columns:
+            rates = pd.to_numeric(
+                frame["suspicious_rate"], errors="coerce"
+            ).dropna()
+            if not rates.empty:
+                suspicious_rate = float(rates.iloc[0])
+        suspicious_reasons = (
+            frame["suspicious_reason"].fillna("").astype(str).to_list()
+            if "suspicious_reason" in frame.columns
+            else None
+        )
+    elif computed is not None and computed.suspicious_mask is not None:
+        suspicious_mask = computed.suspicious_mask & ~mask
+        suspicious_rate = (
+            float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
+        )
+        suspicious_reasons = computed.suspicious_reasons
+    else:
+        suspicious_mask = np.zeros(expected_len, dtype=bool)
+        suspicious_rate = 0.0
+        suspicious_reasons = None
+
+    reject_reasons = (
+        frame["reject_reason"].fillna("").astype(str).to_list()
+        if "reject_reason" in frame.columns
+        else None
+    )
+    return EegQualityInfo(
+        mask,
+        reject_rate,
+        has_tag=True,
+        source="csv",
+        suspicious_mask=suspicious_mask,
+        suspicious_rate=suspicious_rate,
+        reject_reasons=reject_reasons,
+        suspicious_reasons=suspicious_reasons,
+    )
 
 
 def _rejected_spans(
@@ -589,7 +730,10 @@ def plot_band_powers(
     fig, axes = plt.subplots(3, 1, figsize=(10, 11), constrained_layout=True)
     quality_text = ""
     if quality is not None and quality.has_tag:
-        quality_text = f" | 阈值拒绝率 {quality.reject_rate:.1%}"
+        quality_text = (
+            f" | 阈值拒绝率 {quality.reject_rate:.1%}"
+            f" | 可疑率 {quality.suspicious_rate:.1%}"
+        )
     fig.suptitle(f"{title}{quality_text}", fontsize=14, fontweight="bold")
 
     ax_psd = axes[0]
@@ -852,13 +996,28 @@ def plot_band_waveforms(
             start_seconds=t0,
             end_seconds=t1,
         )
+    suspicious_spans: list[tuple[float, float]] = []
+    if (
+        quality is not None
+        and quality.has_suspicious
+        and quality.suspicious_mask is not None
+    ):
+        suspicious_spans = _rejected_spans(
+            quality.suspicious_mask,
+            sample_rate,
+            start_seconds=t0,
+            end_seconds=t1,
+        )
 
     fig, axes = plt.subplots(len(names), 1, figsize=(12, 10), sharex=True, constrained_layout=True)
     if len(names) == 1:
         axes = [axes]
     quality_text = ""
     if quality is not None and quality.has_tag:
-        quality_text = f" | 阈值拒绝率 {quality.reject_rate:.1%}"
+        quality_text = (
+            f" | 阈值拒绝率 {quality.reject_rate:.1%}"
+            f" | 可疑率 {quality.suspicious_rate:.1%}"
+        )
     fig.suptitle(
         f"{title}（{t0:.1f}–{t1:.1f} s）{quality_text}",
         fontsize=14,
@@ -869,6 +1028,8 @@ def plot_band_waveforms(
         low, high = EEG_BANDS[name]
         y = sliced[name]
         ax.plot(time_axis, y, color=BAND_COLORS[name], lw=0.6)
+        for span_start, span_end in suspicious_spans:
+            ax.axvspan(span_start, span_end, color="#FBC02D", alpha=0.16, lw=0)
         for span_start, span_end in rejected_spans:
             ax.axvspan(span_start, span_end, color="#D32F2F", alpha=0.12, lw=0)
         ax.set_ylabel(f"{BAND_LABELS[name]}\n({low:g}-{high:g} Hz)")
@@ -876,7 +1037,12 @@ def plot_band_waveforms(
         ax.margins(x=0)
 
     axes[-1].set_xlabel("时间 (s)")
-    title_suffix = "；红色背景=阈值拒绝片段" if rejected_spans else ""
+    labels = []
+    if rejected_spans:
+        labels.append("红色背景=坏段")
+    if suspicious_spans:
+        labels.append("黄色背景=可疑段")
+    title_suffix = f"；{'，'.join(labels)}" if labels else ""
     axes[0].set_title(f"各节律窄带滤波波形（自上而下：δ → γ）{title_suffix}")
 
     if save_path is not None:
@@ -927,10 +1093,16 @@ def run_analysis(
     print(f"样本数: {len(raw)}  |  采样率: {sample_rate:g} Hz  |  时长: {duration:.2f} s")
     if quality.has_tag:
         rejected = int(np.count_nonzero(quality.reject_mask))
+        suspicious = (
+            int(np.count_nonzero(quality.suspicious_mask))
+            if quality.suspicious_mask is not None
+            else 0
+        )
         source_label = "CSV tag" if quality.source == "csv" else "现场计算"
         print(
             f"阈值拒绝: {quality.reject_rate:.1%} ({rejected}/{len(raw)} 点, {source_label})"
         )
+        print(f"可疑片段: {quality.suspicious_rate:.1%} ({suspicious}/{len(raw)} 点)")
     print(f"带通滤波: {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz (零相位 sosfiltfilt)")
     print()
     print(format_results(result))
@@ -993,14 +1165,14 @@ def run_analysis(
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"E:\qt_project\pyqt\Host_computer_6\Host_computer_6\Sample\jiyu_open40_close120_1\eeg_raw_converted.csv"
+    xlsx_file = r"E:\qt_project\pyqt\Host_computer_6\Host_computer_6\Result\eeg_threshold_reject_demo\eeg_raw.csv"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)
     show_waveform = True    # 是否弹出各节律波形图窗口
     save_waveform = True   # 是否保存波形图 (*_band_waveform.png)
     waveform_seconds = 0  # 从 0 秒起显示 N 秒；None 则显示整段（time_range 未设置时）
-    waveform_time_range = (0, 60)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
+    waveform_time_range = (0, 120)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
     show_fft = True
     save_fft = True
     fft_time_range = None  # None=整段 FFT；(10, 20) 仅对 10–20 s 画 FFT
