@@ -1310,7 +1310,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "助眠音效已启动: "
             f"暖机 {p.warmup_sec:g}s，最小间隔 {p.min_interval_sec:g}s，"
             f"ERP 延迟 {p.erp_latency_sec * 1000:g} ms，"
-            f"burst {p.burst_freq_hz:g} Hz / {p.burst_duration_ms:g} ms"
+            f"粉噪 burst {p.burst_duration_ms:g} ms"
         )
 
     def _on_sleep_aid_burst(self, count: float) -> None:

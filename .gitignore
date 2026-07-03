@@ -1,0 +1,21 @@
+# Runtime outputs
+/Result/
+
+# Local backup folders
+/Host_computer_6_nested_backup_*/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+

@@ -1,6 +1,6 @@
 """
 立体声正弦波输出控制：左/右声道频率、相位与播放时长；
-助眠闭环：Alpha 波谷相位锁定短促 burst 刺激。
+助眠闭环：Alpha 波谷相位锁定短促粉噪 burst 刺激。
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ SLEEP_AID_AUDIO_LATENCY_SEC = 0.0  ## 音频线直连振子：模拟传输可忽
 SLEEP_AID_FILTER_DELAY_SEC = 0.030
 SLEEP_AID_PLAY_LATENCY = "low"  ## sounddevice 低延迟输出（声卡缓冲仍须实测标定）
 SLEEP_AID_TRIGGER_TOLERANCE_SEC = 0.004
-SLEEP_AID_BURST_FREQ_HZ = 1000.0
 SLEEP_AID_BURST_DURATION_MS = 20.0
 SLEEP_AID_BURST_AMPLITUDE = 0.3
 
@@ -205,23 +204,31 @@ class SleepAidParams:
     audio_latency_sec: float = SLEEP_AID_AUDIO_LATENCY_SEC
     filter_delay_sec: float = SLEEP_AID_FILTER_DELAY_SEC
     trigger_tolerance_sec: float = SLEEP_AID_TRIGGER_TOLERANCE_SEC
-    burst_freq_hz: float = SLEEP_AID_BURST_FREQ_HZ
     burst_duration_ms: float = SLEEP_AID_BURST_DURATION_MS
     burst_amplitude: float = SLEEP_AID_BURST_AMPLITUDE
 
 
-def make_tone_burst_stereo(
+def make_pink_noise_burst_stereo(
     *,
     sample_rate: float = DEFAULT_SAMPLE_RATE,
-    frequency_hz: float = SLEEP_AID_BURST_FREQ_HZ,
     duration_ms: float = SLEEP_AID_BURST_DURATION_MS,
     amplitude: float = SLEEP_AID_BURST_AMPLITUDE,
+    rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """生成 Hanning 包络立体声 tone burst，形状 (frames, 2)。"""
+    """生成 Hanning 包络立体声粉噪 burst，形状 (frames, 2)。"""
     frames = max(1, int(sample_rate * duration_ms / 1000.0))
-    t = np.arange(frames, dtype=np.float64) / sample_rate
+    gen = rng if rng is not None else np.random.default_rng()
+    white = gen.standard_normal(frames)
+    spec = np.fft.rfft(white)
+    freqs = np.fft.rfftfreq(frames, d=1.0 / sample_rate)
+    freqs[0] = freqs[1] if len(freqs) > 1 else 1.0
+    spec *= 1.0 / np.sqrt(freqs)
+    mono = np.fft.irfft(spec, n=frames)
+    peak = float(np.max(np.abs(mono)))
+    if peak > 0.0:
+        mono /= peak
     envelope = np.hanning(frames)
-    mono = amplitude * envelope * np.sin(2.0 * np.pi * frequency_hz * t)
+    mono = amplitude * envelope * mono
     stereo = np.column_stack([mono, mono]).astype(np.float32)
     return stereo
 
@@ -250,12 +257,7 @@ class SleepAidStimulusController:
             device = device_idx
         self._device = device
         self._on_triggered = on_triggered
-        self._burst = make_tone_burst_stereo(
-            sample_rate=self._sample_rate,
-            frequency_hz=self._params.burst_freq_hz,
-            duration_ms=self._params.burst_duration_ms,
-            amplitude=self._params.burst_amplitude,
-        )
+        self._rng = np.random.default_rng()
         self._lock = threading.Lock()
         self._active = False
         self._started_at = 0.0
@@ -340,8 +342,14 @@ class SleepAidStimulusController:
         return True
 
     def _play_burst(self) -> None:
+        burst = make_pink_noise_burst_stereo(
+            sample_rate=self._sample_rate,
+            duration_ms=self._params.burst_duration_ms,
+            amplitude=self._params.burst_amplitude,
+            rng=self._rng,
+        )
         sd.play(
-            self._burst,
+            burst,
             samplerate=self._sample_rate,
             device=self._device,
             blocking=False,

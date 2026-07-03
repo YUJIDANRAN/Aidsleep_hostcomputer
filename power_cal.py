@@ -831,19 +831,19 @@ def run_analysis(
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"C:\Users\liudi\Desktop\aidSleepProject\EEG_Multi-object_detection20260603\jiyu_open80_close40_2\jiyu_open80_close40_2.xlsx"
+    xlsx_file = r"C:\Users\liudi\Desktop\信号质量检测gelin\jiyu0pen30close30_gelin.xlsx"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)
     show_waveform = True    # 是否弹出各节律波形图窗口
     save_waveform = True   # 是否保存波形图 (*_band_waveform.png)
     waveform_seconds = 0  # 从 0 秒起显示 N 秒；None 则显示整段（time_range 未设置时）
-    waveform_time_range = (10, 11)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
+    waveform_time_range = (0, 60)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
     show_fft = True
     save_fft = True
     fft_time_range = None  # None=整段 FFT；(10, 20) 仅对 10–20 s 画 FFT
     # 两段对比：计算相同节律功率比 B/A，并出对比图
-    compare_segments = ((20,30), (100, 110))  # (段A起止秒), (段B起止秒)；None 关闭
+    compare_segments = ((120,180), (300, 360))  # (段A起止秒), (段B起止秒)；None 关闭
     show_segment_compare = True
     save_segment_compare = True
     # =====================================
