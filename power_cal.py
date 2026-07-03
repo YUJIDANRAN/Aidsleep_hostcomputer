@@ -22,14 +22,49 @@ DEFAULT_SAMPLE_RATE = float(
 
 BANDPASS_LOW_HZ = 0.5
 BANDPASS_HIGH_HZ = 40.0
+
+# ===== EEG 阈值拒绝/可疑段参数 =====
+# 检测按固定时长切片，目前每 1 秒判断一次；调小会更精细，但也更容易被瞬时噪声影响。
 EEG_REJECT_SEGMENT_SEC = 1.0
+
+# ADC 贴边饱和坏段阈值：原始值 <= 50 或 >= 4045 时标红。
+# 适合 12 bit ADC (0-4095)。如果硬件有效范围变窄/变宽，再同步调整。
 EEG_RAW_MIN_VALID = 50
 EEG_RAW_MAX_VALID = 4045
+
+# 原始 1 秒片段峰峰值坏段阈值：max(segment)-min(segment) 超过该值标红。
+# 主要抓大幅运动伪迹、严重电极扰动、接触不良；调小会更严格。
 EEG_SEGMENT_MAX_PTP = 1200.0
+
+# 原始 1 秒片段偏离中位数坏段阈值：单点离该秒中位数太远时标红。
+# 主要抓特别大的尖峰/跳变；调小会更严格。
 EEG_SEGMENT_MAX_DEVIATION = 800.0
+
+# 自适应可疑段倍率：阈值 = 全部 1 秒片段的 median + N*MAD。
+# 同时作用于 EEG_SUSPICIOUS_MIN_PTP 和 EEG_SUSPICIOUS_MIN_DIFF 对应规则。
+# 调小更敏感、黄段更多；调大更保守、黄段更少。
 EEG_ADAPTIVE_MAD_MULT = 5.0
-EEG_SUSPICIOUS_MIN_PTP = 250.0
-EEG_SUSPICIOUS_MIN_DIFF = 100.0
+
+# 原始 1 秒峰峰值可疑段最低阈值。
+# 实际阈值取 max(该值, median + EEG_ADAPTIVE_MAD_MULT*MAD)。
+# 主要抓比全局背景明显更“抖”的片段；调小会更容易标黄。
+EEG_SUSPICIOUS_MIN_PTP = 200.0
+
+# 原始 1 秒内最大相邻跳变可疑段最低阈值。
+# 实际阈值取 max(该值, median + EEG_ADAPTIVE_MAD_MULT*MAD)。
+# 主要抓短促尖峰、突然跳点；调小会更容易标黄。
+EEG_SUSPICIOUS_MIN_DIFF = 60.0
+
+# δ(0.5-4 Hz)滤波后 RMS 可疑段 MAD 倍率。
+# 阈值候选 = delta_rms_median + N*delta_rms_MAD。
+# 主要抓低频慢漂/电极扰动/运动造成的 δ 行突刺；只标黄，不标红。
+# 调小更容易抓低频异常；调大更保守。
+EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT = 6.0
+
+# δ RMS 相对背景的最低倍数门槛。
+# 最终 δ RMS 阈值 = max(median*该倍数, median + MAD_MULT*MAD)。
+# 防止 MAD 很小时阈值过低；调小更敏感，调大更保守。
+EEG_SUSPICIOUS_DELTA_RMS_RATIO = 2.0
 
 # 在 0.5–40 Hz 带通范围内的标准节律划分
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
@@ -277,6 +312,7 @@ def build_threshold_rejection(
     segments: list[tuple[int, int, np.ndarray]] = []
     ptp_values: list[float] = []
     diff_values: list[float] = []
+    delta_rms_values: list[float] = []
 
     for start in range(0, count, segment_size):
         end = min(count, start + segment_size)
@@ -285,6 +321,23 @@ def build_threshold_rejection(
         ptp_values.append(float(np.ptp(segment)))
         diffs = np.diff(segment)
         diff_values.append(float(np.max(np.abs(diffs))) if diffs.size else 0.0)
+
+    try:
+        delta_signal = bandpass_filter(
+            values.astype(np.float64, copy=False),
+            sample_rate,
+            0.5,
+            4.0,
+        )
+    except ValueError:
+        delta_signal = None
+
+    for start, end, _segment in segments:
+        if delta_signal is None:
+            delta_rms_values.append(0.0)
+            continue
+        delta_segment = delta_signal[start:end]
+        delta_rms_values.append(float(np.sqrt(np.mean(delta_segment * delta_segment))))
 
     def _adaptive_threshold(metrics: list[float], floor: float) -> float:
         if not metrics:
@@ -302,6 +355,16 @@ def build_threshold_rejection(
         diff_values,
         EEG_SUSPICIOUS_MIN_DIFF,
     )
+    if delta_rms_values:
+        delta_rms_arr = np.asarray(delta_rms_values, dtype=np.float64)
+        delta_rms_median = float(np.median(delta_rms_arr))
+        delta_rms_mad = float(np.median(np.abs(delta_rms_arr - delta_rms_median)))
+        delta_rms_suspicious_threshold = max(
+            delta_rms_median * EEG_SUSPICIOUS_DELTA_RMS_RATIO,
+            delta_rms_median + EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT * delta_rms_mad,
+        )
+    else:
+        delta_rms_suspicious_threshold = float("inf")
 
     for idx, (start, end, segment) in enumerate(segments):
         reject_reason_parts: list[str] = []
@@ -324,6 +387,11 @@ def build_threshold_rejection(
         if max_diff > diff_suspicious_threshold:
             suspicious_reason_parts.append(
                 f"adaptive_diff>{diff_suspicious_threshold:g}"
+            )
+        delta_rms = delta_rms_values[idx]
+        if delta_rms > delta_rms_suspicious_threshold:
+            suspicious_reason_parts.append(
+                f"delta_rms>{delta_rms_suspicious_threshold:g}"
             )
 
         if reject_reason_parts:
@@ -382,6 +450,8 @@ def read_eeg_quality(
         if raw_values is not None
         else None
     )
+    if computed is not None:
+        return computed
 
     def _fit_mask(mask: np.ndarray) -> np.ndarray:
         if mask.size < expected_len:
@@ -1165,7 +1235,7 @@ def run_analysis(
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"E:\qt_project\pyqt\Host_computer_6\Host_computer_6\Result\eeg_threshold_reject_demo\eeg_raw.csv"
+    xlsx_file = r"Sample/weiyu_open60_close60/weiyu_open60_close60_converted.csv"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)
