@@ -64,6 +64,20 @@ from controller import (
 
 DEFAULT_SERIAL_PORT = "COM6"  ## EEG 默认串口
 DEFAULT_OSC_SERIAL_PORT = "COM7"  ## 振子默认串口
+SERIAL_BAUDRATES = ("9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600")
+SERIAL_DATA_BITS = ("5", "6", "7", "8")
+SERIAL_PARITIES = (
+    ("None", "N"),
+    ("Even", "E"),
+    ("Odd", "O"),
+    ("Mark", "M"),
+    ("Space", "S"),
+)
+SERIAL_STOP_BITS = (
+    ("1", 1),
+    ("1.5", 1.5),
+    ("2", 2),
+)
 LOG_MAX_LINES = 20  ## 日志最大行数
 OSC_DISPLAY_RATE = 100  ## 界面波形约 100 点/秒（由 1000 Hz 每 10 点取 1 点）
 OSC_DECIM_FACTOR = max(1, int(OSC_SAMPLE_RATE / OSC_DISPLAY_RATE))  ## 1000→100 显示
@@ -853,6 +867,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._port = ""  ## 当前已连接的 EEG 串口
         self._osc_port = ""  ## 当前已连接的振子串口
         self._baudrate = baudrate  ## 波特率
+        self._rebuild_control_panels(baudrate)
         self._link: Optional[Ks1082Serial | EegCsvReplay] = None  ## EEG 串口或 CSV 模拟
         self._osc_link: Optional[OscillatorSerial] = None  ## 振子串口连接
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
@@ -978,8 +993,143 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if self._running:
             self._log("默认 raw 模式，已自动开始采集")
 
+    @staticmethod
+    def _panel_label(text: str, parent: QtWidgets.QWidget) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text, parent)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        label.setMinimumHeight(28)
+        return label
+
+    @staticmethod
+    def _set_combo_text(combo: QtWidgets.QComboBox, text: str) -> None:
+        index = combo.findText(text)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _rebuild_control_panels(self, baudrate: int) -> None:
+        """Apply Designer-defined layout defaults and wire runtime-only behavior."""
+        for name in (
+            "textEdit",
+            "textEdit_2",
+            "textEdit_3",
+            "textEdit_4",
+            "textEdit_5",
+            "textEdit_6",
+            "textEdit_7",
+            "textEdit_8",
+            "textEdit_9",
+            "textEdit_10",
+        ):
+            widget = getattr(self.ui, name, None)
+            if widget is not None:
+                widget.hide()
+
+        self.ui.groupBox.setTitle("功能控制")
+        self.ui.groupBox_2.setTitle("助眠音频")
+        self.ui.functionScrollArea.setWidgetResizable(True)
+        self.ui.functionScrollArea.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.ui.functionScrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.ui.functionScrollArea.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+
+        self.ui.pushButton_2.setFixedHeight(34)
+        self.ui.pushButton_6.setFixedHeight(34)
+        self.ui.groupBox_eeg_display.setMinimumHeight(210)
+        self.ui.groupBox_osc_display.setMinimumHeight(210)
+        self.ui.groupBox_2.setMinimumHeight(285)
+        self.ui.pushButton_7.setMinimumSize(92, 42)
+        self.ui.pushButton_8.setMinimumSize(180, 42)
+        self.ui.pushButton_8.setStyleSheet(
+            "QPushButton { background:#2F7D3B; color:white; font-weight:bold; border:none; border-radius:6px; }"
+            "QPushButton:hover { background:#256A31; }"
+        )
+
+        self.ui.plainTextEdit.setMinimumSize(420, 82)
+        self.ui.plainTextEdit.setMaximumHeight(96)
+        self.ui.timeEdit.setMaximumHeight(40)
+        self.ui.lcdNumber.setMinimumHeight(36)
+        self.ui.lineEdit_13.setMaximumHeight(34)
+        self.ui.lineEdit_3.setMinimumWidth(170)
+
+        self.ui.comboBox_serial_baud.clear()
+        self.ui.comboBox_serial_baud.addItems(SERIAL_BAUDRATES)
+        self._set_combo_text(self.ui.comboBox_serial_baud, str(baudrate))
+        self.ui.comboBox_serial_data_bits.clear()
+        self.ui.comboBox_serial_data_bits.addItems(SERIAL_DATA_BITS)
+        self._set_combo_text(self.ui.comboBox_serial_data_bits, "8")
+        self.ui.comboBox_serial_parity.clear()
+        for label, value in SERIAL_PARITIES:
+            self.ui.comboBox_serial_parity.addItem(label, value)
+        self.ui.comboBox_serial_stop_bits.clear()
+        for label, value in SERIAL_STOP_BITS:
+            self.ui.comboBox_serial_stop_bits.addItem(label, value)
+
+        for edit in (self.ui.lineEdit_5, self.ui.lineEdit_4):
+            edit.setMinimumWidth(92)
+        for combo in (
+            self.ui.comboBox_serial_baud,
+            self.ui.comboBox_serial_parity,
+            self.ui.comboBox_serial_data_bits,
+            self.ui.comboBox_serial_stop_bits,
+        ):
+            combo.setMinimumWidth(76)
+        self.ui.pushButton_serial_toggle.setMinimumSize(96, 32)
+        self.ui.pushButton_serial_toggle.setText("打开串口")
+        self.ui.pushButton_serial_toggle.setStyleSheet(
+            "QPushButton { background:#2563EB; color:white; font-weight:bold; border:none; border-radius:6px; }"
+            "QPushButton:hover { background:#1D4ED8; }"
+        )
+
+        try:
+            self.ui.pushButton_browse_csv.clicked.disconnect()
+        except TypeError:
+            pass
+        self.ui.pushButton_browse_csv.clicked.connect(self._browse_eeg_replay_csv)
+        try:
+            self.ui.pushButton_serial_toggle.clicked.disconnect()
+        except TypeError:
+            pass
+        self.ui.pushButton_serial_toggle.clicked.connect(self._toggle_serial_connection)
+
+        self.ui.pushButton.setMinimumSize(130, 78)
+        self.ui.bottomPanel.raise_()
+        self._layout_main_regions()
+
+    def _layout_main_regions(self) -> None:
+        """Resize the plot, right controls, and bottom controls with the window."""
+        cw = self.ui.centralwidget
+        width = max(640, cw.width())
+        height = max(520, cw.height())
+        margin = 10
+        gap = 10
+        bottom_h = max(175, min(225, int(height * 0.2)))
+        top_h = max(320, height - bottom_h - margin * 2 - gap)
+        right_w = max(420, min(720, int(width * 0.34)))
+        left_w = width - right_w - margin * 2 - gap
+        if left_w < 520:
+            left_w = max(320, int(width * 0.58))
+            right_w = max(280, width - left_w - margin * 2 - gap)
+
+        plot_rect = QtCore.QRect(margin, margin, left_w, top_h)
+        self.ui.stackedWidget.setGeometry(plot_rect)
+        view_margin = 20
+        view_w = max(200, plot_rect.width() - view_margin * 2)
+        view_h = max(160, plot_rect.height() - view_margin * 2)
+        self.ui.graphicsView.setGeometry(QtCore.QRect(view_margin, view_margin, view_w, view_h))
+
+        right_x = margin + left_w + gap
+        self.ui.groupBox.setGeometry(QtCore.QRect(right_x, margin, right_w, top_h))
+        self.ui.bottomPanel.setGeometry(
+            QtCore.QRect(
+                margin,
+                margin + top_h + gap,
+                max(1, width - margin * 2),
+                bottom_h,
+            )
+        )
+
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
+        self._layout_main_regions()
         self._sync_waveform_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.show()
@@ -998,6 +1148,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "填写已保存的 EEG CSV（如 Result/eeg_xxx/eeg_raw.csv）时，"
             "不读 EEG 串口，按 500 Hz 回放模拟输入"
         )
+
+    def _browse_eeg_replay_csv(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择 EEG CSV",
+            str((_ROOT / "Result").resolve()),
+            "CSV Files (*.csv *.txt);;All Files (*)",
+        )
+        if path:
+            self.ui.lineEdit_14.setText(path)
+            self._log(f"已选择 EEG CSV: {path}")
 
     def _resolve_eeg_replay_csv_path(self, text: str) -> Optional[Path]:
         raw = text.strip().strip('"').strip("'")
@@ -1595,6 +1756,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
+        if hasattr(self.ui, "bottomPanel"):
+            self._layout_main_regions()
+        if not hasattr(self, "_waveform") or not hasattr(self, "_osc_waveform"):
+            return
         self._sync_waveform_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.refresh_layout()
@@ -1733,6 +1898,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 "background-color:#9E9E9E; color:#F5F5F5; }"
             )
             btn.setText("已停止 · 启动")
+        self._refresh_serial_button()
 
     def _log_available_ports(self) -> None:
         try:
@@ -1751,6 +1917,95 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             cursor.select(QtGui.QTextCursor.BlockUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()
+
+    def _serial_settings_from_ui(self) -> Dict[str, object]:
+        baud_combo = getattr(self.ui, "comboBox_serial_baud", None)
+        data_combo = getattr(self.ui, "comboBox_serial_data_bits", None)
+        parity_combo = getattr(self.ui, "comboBox_serial_parity", None)
+        stop_combo = getattr(self.ui, "comboBox_serial_stop_bits", None)
+        baudrate = self._baudrate
+        bytesize = 8
+        parity = "N"
+        stopbits = 1
+        if baud_combo is not None:
+            try:
+                baudrate = int(baud_combo.currentText())
+            except ValueError:
+                baudrate = 115200
+        if data_combo is not None:
+            try:
+                bytesize = int(data_combo.currentText())
+            except ValueError:
+                bytesize = 8
+        if parity_combo is not None:
+            parity = str(parity_combo.currentData() or "N")
+        if stop_combo is not None:
+            stopbits = stop_combo.currentData() or 1
+        self._baudrate = baudrate
+        return {
+            "baudrate": baudrate,
+            "bytesize": bytesize,
+            "parity": parity,
+            "stopbits": stopbits,
+        }
+
+    @staticmethod
+    def _serial_settings_match(link: object, settings: Dict[str, object]) -> bool:
+        return (
+            getattr(link, "baudrate", None) == settings["baudrate"]
+            and getattr(link, "bytesize", None) == settings["bytesize"]
+            and getattr(link, "parity", None) == settings["parity"]
+            and getattr(link, "stopbits", None) == settings["stopbits"]
+        )
+
+    @staticmethod
+    def _format_serial_settings(settings: Dict[str, object]) -> str:
+        return (
+            f"{settings['baudrate']}bps "
+            f"{settings['bytesize']}{settings['parity']}{settings['stopbits']}"
+        )
+
+    def _refresh_serial_button(self) -> None:
+        btn = getattr(self.ui, "pushButton_serial_toggle", None)
+        if btn is None:
+            return
+        eeg_open = isinstance(self._link, Ks1082Serial) and self._link.is_open
+        osc_open = self._osc_link is not None and self._osc_link.is_open
+        if eeg_open or osc_open:
+            btn.setText("关闭串口")
+            btn.setStyleSheet(
+                "QPushButton { background:#B91C1C; color:white; font-weight:bold; border:none; border-radius:6px; }"
+                "QPushButton:hover { background:#991B1B; }"
+            )
+        else:
+            btn.setText("打开串口")
+            btn.setStyleSheet(
+                "QPushButton { background:#2563EB; color:white; font-weight:bold; border:none; border-radius:6px; }"
+                "QPushButton:hover { background:#1D4ED8; }"
+            )
+
+    def _toggle_serial_connection(self) -> None:
+        eeg_open = isinstance(self._link, Ks1082Serial) and self._link.is_open
+        osc_open = self._osc_link is not None and self._osc_link.is_open
+        if eeg_open or osc_open:
+            if self._link is not None:
+                self._link.close()
+            if self._osc_link is not None:
+                self._osc_link.close()
+            self._running = False
+            self._refresh_capture_button()
+            self._refresh_serial_button()
+            self._update_status_bar()
+            self._log("串口已关闭")
+            return
+
+        eeg_ok = self._open_serial()
+        osc_ok = self._open_osc_serial()
+        self._refresh_serial_button()
+        if eeg_ok or osc_ok:
+            self._log("串口已打开，可点击启动开始采集")
+        else:
+            self._log("串口打开失败，请检查端口与参数")
 
     def _ui_serial_port(self) -> str:
         """从 lineEdit_5 读取 EEG 串口号。"""
@@ -1795,42 +2050,48 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 return False
 
         port = self._ui_serial_port()
+        serial_settings = self._serial_settings_from_ui()
         try:
             if (
                 isinstance(self._link, Ks1082Serial)
                 and self._link.is_open
                 and self._link.port == port
+                and self._serial_settings_match(self._link, serial_settings)
             ):
                 return True
             if self._link is not None:
                 self._link.close()
-            self._link = Ks1082Serial(port, baudrate=self._baudrate, timeout=0.05)
+            self._link = Ks1082Serial(port, timeout=0.05, **serial_settings)
             self._link.open()
             self._port = port
-            self._log(f"EEG 串口已连接: {self._port} @ {self._baudrate}")
+            self._log(f"EEG 串口已连接: {self._port} @ {self._format_serial_settings(serial_settings)}")
             self._log(f"EEG 采样率 {self._rhythm.sample_rate:.0f} Hz，显示 {RAW_DISPLAY_RATE} Hz")
+            self._refresh_serial_button()
             return True
         except Exception as exc:
             self._link = None
             self._log(f"EEG 串口打开失败 ({port}): {exc}")
+            self._refresh_serial_button()
             return False
 
     def _open_osc_serial(self) -> bool:
         """按 UI 串口框打开振子串口；成功返回 True。"""
         port = self._ui_osc_serial_port()
+        serial_settings = self._serial_settings_from_ui()
         try:
             if (
                 self._osc_link is not None
                 and self._osc_link.is_open
                 and self._osc_link.port == port
+                and self._serial_settings_match(self._osc_link, serial_settings)
             ):
                 return True
             if self._osc_link is not None:
                 self._osc_link.close()
-            self._osc_link = OscillatorSerial(port, baudrate=self._baudrate, timeout=0.05)
+            self._osc_link = OscillatorSerial(port, timeout=0.05, **serial_settings)
             self._osc_link.open()
             self._osc_port = port
-            self._log(f"振子串口已连接: {self._osc_port} @ {self._baudrate}")
+            self._log(f"振子串口已连接: {self._osc_port} @ {self._format_serial_settings(serial_settings)}")
             self._log(
                 f"振子 MCU 采样 {OSC_SAMPLE_RATE:.0f} Hz，"
                 f"每批 {OSC_BUFFER_SIZE} 点上传，"
@@ -1841,10 +2102,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"振子标定: {SENSOR_UNITS_PER_G:g} 计数/g，"
                 f"g={GRAVITY_M_S2} m/s²，纵轴 {ACCEL_DISPLAY_UNIT}"
             )
+            self._refresh_serial_button()
             return True
         except Exception as exc:
             self._osc_link = None
             self._log(f"振子串口打开失败 ({port}): {exc}")
+            self._refresh_serial_button()
             return False
 
     def _update_status_bar(self) -> None:
@@ -2130,7 +2393,7 @@ def run_app(
         baudrate=baudrate,
         sample_rate=sample_rate,
     )
-    window.show()  ## 显示窗口
+    window.showMaximized()  ## 默认最大化显示窗口
     sys.exit(app.exec_())  ## 进入事件循环
 
 

@@ -1235,7 +1235,7 @@ def run_analysis(
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"Sample/weiyu_open60_close60/weiyu_open60_close60_converted.csv"
+    xlsx_file = r"Sample/close60open60_1/close60open60_1_converted.csv"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)

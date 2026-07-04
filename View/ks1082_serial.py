@@ -146,6 +146,9 @@ class Ks1082Serial:
         port: str,
         baudrate: int = 115200,
         timeout: float = 0.1,
+        bytesize: int = 8,
+        parity: str = "N",
+        stopbits: float = 1,
     ) -> None:
         if Serial is None:
             raise ImportError(
@@ -154,6 +157,9 @@ class Ks1082Serial:
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self.bytesize = bytesize
+        self.parity = parity
+        self.stopbits = stopbits
         self._ser: Optional[Serial] = None
         self._parser = AdcStreamParser()
         self.on_sample: Optional[Callable[[AdcSample], None]] = None
@@ -167,9 +173,9 @@ class Ks1082Serial:
             port=self.port,
             baudrate=self.baudrate,
             timeout=self.timeout,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
+            bytesize=self.bytesize,
+            parity=self.parity,
+            stopbits=self.stopbits,
             rtscts=False,
             dsrdtr=False,
             xonxoff=False,

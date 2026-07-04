@@ -149,6 +149,9 @@ class OscillatorSerial:
         baudrate: int = DEFAULT_BAUDRATE,
         timeout: float = 0.1,
         batch_size: int = BUFFER_SIZE,
+        bytesize: int = 8,
+        parity: str = "N",
+        stopbits: float = 1,
     ) -> None:
         if Serial is None:
             raise ImportError(
@@ -158,6 +161,9 @@ class OscillatorSerial:
         self.baudrate = baudrate
         self.timeout = timeout
         self.batch_size = batch_size
+        self.bytesize = bytesize
+        self.parity = parity
+        self.stopbits = stopbits
         self._ser: Optional[Serial] = None
         self._parser = AccStreamParser(expected_size=batch_size)
         self.on_batch: Optional[Callable[[AccDataBatch], None]] = None  ## 收到整批时的回调
@@ -171,9 +177,9 @@ class OscillatorSerial:
             port=self.port,
             baudrate=self.baudrate,
             timeout=self.timeout,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
+            bytesize=self.bytesize,
+            parity=self.parity,
+            stopbits=self.stopbits,
             rtscts=False,
             dsrdtr=False,
             xonxoff=False,
