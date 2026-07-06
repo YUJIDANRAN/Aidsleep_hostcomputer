@@ -117,6 +117,11 @@ RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
 RAW_PLOT_MAX_POINTS = int(RAW_DISPLAY_RATE * RAW_PLOT_WINDOW_SECONDS)  ## 缓冲约 200 点
 SERIAL_POLL_INTERVAL_MS = max(2, int(1000 / MCU_SAMPLE_RATE))  ## 串口轮询 2 ms
 MAX_SAMPLES_PER_POLL = 80  ## 单次 poll 最多处理的原始样本数，防止恢复后积压卡顿
+REALTIME_ALPHA_REJECT_HISTORY_SEC = 30.0
+REALTIME_ALPHA_REJECT_MIN_HISTORY_SEC = 1.0
+REALTIME_ALPHA_REJECT_MAD_MULT = 6.0
+REALTIME_ALPHA_REJECT_RATIO = 2.0
+REALTIME_ALPHA_REJECT_ABS_FLOOR = 80.0
 MIN_PLOT_WIDTH = 200  ## 绘图区最小宽度
 MIN_PLOT_HEIGHT = 120  ## 绘图区最小高度
 AXIS_MARGIN_LEFT = 72  ## 左留白给 Y 轴
@@ -182,6 +187,53 @@ def _build_eeg_rejection_tags(
         suspicious_reasons,
         quality.suspicious_rate,
     )
+
+
+class RealtimeAlphaThresholdRejector:
+    """Realtime alpha amplitude tagger for display-only rejection marks."""
+
+    def __init__(self, sample_rate: float) -> None:
+        self._sample_rate = max(float(sample_rate), 1.0)
+        self._history_max = max(
+            1, int(round(self._sample_rate * REALTIME_ALPHA_REJECT_HISTORY_SEC))
+        )
+        self._min_history = max(
+            1, int(round(self._sample_rate * REALTIME_ALPHA_REJECT_MIN_HISTORY_SEC))
+        )
+        self._update_interval = max(1, int(round(self._sample_rate * 0.1)))
+        self._history: Deque[float] = deque(maxlen=self._history_max)
+        self._threshold = REALTIME_ALPHA_REJECT_ABS_FLOOR
+        self._samples_since_update = self._update_interval
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    def reset(self) -> None:
+        self._history.clear()
+        self._threshold = REALTIME_ALPHA_REJECT_ABS_FLOOR
+        self._samples_since_update = self._update_interval
+
+    def push(self, alpha: float) -> bool:
+        abs_value = abs(float(alpha))
+        if (
+            len(self._history) >= self._min_history
+            and self._samples_since_update >= self._update_interval
+        ):
+            values = np.fromiter(self._history, dtype=np.float64)
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median)))
+            self._threshold = max(
+                REALTIME_ALPHA_REJECT_ABS_FLOOR,
+                median * REALTIME_ALPHA_REJECT_RATIO,
+                median + REALTIME_ALPHA_REJECT_MAD_MULT * mad,
+            )
+            self._samples_since_update = 0
+
+        rejected = len(self._history) >= self._min_history and abs_value > self._threshold
+        self._history.append(abs_value)
+        self._samples_since_update += 1
+        return rejected
 
 
 class AlphaPhaseTracker:
@@ -306,6 +358,8 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         self._series_buffers: Dict[str, Deque[float]] = {}
         self._series_path_items: Dict[str, QtWidgets.QGraphicsPathItem] = {}
         self._axis_items: list[QtWidgets.QGraphicsItem] = []  ## 坐标轴图形项
+        self._reject_flags: Deque[int] = deque(maxlen=self._max_points)
+        self._reject_items: list[QtWidgets.QGraphicsItem] = []
         self._y_mid = 0.0  ## Y 轴中心
         self._y_amp = 1.0  ## Y 轴半幅
         self._min_y_amp = MIN_Y_AMP  ## 滚轮缩放 Y 半幅下限
@@ -386,6 +440,7 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         else:
             self._disable_multi_series()
             self._points = deque(maxlen=self._max_points)  ## 重建环缓冲
+            self._reject_flags = deque(maxlen=self._max_points)
             self._path_item.setPen(_make_wave_pen(line_color))  ## 更新颜色与线宽
         self._path_dirty = True
         self._sync_plot_size_from_viewport()
@@ -440,6 +495,7 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
 
     def clear(self) -> None:
         self._points.clear()  ## 清空数据
+        self._reject_flags.clear()
         for buf in self._series_buffers.values():
             buf.clear()
         self._path_dirty = True
@@ -447,14 +503,32 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         self._last_axis_refresh = 0.0
         self._refresh_plot(force=True)  ## 重绘空波形
 
-    def append_alpha(self, alpha: float) -> None:
+    def append_alpha(self, alpha: float, rejected: bool = False) -> None:
         self._points.append(alpha)  ## 追加点
+        self._reject_flags.append(1 if rejected else 0)
         self._path_dirty = True
         self._refresh_plot()
 
-    def append_alphas(self, alphas: Iterable[float]) -> None:
+    def append_alphas(
+        self,
+        alphas: Iterable[float],
+        reject_flags: Optional[Iterable[bool]] = None,
+    ) -> None:
+        if reject_flags is None:
+            for alpha in alphas:
+                self._points.append(alpha)  ## 批量追加
+                self._reject_flags.append(0)
+        else:
+            for alpha, rejected in zip(alphas, reject_flags):
+                self._points.append(alpha)  ## 批量追加
+                self._reject_flags.append(1 if rejected else 0)
+        self._path_dirty = True
+        self._refresh_plot()
+
+    def append_alphas_plain(self, alphas: Iterable[float]) -> None:
         for alpha in alphas:
             self._points.append(alpha)  ## 批量追加
+            self._reject_flags.append(0)
         self._path_dirty = True
         self._refresh_plot()
 
@@ -533,12 +607,13 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         )
 
     def _wheel_axis_zone(self, event: QtGui.QWheelEvent) -> Optional[str]:
-        """根据滚轮位置判断所在区域：y=Y轴区，x=X轴区，None=绘图区。"""
+        """Return y/x target for wheel zoom; plot area defaults to x zoom."""
         vp = self.viewport()
         vp_pos = vp.mapFromGlobal(event.globalPos())
         scene_pos = self.mapToScene(self.mapFromGlobal(event.globalPos()))
         left = self._plot_left
         top = self._plot_top
+        right = left + self._plot_width
         bottom = top + self._plot_height
 
         in_y_margin = vp_pos.x() < AXIS_MARGIN_LEFT + Y_AXIS_WHEEL_BAND
@@ -560,10 +635,12 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
             return "y"
         if in_x:
             return "x"
+        if left <= scene_pos.x() <= right and top <= scene_pos.y() <= bottom:
+            return "x"
         return None
 
     def _handle_wheel_event(self, event: QtGui.QWheelEvent) -> bool:
-        """raw 模式滚轮：Y/X 轴区缩放；Shift+滚轮平移。"""
+        """Wheel: plot/x-axis zooms time, y-axis/Ctrl zooms amplitude, Shift pans."""
         if not self._fixed_y_axis:
             return False
         zone = self._wheel_axis_zone(event)
@@ -574,7 +651,10 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
             return False
         x_step = WHEEL_X_ZOOM_STEP if delta > 0 else 1.0 / WHEEL_X_ZOOM_STEP
         scene_pos = self.mapToScene(self.mapFromGlobal(event.globalPos()))
-        shift_pan = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+        modifiers = event.modifiers()
+        shift_pan = bool(modifiers & QtCore.Qt.ShiftModifier)
+        if modifiers & QtCore.Qt.ControlModifier:
+            zone = "y"
         if zone == "y":
             if shift_pan:
                 self._pan_y(delta)
@@ -765,6 +845,49 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         self._last_axis_y_mid = self._y_mid
         self._last_axis_y_amp = self._y_amp
 
+    def _clear_reject_items(self) -> None:
+        for item in self._reject_items:
+            self._scene.removeItem(item)
+        self._reject_items.clear()
+
+    def _draw_reject_flags(self, count: int) -> None:
+        self._clear_reject_items()
+        if self._multi_mode or count <= 1 or not self._reject_flags:
+            return
+        flags = list(self._reject_flags)
+        if len(flags) < count:
+            flags = [0] * (count - len(flags)) + flags
+        elif len(flags) > count:
+            flags = flags[-count:]
+
+        if self._use_x_window():
+            visible_start, visible_end = self._x_window(count)
+        else:
+            visible_start, visible_end = 0, count
+
+        top = self._plot_top
+        height = self._plot_height
+        brush = QtGui.QBrush(QtGui.QColor(211, 47, 47, 46))
+        pen = QtGui.QPen()
+        pen.setStyle(QtCore.Qt.NoPen)
+        i = visible_start
+        while i < visible_end:
+            if not flags[i]:
+                i += 1
+                continue
+            start = i
+            while i < visible_end and flags[i]:
+                i += 1
+            end = min(i, visible_end - 1)
+            x0 = self._index_to_x(start, count)
+            x1 = self._index_to_x(end, count)
+            if x1 <= x0:
+                x1 = x0 + 1.0
+            rect = self._scene.addRect(x0, top, x1 - x0, height, pen, brush)
+            rect.setZValue(1.5)
+            rect.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            self._reject_items.append(rect)
+
     def _refresh_plot(self, *, force: bool = False) -> None:
         if not self._path_dirty and not force:
             return
@@ -783,6 +906,7 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         if count == 0:  ## 无数据：空路径
             self._path = QtGui.QPainterPath()
             self._path_item.setPath(self._path)
+            self._clear_reject_items()
             for path_item in self._series_path_items.values():
                 path_item.setPath(QtGui.QPainterPath())
             if not self._fixed_y_axis:
@@ -792,6 +916,7 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
             return
 
         if self._multi_mode:
+            self._clear_reject_items()
             all_values: list[float] = []
             for name, buf in self._series_buffers.items():
                 values = list(buf)
@@ -815,19 +940,32 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
             return
 
         values = list(self._points)  ## 拷贝为列表
+        finite_values = [value for value in values if np.isfinite(value)]
         if not self._fixed_y_axis:  ## Alpha 模式才自动跟踪 Y 量程
-            self._y_mid = sum(values) / count  ## 均值作 Y 中心
-            amplitude = max(abs(v - self._y_mid) for v in values)  ## 最大偏离
+            if not finite_values:
+                self._y_mid = 0.0
+                self._y_amp = 1.0
+                self._path_item.setPath(QtGui.QPainterPath())
+                self._update_axes_if_needed(count, force=force_axes)
+                return
+            self._y_mid = sum(finite_values) / len(finite_values)  ## 均值作 Y 中心
+            amplitude = max(abs(v - self._y_mid) for v in finite_values)  ## 最大偏离
             if amplitude < 1e-6:
                 amplitude = 1.0  ## 避免除零
             self._y_amp = amplitude * 1.15  ## 留 15% 边距
 
+        self._draw_reject_flags(count)
         path = QtGui.QPainterPath()
+        drawing = False
         for i, value in enumerate(values):
+            if not np.isfinite(value):
+                drawing = False
+                continue
             x = self._index_to_x(i, count)
             y = self._value_to_y(value)
-            if i == 0:
+            if not drawing:
                 path.moveTo(x, y)
+                drawing = True
             else:
                 path.lineTo(x, y)
 
@@ -871,6 +1009,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._link: Optional[Ks1082Serial | EegCsvReplay] = None  ## EEG 串口或 CSV 模拟
         self._osc_link: Optional[OscillatorSerial] = None  ## 振子串口连接
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
+        self._alpha_rejector = RealtimeAlphaThresholdRejector(sample_rate)
+        self._alpha_display_last_kept: Optional[float] = None
+        self._alpha_display_was_removed = False
         self._osc_proc = OscStreamProcessor(sample_rate=OSC_SAMPLE_RATE)  ## 振子流式滤波
         self._audio_stopped.connect(self._on_audio_stopped)
         self._audio_controller = StereoAudioController(
@@ -980,6 +1121,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             else:
                 self._link.reset_playback()
             self._rhythm.reset()
+            self._alpha_rejector.reset()
+            self._reset_alpha_display_removal_state()
             self._decim_counter = 0
             self._waveform.clear()
         if self._osc_link is not None and self._osc_link.is_open:
@@ -1201,6 +1344,102 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 edit.setText(value)
             edit.setPlaceholderText(hint)
 
+        if not hasattr(self.ui, "checkBox_remove_alpha_artifacts"):
+            self.ui.checkBox_remove_alpha_artifacts = QtWidgets.QCheckBox(
+                "剔除异常波形片段",
+                self.ui.groupBox_compare,
+            )
+            self.ui.checkBox_remove_alpha_artifacts.setObjectName(
+                "checkBox_remove_alpha_artifacts"
+            )
+            self.ui.checkBox_remove_alpha_artifacts.setToolTip(
+                "开启后，power_cal 额外保存 alpha 可疑片段剔除后的 gap/compressed 波形图；"
+                "离线 full/cleaned CSV 始终保存。"
+            )
+            self.ui.checkBox_remove_alpha_artifacts.setChecked(False)
+            self.ui.gridLayout_compare.addWidget(
+                self.ui.checkBox_remove_alpha_artifacts,
+                3,
+                0,
+                1,
+                3,
+            )
+            self.ui.radioButton_alpha_remove_compressed = QtWidgets.QRadioButton(
+                "平滑拼接剩余时间轴",
+                self.ui.groupBox_compare,
+            )
+            self.ui.radioButton_alpha_remove_compressed.setObjectName(
+                "radioButton_alpha_remove_compressed"
+            )
+            self.ui.radioButton_alpha_remove_gap = QtWidgets.QRadioButton(
+                "直接断开/空白",
+                self.ui.groupBox_compare,
+            )
+            self.ui.radioButton_alpha_remove_gap.setObjectName(
+                "radioButton_alpha_remove_gap"
+            )
+            self.ui.radioButton_alpha_remove_compressed.setChecked(True)
+            self._alpha_removal_view_group = QtWidgets.QButtonGroup(self)
+            self._alpha_removal_view_group.setExclusive(True)
+            self._alpha_removal_view_group.addButton(
+                self.ui.radioButton_alpha_remove_compressed
+            )
+            self._alpha_removal_view_group.addButton(
+                self.ui.radioButton_alpha_remove_gap
+            )
+            self.ui.gridLayout_compare.addWidget(
+                self.ui.radioButton_alpha_remove_compressed,
+                4,
+                0,
+                1,
+                2,
+            )
+            self.ui.gridLayout_compare.addWidget(
+                self.ui.radioButton_alpha_remove_gap,
+                4,
+                2,
+                1,
+                1,
+            )
+            self.ui.checkBox_remove_alpha_artifacts.toggled.connect(
+                self._sync_alpha_removal_view_controls_enabled
+            )
+            self.ui.checkBox_remove_alpha_artifacts.toggled.connect(
+                self._reset_alpha_display_removal_state
+            )
+            self.ui.radioButton_alpha_remove_compressed.toggled.connect(
+                self._reset_alpha_display_removal_state
+            )
+            self.ui.radioButton_alpha_remove_gap.toggled.connect(
+                self._reset_alpha_display_removal_state
+            )
+            self._sync_alpha_removal_view_controls_enabled(False)
+
+    def _remove_alpha_artifact_segments_enabled(self) -> bool:
+        checkbox = getattr(self.ui, "checkBox_remove_alpha_artifacts", None)
+        return bool(checkbox is not None and checkbox.isChecked())
+
+    def _reset_alpha_display_removal_state(self) -> None:
+        self._alpha_display_last_kept = None
+        self._alpha_display_was_removed = False
+
+    def _alpha_artifact_removal_view_mode(self) -> str:
+        if not self._remove_alpha_artifact_segments_enabled():
+            return "compressed"
+        gap_radio = getattr(self.ui, "radioButton_alpha_remove_gap", None)
+        if gap_radio is not None and gap_radio.isChecked():
+            return "gap"
+        return "compressed"
+
+    def _sync_alpha_removal_view_controls_enabled(self, checked: bool) -> None:
+        for name in (
+            "radioButton_alpha_remove_compressed",
+            "radioButton_alpha_remove_gap",
+        ):
+            radio = getattr(self.ui, name, None)
+            if radio is not None:
+                radio.setEnabled(bool(checked))
+
     def _read_compare_segments_from_ui(
         self,
     ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
@@ -1235,14 +1474,23 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
             return
         compare_segments = self._read_compare_segments_from_ui()
+        remove_alpha_artifacts = self._remove_alpha_artifact_segments_enabled()
+        alpha_removal_view = self._alpha_artifact_removal_view_mode()
         if compare_segments is None:
-            self._log("段间对比时间未填全或无效，跳过 power_cal 分析")
-            return
-        range_a, range_b = compare_segments
-        self._log(
-            f"开始 power_cal 分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
-            f"段B {range_b[0]:g}–{range_b[1]:g}s"
-        )
+            self._log("段间对比时间未填全或无效，仅运行基础分析和离线数据导出")
+        else:
+            range_a, range_b = compare_segments
+            self._log(
+                f"开始 power_cal 分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
+                f"段B {range_b[0]:g}–{range_b[1]:g}s"
+            )
+        if remove_alpha_artifacts:
+            view_label = (
+                "直接断开/空白"
+                if alpha_removal_view == "gap"
+                else "平滑拼接剩余时间轴"
+            )
+            self._log(f"已启用: 剔除异常波形片段图像导出 ({view_label})")
         buffer = io.StringIO()
         try:
             with redirect_stdout(buffer):
@@ -1260,7 +1508,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     fft_time_range=None,
                     compare_segments=compare_segments,
                     show_segment_compare=False,
-                    save_segment_compare=True,
+                    save_segment_compare=compare_segments is not None,
+                    enable_alpha_suspicious=True,
+                    save_model_window_table=True,
+                    save_offline_waveform_data=True,
+                    remove_alpha_artifact_segments=remove_alpha_artifacts,
+                    alpha_artifact_removal_view=alpha_removal_view,
                 )
             report = buffer.getvalue().strip()
             if report:
@@ -1547,6 +1800,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
         self._sleep_aid_tracker.reset()
         self._rhythm.reset()
+        self._alpha_rejector.reset()
+        self._reset_alpha_display_removal_state()
         self._sleep_aid_controller.start()
         self._apply_display_mode("alpha")
         self.ui.checkBox.blockSignals(True)
@@ -1783,7 +2038,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         self._display_mode = mode
         self._decim_counter = 0
-        wheel_hint = "Y/X轴滚轮:缩放  Shift+滚轮:平移"
+        wheel_hint = "滚轮:时间轴缩放  Ctrl+滚轮:Y缩放  Shift+滚轮:平移"
         if mode == "raw":
             legend = f"RAW CH1  |  {wheel_hint}"
             line_color = "#BF360C"
@@ -1821,7 +2076,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_display_mode = mode
         self._osc_axis_display_key = ()
         self._osc_decim_counter = 0
-        wheel_hint = "Y/X轴滚轮:缩放  Shift+滚轮:平移"
+        wheel_hint = "滚轮:时间轴缩放  Ctrl+滚轮:Y缩放  Shift+滚轮:平移"
         if mode == "m_freq":
             legend = f"M_Fre 主振加速度 ({ACCEL_DISPLAY_UNIT})  |  {wheel_hint}"
             line_color = M_FREQ_PLOT_COLOR
@@ -1860,7 +2115,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_axis_display_key = key
         self._osc_display_mode = ""
         self._osc_decim_counter = 0
-        wheel_hint = "Y/X轴滚轮:缩放  Shift+滚轮:平移"
+        wheel_hint = "滚轮:时间轴缩放  Ctrl+滚轮:Y缩放  Shift+滚轮:平移"
         axis_text = "+".join(axis.upper() for axis in axes)
         legend = (
             f"振子 {axis_text} 加速度 ({ACCEL_DISPLAY_UNIT})  |  {wheel_hint}"
@@ -2172,6 +2427,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._decim_counter = 0
                 self._last_status_update = 0.0
                 self._rhythm.reset()
+                self._alpha_rejector.reset()
+                self._reset_alpha_display_removal_state()
                 self._waveform.clear()
                 if flushed:
                     self._log(f"EEG 已丢弃暂停期间积压的 {flushed} 字节")
@@ -2214,12 +2471,25 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         got_bytes = self._link.bytes_received - prev_bytes
 
         if samples:
-            if len(samples) > MAX_SAMPLES_PER_POLL:
+            if (
+                len(samples) > MAX_SAMPLES_PER_POLL
+                and not isinstance(self._link, EegCsvReplay)
+            ):
                 samples = samples[-MAX_SAMPLES_PER_POLL:]
             mode = self._current_display_mode()
             self._apply_display_mode(mode)
             plot_values: list[float] = []
+            plot_reject_flags: list[bool] = []
             band = None if mode == "raw" else mode
+            remove_alpha_display = (
+                band == "alpha" and self._remove_alpha_artifact_segments_enabled()
+            )
+            alpha_removal_view = (
+                self._alpha_artifact_removal_view_mode()
+                if remove_alpha_display
+                else "none"
+            )
+            decim_rejected = False
             sleep_aid = (
                 self._sleep_aid_controller is not None
                 and self._sleep_aid_controller.is_active
@@ -2233,14 +2503,44 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sample_count += 1
                 self._decim_counter += 1
                 value = self._rhythm.push(sample.channel1, band)
+                rejected = False
+                if band == "alpha":
+                    rejected = self._alpha_rejector.push(value)
+                    decim_rejected = decim_rejected or rejected
                 if sleep_aid:
                     self._process_sleep_aid_sample(value)
                 if self._decim_counter >= RAW_DECIM_FACTOR:
                     self._decim_counter = 0
-                    plot_values.append(value)
+                    display_rejected = decim_rejected
+                    decim_rejected = False
+                    if remove_alpha_display and alpha_removal_view == "compressed":
+                        if display_rejected:
+                            self._alpha_display_was_removed = True
+                            continue
+                        display_value = value
+                        if (
+                            self._alpha_display_was_removed
+                            and self._alpha_display_last_kept is not None
+                        ):
+                            display_value = (
+                                self._alpha_display_last_kept + value
+                            ) * 0.5
+                        self._alpha_display_was_removed = False
+                        self._alpha_display_last_kept = display_value
+                        plot_values.append(display_value)
+                        plot_reject_flags.append(False)
+                    elif remove_alpha_display and alpha_removal_view == "gap":
+                        plot_values.append(float("nan") if display_rejected else value)
+                        plot_reject_flags.append(display_rejected)
+                    else:
+                        plot_values.append(value)
+                        plot_reject_flags.append(display_rejected)
 
             if plot_values:
-                self._waveform.append_alphas(plot_values)
+                self._waveform.append_alphas(
+                    plot_values,
+                    plot_reject_flags if band == "alpha" else None,
+                )
             self._no_data_ticks = 0
         elif got_bytes == 0:
             self._no_data_ticks += 1
