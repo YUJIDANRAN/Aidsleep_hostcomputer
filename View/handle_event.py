@@ -111,6 +111,7 @@ DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
 DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
 DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
 EEG_REJECT_RATE_WARN = 0.20  ## 拒绝率超过 20% 时提示本次采集不宜用于分析
+TROUGH_CAL_SCRIPT = _ALGO_DIR / "TroughCalibrator.py"
 RAW_DISPLAY_RATE = 100  ## 波形显示约 100 点/秒
 RAW_DECIM_FACTOR = max(1, int(MCU_SAMPLE_RATE / RAW_DISPLAY_RATE))  ## 500→100 降采样比
 RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
@@ -957,8 +958,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_timed_test_ui()
         self._setup_compare_segments_ui()
         self._setup_eeg_replay_ui()
+        self._last_eeg_session_dir: Optional[Path] = None
         self._sleep_aid_last_warm_sec = -1
         self._sleep_aid_burst_count = 0
+        self._sleep_aid_burst_record: List[dict] = []
         self._running = False  ## 默认不采集
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
@@ -1493,12 +1496,35 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._reset_timed_test_state()
         if saved is not None:
             cleaned_path, full_path, sample_rate, reject_rate = saved
+            session_dir = full_path.parent
+            self._last_eeg_session_dir = session_dir
             self._run_post_test_power_analysis(
                 full_path,
                 cleaned_path,
                 sample_rate,
                 reject_rate,
             )
+            self._maybe_run_trough_calibration(session_dir)
+
+    def _maybe_run_trough_calibration(self, session_dir: Path) -> None:
+        """定时测试结束后：若有 burst 记录，运行波谷对齐标定（方法 B）。"""
+        if not (session_dir / "sleep_aid_bursts.csv").is_file():
+            return
+        if not TROUGH_CAL_SCRIPT.is_file():
+            self._log(f"未找到波谷标定脚本: {TROUGH_CAL_SCRIPT}")
+            return
+        try:
+            from TroughCalibrator import run_calibration
+
+            result = run_calibration(session_dir, save_plots=True)
+            for line in result.report_text.splitlines():
+                self._log(line)
+            self._log(
+                f"波谷标定完成，建议 total_latency "
+                f"{result.suggested_total_latency_sec * 1000:.1f} ms"
+            )
+        except Exception as exc:
+            self._log(f"波谷标定失败: {exc}")
 
     def _read_time_edit_duration_sec(self) -> Optional[float]:
         """读取 timeEdit；00:00:00 表示未设置。"""
@@ -1659,10 +1685,70 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"可疑片段率: {suspicious_rate:.1%}")
             if reject_rate > EEG_REJECT_RATE_WARN:
                 self._log("拒绝率过高，本次数据不建议用于样本分析")
+            session_dir = full_path.parent
+            self._last_eeg_session_dir = session_dir
+            self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
             return cleaned_path, full_path, sample_rate, reject_rate
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
             return None
+
+    def _save_sleep_aid_bursts_csv(self, session_dir: Path, sample_rate: float) -> None:
+        if not self._sleep_aid_burst_record:
+            return
+        path = Path(session_dir) / "sleep_aid_bursts.csv"
+        try:
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    [
+                        "burst_index",
+                        "sample_index",
+                        "time_s",
+                        "total_latency_sec",
+                        "seconds_to_trough",
+                        "phase_rad",
+                        "inst_freq_hz",
+                    ]
+                )
+                for row in self._sleep_aid_burst_record:
+                    writer.writerow(
+                        [
+                            row["burst_index"],
+                            row["sample_index"],
+                            row["sample_index"] / sample_rate,
+                            row["total_latency_sec"],
+                            row["seconds_to_trough"],
+                            row["phase_rad"],
+                            row["inst_freq_hz"],
+                        ]
+                    )
+            self._log(
+                f"助眠 burst 事件已保存: {path} ({len(self._sleep_aid_burst_record)} 条)"
+            )
+        except OSError as exc:
+            self._log(f"保存 sleep_aid_bursts.csv 失败: {exc}")
+
+    def _record_sleep_aid_burst(
+        self,
+        *,
+        sample_index: int,
+        snapshot: AlphaPhaseSnapshot,
+    ) -> None:
+        if self._sleep_aid_controller is None:
+            return
+        self._sleep_aid_burst_record.append(
+            {
+                "burst_index": len(self._sleep_aid_burst_record) + 1,
+                "sample_index": int(sample_index),
+                "total_latency_sec": float(
+                    self._sleep_aid_controller.total_latency_sec
+                ),
+                "seconds_to_trough": float(snapshot.seconds_to_trough),
+                "phase_rad": float(snapshot.phase_rad),
+                "inst_freq_hz": float(snapshot.inst_freq_hz),
+            }
+        )
 
     def _stop_capture_due_to_timeout(self) -> None:
         """定时到时：停止采集并保存 CSV。"""
@@ -1743,6 +1829,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"助眠音效已停止，共触发 {self._sleep_aid_controller.trigger_count} 次，"
                 f"门控跳过 {skip} 次（{reason_text}）"
             )
+            if self._sleep_aid_burst_record:
+                if self._test_duration_sec is not None and self._test_started_at is not None:
+                    self._log(
+                        f"助眠 burst 事件 {len(self._sleep_aid_burst_record)} 条，"
+                        "将在定时测试结束时与 EEG 一并保存"
+                    )
+                else:
+                    sample_rate = float(MCU_SAMPLE_RATE)
+                    measured = self._rhythm.measured_sample_rate
+                    if measured is not None and measured > 0:
+                        sample_rate = measured
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    session_dir = DEFAULT_EEG_CSV_DIR / f"eeg_{stamp}"
+                    session_dir.mkdir(parents=True, exist_ok=True)
+                    self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
             return
         if self._audio_controller.is_playing:
             self._audio_controller.stop()
@@ -1758,6 +1859,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._quality_gate.reset()
         self._reset_alpha_display_removal_state()
         self._sleep_aid_burst_count = 0
+        self._sleep_aid_burst_record.clear()
         self._sleep_aid_controller.start()
         self._apply_display_mode("alpha")
         self.ui.checkBox.blockSignals(True)
@@ -1768,7 +1870,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._log(
             "助眠音效已启动: "
             f"暖机 {p.warmup_sec:g}s，最小间隔 {p.min_interval_sec:g}s，"
-            f"ERP 延迟 {p.erp_latency_sec * 1000:g} ms，"
+            f"刺激效应延迟 {p.stimulus_effect_latency_sec * 1000:g} ms，"
             f"粉噪 burst {p.burst_duration_ms:g} ms"
         )
 
@@ -1782,7 +1884,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"助眠 burst #{count}")
         self._refresh_sleep_aid_button()
 
-    def _process_sleep_aid_sample(self, raw: int, alpha: float) -> None:
+    def _process_sleep_aid_sample(
+        self, raw: int, alpha: float, sample_index: int
+    ) -> None:
         if self._sleep_aid_controller is None or not self._sleep_aid_controller.is_active:
             return
 
@@ -1801,15 +1905,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         params = self._sleep_aid_controller.params
         guard_sec = (
             self._sleep_aid_controller.total_latency_sec
-            + params.erp_latency_sec
+            + params.stimulus_effect_latency_sec
             + params.burst_duration_ms / 1000.0
             + params.quality_lookahead_sec
         )
-        self._sleep_aid_controller.process_snapshot(
+        triggered = self._sleep_aid_controller.process_snapshot(
             snapshot,
             is_stimulus_ok=lambda: gate.is_stimulus_window_clean(guard_sec),
             on_skip=gate.record_skip,
         )
+        if triggered:
+            self._record_sleep_aid_burst(
+                sample_index=sample_index,
+                snapshot=snapshot,
+            )
         warm = self._sleep_aid_controller.warmup_remaining()
         if warm > 0.0 and int(warm) != getattr(self, "_sleep_aid_last_warm_sec", -1):
             self._sleep_aid_last_warm_sec = int(warm)
@@ -2497,7 +2606,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     rejected = self._alpha_rejector.push(value)
                     decim_rejected = decim_rejected or rejected
                 if sleep_aid:
-                    self._process_sleep_aid_sample(sample.channel1, value)
+                    self._process_sleep_aid_sample(
+                        sample.channel1, value, self._sample_count - 1
+                    )
                 if self._decim_counter >= RAW_DECIM_FACTOR:
                     self._decim_counter = 0
                     display_rejected = decim_rejected

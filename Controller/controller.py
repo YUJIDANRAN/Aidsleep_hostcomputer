@@ -22,7 +22,7 @@ from audiio import (
 
 SLEEP_AID_WARMUP_SEC = 15.0
 SLEEP_AID_MIN_INTERVAL_SEC = 0.5
-SLEEP_AID_ERP_LATENCY_SEC = 0.062
+SLEEP_AID_STIMULUS_EFFECT_LATENCY_SEC = 0.065  ## 标定 2026-07-07：total_latency 95 ms（+滤波 30 ms）
 SLEEP_AID_AUDIO_LATENCY_SEC = 0.0  ## 音频线直连振子：模拟传输可忽略（非蓝牙）
 SLEEP_AID_FILTER_DELAY_SEC = 0.030
 SLEEP_AID_TRIGGER_TOLERANCE_SEC = 0.004
@@ -197,7 +197,7 @@ class SleepAidParams:
 
     warmup_sec: float = SLEEP_AID_WARMUP_SEC
     min_interval_sec: float = SLEEP_AID_MIN_INTERVAL_SEC
-    erp_latency_sec: float = SLEEP_AID_ERP_LATENCY_SEC
+    stimulus_effect_latency_sec: float = SLEEP_AID_STIMULUS_EFFECT_LATENCY_SEC
     audio_latency_sec: float = SLEEP_AID_AUDIO_LATENCY_SEC
     filter_delay_sec: float = SLEEP_AID_FILTER_DELAY_SEC
     trigger_tolerance_sec: float = SLEEP_AID_TRIGGER_TOLERANCE_SEC
@@ -291,7 +291,11 @@ class SleepAidStimulusController:
     @property
     def total_latency_sec(self) -> float:
         p = self._params
-        return p.erp_latency_sec + p.audio_latency_sec + p.filter_delay_sec
+        return (
+            p.stimulus_effect_latency_sec
+            + p.audio_latency_sec
+            + p.filter_delay_sec
+        )
 
     def warmup_remaining(self, now: Optional[float] = None) -> float:
         """距暖机结束剩余秒数；未激活时返回 0。"""
