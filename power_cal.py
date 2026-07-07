@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,44 @@ from scipy.integrate import trapezoid
 from scipy.signal import butter, sosfilt, sosfilt_zi, sosfiltfilt, welch
 from scipy.fft import rfft, rfftfreq
 
+_ALGO_DIR = Path(__file__).resolve().parent / "Algorithm"
+if str(_ALGO_DIR) not in sys.path:
+    sys.path.insert(0, str(_ALGO_DIR))
+
+from MovementArtifact import (  # noqa: E402
+    BandSuspiciousInfo,
+    EegQualityInfo,
+    EEG_ADAPTIVE_MAD_MULT,
+    EEG_RAW_MAX_VALID,
+    EEG_RAW_MIN_VALID,
+    EEG_REJECT_SEGMENT_SEC,
+    EEG_SEGMENT_MAX_DEVIATION,
+    EEG_SEGMENT_MAX_PTP,
+    EEG_SUSPICIOUS_ALPHA_RMS_FLOOR,
+    EEG_SUSPICIOUS_ALPHA_RMS_MAD_MULT,
+    EEG_SUSPICIOUS_ALPHA_RMS_RATIO,
+    EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT,
+    EEG_SUSPICIOUS_DELTA_RMS_RATIO,
+    EEG_SUSPICIOUS_MIN_DIFF,
+    EEG_SUSPICIOUS_MIN_PTP,
+    MODEL_ALPHA_SUSPICIOUS_DROP_RATIO,
+    MODEL_ALPHA_SUSPICIOUS_WARN_RATIO,
+    MODEL_REJECT_DROP_RATIO,
+    MODEL_SUSPICIOUS_DROP_RATIO,
+    MODEL_SUSPICIOUS_WARN_RATIO,
+    MODEL_WINDOW_SEC,
+    build_band_rms_suspicious,
+    build_model_window_quality_table,
+    build_threshold_rejection,
+    clean_raw_signal,
+    export_offline_raw_csvs,
+    fit_bool_mask,
+    merge_quality_with_band_suspicious,
+    read_eeg_quality,
+    rejected_spans as quality_mask_spans,
+    slice_clean_raw_segment,
+)
+
 FILTER_ORDER = 4
 KS1082_SAMPLE_RATE = 500.0
 DEFAULT_SAMPLE_RATE = float(
@@ -22,65 +61,6 @@ DEFAULT_SAMPLE_RATE = float(
 
 BANDPASS_LOW_HZ = 0.5
 BANDPASS_HIGH_HZ = 40.0
-
-# ===== EEG 阈值拒绝/可疑段参数 =====
-# 检测按固定时长切片，目前每 1 秒判断一次；调小会更精细，但也更容易被瞬时噪声影响。
-EEG_REJECT_SEGMENT_SEC = 1
-
-# ADC 贴边饱和坏段阈值：原始值 <= 50 或 >= 4045 时标红。
-# 适合 12 bit ADC (0-4095)。如果硬件有效范围变窄/变宽，再同步调整。
-EEG_RAW_MIN_VALID = 50
-EEG_RAW_MAX_VALID = 4045
-
-# 原始 1 秒片段峰峰值坏段阈值：max(segment)-min(segment) 超过该值标红。
-# 主要抓大幅运动伪迹、严重电极扰动、接触不良；调小会更严格。
-EEG_SEGMENT_MAX_PTP = 1200.0
-
-# 原始 1 秒片段偏离中位数坏段阈值：单点离该秒中位数太远时标红。
-# 主要抓特别大的尖峰/跳变；调小会更严格。
-EEG_SEGMENT_MAX_DEVIATION = 800.0
-
-# 自适应可疑段倍率：阈值 = 全部 1 秒片段的 median + N*MAD。
-# 同时作用于 EEG_SUSPICIOUS_MIN_PTP 和 EEG_SUSPICIOUS_MIN_DIFF 对应规则。
-# 调小更敏感、黄段更多；调大更保守、黄段更少。
-EEG_ADAPTIVE_MAD_MULT = 5.0
-
-# 原始 1 秒峰峰值可疑段最低阈值。
-# 实际阈值取 max(该值, median + EEG_ADAPTIVE_MAD_MULT*MAD)。
-# 主要抓比全局背景明显更“抖”的片段；调小会更容易标黄。
-EEG_SUSPICIOUS_MIN_PTP = 200.0
-
-# 原始 1 秒内最大相邻跳变可疑段最低阈值。
-# 实际阈值取 max(该值, median + EEG_ADAPTIVE_MAD_MULT*MAD)。
-# 主要抓短促尖峰、突然跳点；调小会更容易标黄。
-EEG_SUSPICIOUS_MIN_DIFF = 60.0
-
-# δ(0.5-4 Hz)滤波后 RMS 可疑段 MAD 倍率。
-# 阈值候选 = delta_rms_median + N*delta_rms_MAD。
-# 主要抓低频慢漂/电极扰动/运动造成的 δ 行突刺；只标黄，不标红。
-# 调小更容易抓低频异常；调大更保守。
-EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT = 6.0
-
-# δ RMS 相对背景的最低倍数门槛。
-# 最终 δ RMS 阈值 = max(median*该倍数, median + MAD_MULT*MAD)。
-# 防止 MAD 很小时阈值过低；调小更敏感，调大更保守。
-EEG_SUSPICIOUS_DELTA_RMS_RATIO = 2.0
-
-# Alpha(8-13 Hz) RMS adaptive suspicious segment detection.
-# This is intentionally a yellow/tag-only rule: strong alpha may be a real
-# relaxed/eyes-closed state, so it should not directly reject data.
-EEG_SUSPICIOUS_ALPHA_RMS_MAD_MULT = 6.0
-EEG_SUSPICIOUS_ALPHA_RMS_RATIO = 2.0
-EEG_SUSPICIOUS_ALPHA_RMS_FLOOR = 1.0
-
-# Window-level model quality policy. A model can use this table to keep,
-# downweight, or skip windows without pretending repaired EEG is real EEG.
-MODEL_WINDOW_SEC = 5.0
-MODEL_ALPHA_SUSPICIOUS_WARN_RATIO = 0.10
-MODEL_ALPHA_SUSPICIOUS_DROP_RATIO = 0.30
-MODEL_REJECT_DROP_RATIO = 0.20
-MODEL_SUSPICIOUS_WARN_RATIO = 0.20
-MODEL_SUSPICIOUS_DROP_RATIO = 0.50
 
 # Experimental visualization path: remove alpha-suspicious samples from all
 # bands, concatenate the remaining points, then lightly smooth the display.
@@ -165,31 +145,6 @@ class SampleRateEstimator:
         if 50.0 <= rate <= 2000.0:
             return rate
         return None
-
-
-@dataclass
-class EegQualityInfo:
-    reject_mask: np.ndarray
-    reject_rate: float
-    has_tag: bool = False
-    source: str = "none"
-    suspicious_mask: np.ndarray | None = None
-    suspicious_rate: float = 0.0
-    reject_reasons: list[str] | None = None
-    suspicious_reasons: list[str] | None = None
-
-    @property
-    def has_rejection(self) -> bool:
-        return bool(self.has_tag and self.reject_mask.size and np.any(self.reject_mask))
-
-    @property
-    def has_suspicious(self) -> bool:
-        return bool(
-            self.has_tag
-            and self.suspicious_mask is not None
-            and self.suspicious_mask.size
-            and np.any(self.suspicious_mask)
-        )
 
 
 class RhythmStreamProcessor:
@@ -278,18 +233,6 @@ class SegmentBandComparison:
     relative_ratio: Dict[str, float]
 
 
-@dataclass(frozen=True)
-class BandSuspiciousInfo:
-    band_name: str
-    mask: np.ndarray
-    rate: float
-    rms_threshold: float
-    rms_median: float
-    rms_mad: float
-    segment_sec: float
-    reasons: list[str]
-
-
 def _slice_signal(
     signal: np.ndarray,
     sample_rate: float,
@@ -337,425 +280,6 @@ def read_eeg_signal(data_path: str | Path, column: int = 0) -> np.ndarray:
             f"有效样本过少 ({values.size})，请检查 {path.name} 是否包含 EEG 数据"
         )
     return values
-
-
-def build_threshold_rejection(
-    values: np.ndarray,
-    sample_rate: float,
-) -> EegQualityInfo:
-    """按 1 s 片段打质量标签：严重坏段 rejected，可疑段 suspicious。"""
-    count = values.size
-    if count == 0:
-        empty = np.zeros(0, dtype=bool)
-        return EegQualityInfo(empty, 0.0, has_tag=False, suspicious_mask=empty)
-
-    reject_mask = np.zeros(count, dtype=bool)
-    suspicious_mask = np.zeros(count, dtype=bool)
-    reject_reasons = [""] * count
-    suspicious_reasons = [""] * count
-    segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
-    segments: list[tuple[int, int, np.ndarray]] = []
-    ptp_values: list[float] = []
-    diff_values: list[float] = []
-    delta_rms_values: list[float] = []
-
-    for start in range(0, count, segment_size):
-        end = min(count, start + segment_size)
-        segment = values[start:end].astype(np.float64, copy=False)
-        segments.append((start, end, segment))
-        ptp_values.append(float(np.ptp(segment)))
-        diffs = np.diff(segment)
-        diff_values.append(float(np.max(np.abs(diffs))) if diffs.size else 0.0)
-
-    try:
-        delta_signal = bandpass_filter(
-            values.astype(np.float64, copy=False),
-            sample_rate,
-            0.5,
-            4.0,
-        )
-    except ValueError:
-        delta_signal = None
-
-    for start, end, _segment in segments:
-        if delta_signal is None:
-            delta_rms_values.append(0.0)
-            continue
-        delta_segment = delta_signal[start:end]
-        delta_rms_values.append(float(np.sqrt(np.mean(delta_segment * delta_segment))))
-
-    def _adaptive_threshold(metrics: list[float], floor: float) -> float:
-        if not metrics:
-            return floor
-        arr = np.asarray(metrics, dtype=np.float64)
-        median = float(np.median(arr))
-        mad = float(np.median(np.abs(arr - median)))
-        return max(floor, median + EEG_ADAPTIVE_MAD_MULT * mad)
-
-    ptp_suspicious_threshold = _adaptive_threshold(
-        ptp_values,
-        EEG_SUSPICIOUS_MIN_PTP,
-    )
-    diff_suspicious_threshold = _adaptive_threshold(
-        diff_values,
-        EEG_SUSPICIOUS_MIN_DIFF,
-    )
-    if delta_rms_values:
-        delta_rms_arr = np.asarray(delta_rms_values, dtype=np.float64)
-        delta_rms_median = float(np.median(delta_rms_arr))
-        delta_rms_mad = float(np.median(np.abs(delta_rms_arr - delta_rms_median)))
-        delta_rms_suspicious_threshold = max(
-            delta_rms_median * EEG_SUSPICIOUS_DELTA_RMS_RATIO,
-            delta_rms_median + EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT * delta_rms_mad,
-        )
-    else:
-        delta_rms_suspicious_threshold = float("inf")
-
-    for idx, (start, end, segment) in enumerate(segments):
-        reject_reason_parts: list[str] = []
-        suspicious_reason_parts: list[str] = []
-        if np.any(segment <= EEG_RAW_MIN_VALID) or np.any(segment >= EEG_RAW_MAX_VALID):
-            reject_reason_parts.append("rail_saturation")
-        ptp = ptp_values[idx]
-        if ptp > EEG_SEGMENT_MAX_PTP:
-            reject_reason_parts.append(f"ptp>{EEG_SEGMENT_MAX_PTP:g}")
-        median = float(np.median(segment))
-        max_dev = float(np.max(np.abs(segment - median)))
-        if max_dev > EEG_SEGMENT_MAX_DEVIATION:
-            reject_reason_parts.append(f"deviation>{EEG_SEGMENT_MAX_DEVIATION:g}")
-
-        max_diff = diff_values[idx]
-        if ptp > ptp_suspicious_threshold:
-            suspicious_reason_parts.append(
-                f"adaptive_ptp>{ptp_suspicious_threshold:g}"
-            )
-        if max_diff > diff_suspicious_threshold:
-            suspicious_reason_parts.append(
-                f"adaptive_diff>{diff_suspicious_threshold:g}"
-            )
-        delta_rms = delta_rms_values[idx]
-        if delta_rms > delta_rms_suspicious_threshold:
-            suspicious_reason_parts.append(
-                f"delta_rms>{delta_rms_suspicious_threshold:g}"
-            )
-
-        if reject_reason_parts:
-            reject_mask[start:end] = True
-            reason = ";".join(reject_reason_parts)
-            for point_idx in range(start, end):
-                reject_reasons[point_idx] = reason
-        elif suspicious_reason_parts:
-            suspicious_mask[start:end] = True
-            reason = ";".join(suspicious_reason_parts)
-            for point_idx in range(start, end):
-                suspicious_reasons[point_idx] = reason
-
-    reject_rate = float(np.mean(reject_mask)) if reject_mask.size else 0.0
-    suspicious_rate = (
-        float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
-    )
-    return EegQualityInfo(
-        reject_mask,
-        reject_rate,
-        has_tag=True,
-        source="computed",
-        suspicious_mask=suspicious_mask,
-        suspicious_rate=suspicious_rate,
-        reject_reasons=reject_reasons,
-        suspicious_reasons=suspicious_reasons,
-    )
-
-
-def _mad_threshold(
-    metrics: np.ndarray,
-    *,
-    ratio: float,
-    mad_mult: float,
-    floor: float = 0.0,
-) -> tuple[float, float, float]:
-    if metrics.size == 0:
-        return floor, 0.0, 0.0
-    median = float(np.median(metrics))
-    mad = float(np.median(np.abs(metrics - median)))
-    threshold = max(floor, median * ratio, median + mad_mult * mad)
-    return threshold, median, mad
-
-
-def build_band_rms_suspicious(
-    values: np.ndarray,
-    sample_rate: float,
-    *,
-    band_name: str = "alpha",
-    mad_mult: float = EEG_SUSPICIOUS_ALPHA_RMS_MAD_MULT,
-    ratio: float = EEG_SUSPICIOUS_ALPHA_RMS_RATIO,
-    floor: float = EEG_SUSPICIOUS_ALPHA_RMS_FLOOR,
-) -> BandSuspiciousInfo:
-    """Mark high-RMS band segments as suspicious without rejecting them."""
-    count = values.size
-    empty = np.zeros(count, dtype=bool)
-    empty_reasons = [""] * count
-    if count == 0:
-        return BandSuspiciousInfo(
-            band_name,
-            empty,
-            0.0,
-            floor,
-            0.0,
-            0.0,
-            EEG_REJECT_SEGMENT_SEC,
-            empty_reasons,
-        )
-    if band_name not in EEG_BANDS:
-        raise ValueError(f"未知节律: {band_name!r}")
-
-    low, high = EEG_BANDS[band_name]
-    try:
-        band_signal = bandpass_filter(
-            values.astype(np.float64, copy=False),
-            sample_rate,
-            low,
-            high,
-        )
-    except ValueError:
-        return BandSuspiciousInfo(
-            band_name,
-            empty,
-            0.0,
-            float("inf"),
-            0.0,
-            0.0,
-            EEG_REJECT_SEGMENT_SEC,
-            empty_reasons,
-        )
-
-    segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
-    segments: list[tuple[int, int]] = []
-    rms_values: list[float] = []
-    for start in range(0, count, segment_size):
-        end = min(count, start + segment_size)
-        segment = band_signal[start:end]
-        segments.append((start, end))
-        rms_values.append(float(np.sqrt(np.mean(segment * segment))))
-
-    rms_arr = np.asarray(rms_values, dtype=np.float64)
-    threshold, median, mad = _mad_threshold(
-        rms_arr,
-        ratio=ratio,
-        mad_mult=mad_mult,
-        floor=floor,
-    )
-    mask = np.zeros(count, dtype=bool)
-    reasons = [""] * count
-    for idx, (start, end) in enumerate(segments):
-        rms = rms_values[idx]
-        if rms > threshold:
-            mask[start:end] = True
-            reason = f"{band_name}_rms>{threshold:g}"
-            for point_idx in range(start, end):
-                reasons[point_idx] = reason
-
-    rate = float(np.mean(mask)) if mask.size else 0.0
-    return BandSuspiciousInfo(
-        band_name,
-        mask,
-        rate,
-        threshold,
-        median,
-        mad,
-        EEG_REJECT_SEGMENT_SEC,
-        reasons,
-    )
-
-
-def merge_quality_with_band_suspicious(
-    quality: EegQualityInfo,
-    band_info: BandSuspiciousInfo,
-) -> EegQualityInfo:
-    """Add band-level suspicious tags to the general yellow mask."""
-    count = quality.reject_mask.size
-    band_mask = band_info.mask
-    if band_mask.size < count:
-        band_mask = np.pad(band_mask, (0, count - band_mask.size), constant_values=False)
-    elif band_mask.size > count:
-        band_mask = band_mask[:count]
-
-    base_suspicious = (
-        quality.suspicious_mask.copy()
-        if quality.suspicious_mask is not None
-        else np.zeros(count, dtype=bool)
-    )
-    band_mask = band_mask & ~quality.reject_mask
-    suspicious_mask = base_suspicious | band_mask
-    suspicious_rate = float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
-
-    suspicious_reasons = (
-        list(quality.suspicious_reasons)
-        if quality.suspicious_reasons is not None
-        else [""] * count
-    )
-    if len(suspicious_reasons) < count:
-        suspicious_reasons.extend([""] * (count - len(suspicious_reasons)))
-    elif len(suspicious_reasons) > count:
-        suspicious_reasons = suspicious_reasons[:count]
-
-    for idx, is_band_suspicious in enumerate(band_mask):
-        if not is_band_suspicious:
-            continue
-        reason = band_info.reasons[idx] if idx < len(band_info.reasons) else ""
-        if not reason:
-            reason = f"{band_info.band_name}_rms"
-        if suspicious_reasons[idx]:
-            suspicious_reasons[idx] = f"{suspicious_reasons[idx]};{reason}"
-        else:
-            suspicious_reasons[idx] = reason
-
-    return EegQualityInfo(
-        quality.reject_mask,
-        quality.reject_rate,
-        has_tag=quality.has_tag or band_info.mask.size > 0,
-        source=quality.source,
-        suspicious_mask=suspicious_mask,
-        suspicious_rate=suspicious_rate,
-        reject_reasons=quality.reject_reasons,
-        suspicious_reasons=suspicious_reasons,
-    )
-
-
-def read_eeg_quality(
-    data_path: str | Path,
-    expected_len: int,
-    raw_values: np.ndarray | None = None,
-    sample_rate: float = DEFAULT_SAMPLE_RATE,
-) -> EegQualityInfo:
-    """读取 CSV 中的阈值拒绝 tag；旧文件没有 tag 时返回 0 拒绝率。"""
-    path = Path(data_path)
-    empty_mask = np.zeros(expected_len, dtype=bool)
-    empty = EegQualityInfo(
-        empty_mask,
-        0.0,
-        has_tag=False,
-        suspicious_mask=empty_mask.copy(),
-    )
-    if path.suffix.lower() not in {".csv", ".txt"}:
-        return empty
-
-    frame = pd.read_csv(path)
-    if "is_rejected" not in frame.columns:
-        if raw_values is not None:
-            return build_threshold_rejection(raw_values, sample_rate)
-        return empty
-
-    computed = (
-        build_threshold_rejection(raw_values, sample_rate)
-        if raw_values is not None
-        else None
-    )
-    if computed is not None:
-        return computed
-
-    def _fit_mask(mask: np.ndarray) -> np.ndarray:
-        if mask.size < expected_len:
-            return np.pad(mask, (0, expected_len - mask.size), constant_values=False)
-        if mask.size > expected_len:
-            return mask[:expected_len]
-        return mask
-
-    flags = pd.to_numeric(frame["is_rejected"], errors="coerce").fillna(0)
-    mask = _fit_mask(flags.to_numpy(dtype=np.float64) > 0)
-
-    reject_rate = float(np.mean(mask)) if mask.size else 0.0
-    if "reject_rate" in frame.columns:
-        rates = pd.to_numeric(frame["reject_rate"], errors="coerce").dropna()
-        if not rates.empty:
-            reject_rate = float(rates.iloc[0])
-
-    if "is_suspicious" in frame.columns:
-        suspicious_flags = pd.to_numeric(
-            frame["is_suspicious"], errors="coerce"
-        ).fillna(0)
-        suspicious_mask = _fit_mask(
-            suspicious_flags.to_numpy(dtype=np.float64) > 0
-        )
-        suspicious_mask = suspicious_mask & ~mask
-        suspicious_rate = (
-            float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
-        )
-        if "suspicious_rate" in frame.columns:
-            rates = pd.to_numeric(
-                frame["suspicious_rate"], errors="coerce"
-            ).dropna()
-            if not rates.empty:
-                suspicious_rate = float(rates.iloc[0])
-        suspicious_reasons = (
-            frame["suspicious_reason"].fillna("").astype(str).to_list()
-            if "suspicious_reason" in frame.columns
-            else None
-        )
-    elif computed is not None and computed.suspicious_mask is not None:
-        suspicious_mask = computed.suspicious_mask & ~mask
-        suspicious_rate = (
-            float(np.mean(suspicious_mask)) if suspicious_mask.size else 0.0
-        )
-        suspicious_reasons = computed.suspicious_reasons
-    else:
-        suspicious_mask = np.zeros(expected_len, dtype=bool)
-        suspicious_rate = 0.0
-        suspicious_reasons = None
-
-    reject_reasons = (
-        frame["reject_reason"].fillna("").astype(str).to_list()
-        if "reject_reason" in frame.columns
-        else None
-    )
-    return EegQualityInfo(
-        mask,
-        reject_rate,
-        has_tag=True,
-        source="csv",
-        suspicious_mask=suspicious_mask,
-        suspicious_rate=suspicious_rate,
-        reject_reasons=reject_reasons,
-        suspicious_reasons=suspicious_reasons,
-    )
-
-
-def _rejected_spans(
-    reject_mask: np.ndarray,
-    sample_rate: float,
-    *,
-    start_seconds: float = 0.0,
-    end_seconds: float | None = None,
-) -> list[tuple[float, float]]:
-    """把逐点 reject mask 合并成时间段，供波形图背景标注。"""
-    if reject_mask.size == 0 or not np.any(reject_mask):
-        return []
-
-    total_duration = reject_mask.size / sample_rate
-    view_start = max(0.0, start_seconds)
-    view_end = total_duration if end_seconds is None else min(end_seconds, total_duration)
-    if view_start >= view_end:
-        return []
-
-    i_start = max(0, int(view_start * sample_rate))
-    i_end = min(reject_mask.size, int(np.ceil(view_end * sample_rate)))
-    local = reject_mask[i_start:i_end]
-    spans: list[tuple[float, float]] = []
-    in_span = False
-    span_start = 0
-    for offset, rejected in enumerate(local):
-        if rejected and not in_span:
-            in_span = True
-            span_start = offset
-        elif not rejected and in_span:
-            abs_start = i_start + span_start
-            abs_end = i_start + offset
-            spans.append((abs_start / sample_rate, abs_end / sample_rate))
-            in_span = False
-    if in_span:
-        abs_start = i_start + span_start
-        abs_end = i_start + local.size
-        spans.append((abs_start / sample_rate, abs_end / sample_rate))
-    return spans
 
 
 def bandpass_filter(
@@ -882,6 +406,45 @@ def compare_segment_band_powers(
     )
 
 
+def compare_segment_band_powers_cleaned(
+    raw: np.ndarray,
+    quality: EegQualityInfo,
+    sample_rate: float,
+    range_a: Tuple[float, float],
+    range_b: Tuple[float, float],
+) -> SegmentBandComparison:
+    """段间对比：各段先按原始时间切片，再去掉坏段/可疑段后算功率。"""
+    seg_a = slice_clean_raw_segment(raw, quality, sample_rate, range_a[0], range_a[1])
+    seg_b = slice_clean_raw_segment(raw, quality, sample_rate, range_b[0], range_b[1])
+    min_samples = max(1, int(sample_rate))
+    if seg_a.size < min_samples or seg_b.size < min_samples:
+        raise ValueError(
+            f"删减后有效样本过少 (A={seg_a.size}, B={seg_b.size})，"
+            "请检查段间时间或坏段比例"
+        )
+    analysis_a = compute_band_powers(seg_a.astype(np.float64), sample_rate=sample_rate)
+    analysis_b = compute_band_powers(seg_b.astype(np.float64), sample_rate=sample_rate)
+
+    abs_ratio: Dict[str, float] = {}
+    rel_ratio: Dict[str, float] = {}
+    for name in EEG_BANDS:
+        a_abs = analysis_a.result.absolute[name]
+        b_abs = analysis_b.result.absolute[name]
+        a_rel = analysis_a.result.relative[name]
+        b_rel = analysis_b.result.relative[name]
+        abs_ratio[name] = b_abs / a_abs if a_abs > 0 else float("nan")
+        rel_ratio[name] = b_rel / a_rel if a_rel > 0 else float("nan")
+
+    return SegmentBandComparison(
+        range_a=range_a,
+        range_b=range_b,
+        analysis_a=analysis_a,
+        analysis_b=analysis_b,
+        absolute_ratio=abs_ratio,
+        relative_ratio=rel_ratio,
+    )
+
+
 def format_segment_comparison(comp: SegmentBandComparison) -> str:
     ra, rb = comp.range_a, comp.range_b
     lines = [
@@ -944,85 +507,6 @@ def _slice_waveforms(
     return sliced, time_axis
 
 
-def _fit_bool_mask(mask: np.ndarray, target_len: int) -> np.ndarray:
-    mask = np.asarray(mask, dtype=bool)
-    if mask.size < target_len:
-        return np.pad(mask, (0, target_len - mask.size), constant_values=False)
-    if mask.size > target_len:
-        return mask[:target_len]
-    return mask
-
-
-def build_model_window_quality_table(
-    quality: EegQualityInfo,
-    alpha_info: BandSuspiciousInfo | None,
-    sample_rate: float,
-    *,
-    window_sec: float = MODEL_WINDOW_SEC,
-) -> pd.DataFrame:
-    """Summarize quality tags per model input window."""
-    count = quality.reject_mask.size
-    if count == 0:
-        return pd.DataFrame()
-
-    window_size = max(1, int(round(sample_rate * window_sec)))
-    reject_mask = _fit_bool_mask(quality.reject_mask, count)
-    suspicious_mask = (
-        _fit_bool_mask(quality.suspicious_mask, count)
-        if quality.suspicious_mask is not None
-        else np.zeros(count, dtype=bool)
-    )
-    alpha_mask = (
-        _fit_bool_mask(alpha_info.mask, count)
-        if alpha_info is not None
-        else np.zeros(count, dtype=bool)
-    )
-
-    rows: list[dict[str, object]] = []
-    for window_id, start in enumerate(range(0, count, window_size)):
-        end = min(count, start + window_size)
-        n = end - start
-        reject_ratio = float(np.mean(reject_mask[start:end]))
-        suspicious_ratio = float(np.mean(suspicious_mask[start:end]))
-        alpha_ratio = float(np.mean(alpha_mask[start:end]))
-
-        action = "keep"
-        confidence_weight = 1.0
-        if (
-            reject_ratio >= MODEL_REJECT_DROP_RATIO
-            or suspicious_ratio >= MODEL_SUSPICIOUS_DROP_RATIO
-            or alpha_ratio >= MODEL_ALPHA_SUSPICIOUS_DROP_RATIO
-        ):
-            action = "drop"
-            confidence_weight = 0.0
-        elif (
-            reject_ratio > 0.0
-            or suspicious_ratio >= MODEL_SUSPICIOUS_WARN_RATIO
-            or alpha_ratio >= MODEL_ALPHA_SUSPICIOUS_WARN_RATIO
-        ):
-            action = "low_confidence"
-            confidence_weight = 0.5
-        elif alpha_ratio > 0.0 or suspicious_ratio > 0.0:
-            action = "downweight"
-            confidence_weight = 0.75
-
-        rows.append(
-            {
-                "window_id": window_id,
-                "start_s": start / sample_rate,
-                "end_s": end / sample_rate,
-                "n_samples": n,
-                "reject_ratio": reject_ratio,
-                "suspicious_ratio": suspicious_ratio,
-                "alpha_suspicious_ratio": alpha_ratio,
-                "action": action,
-                "confidence_weight": confidence_weight,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
 def export_offline_waveform_csvs(
     data_path: str | Path,
     raw: np.ndarray,
@@ -1031,57 +515,15 @@ def export_offline_waveform_csvs(
     alpha_info: BandSuspiciousInfo | None,
     sample_rate: float,
 ) -> tuple[Path, Path, int]:
-    """Save full and cleaned offline waveform tables for later model input."""
-    path = Path(data_path)
-    count = len(raw)
-    index = np.arange(count, dtype=np.int64)
-    reject_mask = _fit_bool_mask(quality.reject_mask, count)
-    suspicious_mask = (
-        _fit_bool_mask(quality.suspicious_mask, count)
-        if quality.suspicious_mask is not None
-        else np.zeros(count, dtype=bool)
+    """Save full and cleaned offline raw tables (no rhythm waveform columns)."""
+    del waveforms  ## 节律波形仅用于绘图，离线 CSV 不再保存
+    return export_offline_raw_csvs(
+        data_path,
+        raw,
+        quality,
+        sample_rate,
+        alpha_info=alpha_info,
     )
-    alpha_mask = (
-        _fit_bool_mask(alpha_info.mask, count)
-        if alpha_info is not None
-        else np.zeros(count, dtype=bool)
-    )
-    remove_mask = reject_mask | suspicious_mask
-
-    full_data: dict[str, object] = {
-        "index": index,
-        "time_s": index / sample_rate,
-        "ch1_raw": raw[:count],
-    }
-    for name in EEG_BANDS:
-        full_data[f"{name}_waveform"] = waveforms[name][:count]
-    full_data.update(
-        {
-            "is_rejected": reject_mask.astype(np.int8),
-            "is_suspicious": suspicious_mask.astype(np.int8),
-            "is_alpha_suspicious": alpha_mask.astype(np.int8),
-            "is_removed_in_cleaned": remove_mask.astype(np.int8),
-        }
-    )
-
-    full_path = path.parent / f"{path.stem}_offline_full_waveforms.csv"
-    pd.DataFrame(full_data).to_csv(full_path, index=False, encoding="utf-8-sig")
-
-    keep_mask = ~remove_mask
-    kept_index = np.flatnonzero(keep_mask)
-    clean_data: dict[str, object] = {
-        "clean_index": np.arange(kept_index.size, dtype=np.int64),
-        "clean_time_s": np.arange(kept_index.size, dtype=np.float64) / sample_rate,
-        "original_index": kept_index,
-        "original_time_s": kept_index / sample_rate,
-        "ch1_raw": raw[kept_index],
-    }
-    for name in EEG_BANDS:
-        clean_data[f"{name}_waveform"] = waveforms[name][kept_index]
-
-    clean_path = path.parent / f"{path.stem}_offline_cleaned_waveforms.csv"
-    pd.DataFrame(clean_data).to_csv(clean_path, index=False, encoding="utf-8-sig")
-    return full_path, clean_path, int(np.count_nonzero(remove_mask))
 
 
 def _moving_average(signal: np.ndarray, window_samples: int) -> np.ndarray:
@@ -1132,7 +574,7 @@ def remove_waveforms_keep_time_axis(
     if not waveforms:
         return {}
     n_total = len(next(iter(waveforms.values())))
-    remove_mask = _fit_bool_mask(remove_mask, n_total)
+    remove_mask = fit_bool_mask(remove_mask, n_total)
     if not np.any(remove_mask):
         return {name: wf.copy() for name, wf in waveforms.items()}
 
@@ -1155,7 +597,7 @@ def remove_waveforms_compress_time_axis(
     if not waveforms:
         return {}
     n_total = len(next(iter(waveforms.values())))
-    remove_mask = _fit_bool_mask(remove_mask, n_total)
+    remove_mask = fit_bool_mask(remove_mask, n_total)
     if not np.any(remove_mask):
         return {name: wf.copy() for name, wf in waveforms.items()}
 
@@ -1509,7 +951,7 @@ def plot_band_waveforms(
     t1 = float(time_axis[-1]) if time_axis.size else t_start
     rejected_spans: list[tuple[float, float]] = []
     if quality is not None and quality.has_rejection:
-        rejected_spans = _rejected_spans(
+        rejected_spans = quality_mask_spans(
             quality.reject_mask,
             sample_rate,
             start_seconds=t0,
@@ -1521,7 +963,7 @@ def plot_band_waveforms(
         and quality.has_suspicious
         and quality.suspicious_mask is not None
     ):
-        suspicious_spans = _rejected_spans(
+        suspicious_spans = quality_mask_spans(
             quality.suspicious_mask,
             sample_rate,
             start_seconds=t0,
@@ -1625,6 +1067,263 @@ def plot_band_waveforms(
         plt.close(fig)
 
 
+def _tagged_output_path(path: Path, suffix: str, extension: str) -> Path:
+    if suffix:
+        return path.parent / f"{path.stem}_{suffix}{extension}"
+    return path.parent / f"{path.stem}{extension}"
+
+
+def _run_power_analysis_pass(
+    *,
+    raw: np.ndarray,
+    path: Path,
+    sample_rate: float,
+    pass_label: str,
+    output_tag: str,
+    quality: EegQualityInfo,
+    enable_alpha_suspicious: bool,
+    compare_segments: tuple[tuple[float, float], tuple[float, float]] | None,
+    compare_segments_cleaned: bool,
+    reference_raw: np.ndarray | None,
+    reference_quality: EegQualityInfo | None,
+    show_plot: bool,
+    save_plot: bool,
+    show_waveform: bool,
+    save_waveform: bool,
+    waveform_seconds: float | None,
+    waveform_time_range: tuple[float, float] | None,
+    show_fft: bool,
+    save_fft: bool,
+    fft_time_range: tuple[float, float] | None,
+    show_segment_compare: bool,
+    save_segment_compare: bool,
+    save_model_window_table: bool,
+    save_offline_waveform_data: bool,
+    remove_alpha_artifact_segments: bool,
+    alpha_artifact_removal_view: str,
+) -> BandPowerResult:
+    alpha_info: BandSuspiciousInfo | None = None
+    quality_for_plot = quality
+    if enable_alpha_suspicious:
+        alpha_info = build_band_rms_suspicious(
+            raw.astype(np.float64),
+            sample_rate,
+            band_name="alpha",
+        )
+        quality_for_plot = merge_quality_with_band_suspicious(quality, alpha_info)
+
+    analysis = compute_band_powers(raw.astype(np.float64), sample_rate=sample_rate)
+    result = analysis.result
+    duration = len(raw) / sample_rate
+
+    print()
+    print("=" * 72)
+    print(f"功率分析 · {pass_label}")
+    print("=" * 72)
+    print(f"文件: {path.resolve()}")
+    print(f"样本数: {len(raw)}  |  采样率: {sample_rate:g} Hz  |  时长: {duration:.2f} s")
+    if quality.has_tag:
+        rejected = int(np.count_nonzero(quality.reject_mask))
+        suspicious = (
+            int(np.count_nonzero(quality.suspicious_mask))
+            if quality.suspicious_mask is not None
+            else 0
+        )
+        print(
+            f"阈值拒绝: {quality.reject_rate:.1%} ({rejected}/{quality.reject_mask.size} 点)"
+        )
+        print(f"可疑片段: {quality.suspicious_rate:.1%} ({suspicious}/{quality.reject_mask.size} 点)")
+    print(f"带通滤波: {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz (零相位 sosfiltfilt)")
+    if alpha_info is not None:
+        alpha_points = int(np.count_nonzero(alpha_info.mask))
+        print(
+            "Alpha suspicious: "
+            f"{alpha_info.rate:.1%} ({alpha_points}/{len(raw)} samples), "
+            f"RMS threshold={alpha_info.rms_threshold:.4g}, "
+            f"median={alpha_info.rms_median:.4g}, MAD={alpha_info.rms_mad:.4g}"
+        )
+    print()
+    print(format_results(result))
+
+    if save_model_window_table:
+        window_table = build_model_window_quality_table(
+            quality_for_plot,
+            alpha_info,
+            sample_rate,
+        )
+        if not window_table.empty:
+            window_path = _tagged_output_path(path, output_tag, "_model_windows.csv")
+            window_table.to_csv(window_path, index=False, encoding="utf-8-sig")
+            print(f"Model window quality table saved: {window_path.resolve()}")
+
+    waveforms: Dict[str, np.ndarray] | None = None
+    if save_offline_waveform_data or show_waveform or save_waveform:
+        waveforms = extract_band_waveforms(raw.astype(np.float64), sample_rate)
+
+    if save_offline_waveform_data and waveforms is not None:
+        full_path, clean_path, removed_points = export_offline_waveform_csvs(
+            _tagged_output_path(path, output_tag, ".csv"),
+            raw,
+            waveforms,
+            quality_for_plot,
+            alpha_info,
+            sample_rate,
+        )
+        print(f"Offline full raw CSV saved: {full_path.resolve()}")
+        print(
+            f"Offline cleaned raw CSV saved: {clean_path.resolve()} "
+            f"(removed {removed_points} samples)"
+        )
+
+    if show_plot or save_plot:
+        plot_path = (
+            _tagged_output_path(path, output_tag, "_band_power.png")
+            if save_plot
+            else None
+        )
+        plot_band_powers(
+            analysis,
+            title=f"EEG 节律功率 · {pass_label} · {path.stem}",
+            quality=quality_for_plot,
+            save_path=plot_path,
+            show=show_plot,
+        )
+
+    if show_waveform or save_waveform:
+        if waveforms is None:
+            waveforms = extract_band_waveforms(raw.astype(np.float64), sample_rate)
+        wf_path = (
+            _tagged_output_path(path, output_tag, "_band_waveform.png")
+            if save_waveform
+            else None
+        )
+        plot_band_waveforms(
+            waveforms,
+            sample_rate,
+            title=f"EEG 节律波形 · {pass_label} · {path.stem}",
+            time_range=waveform_time_range,
+            max_seconds=waveform_seconds,
+            quality=quality_for_plot,
+            save_path=wf_path,
+            show=show_waveform,
+        )
+        if remove_alpha_artifact_segments and alpha_info is not None:
+            removal_view = alpha_artifact_removal_view.lower().strip()
+            if removal_view not in {"gap", "compressed", "both"}:
+                removal_view = "both"
+            gap_waveforms = remove_waveforms_keep_time_axis(
+                waveforms,
+                alpha_info.mask,
+                sample_rate,
+            )
+            removed_points = int(np.count_nonzero(alpha_info.mask))
+            removed_quality = EegQualityInfo(
+                reject_mask=fit_bool_mask(alpha_info.mask, len(raw)),
+                reject_rate=alpha_info.rate,
+                has_tag=True,
+                source="alpha_suspicious_removed",
+                suspicious_mask=np.zeros(len(raw), dtype=bool),
+                suspicious_rate=0.0,
+            )
+            original_limits = waveform_y_limits(waveforms)
+            gap_path = (
+                _tagged_output_path(path, f"{output_tag}_alpha_removed_gap", "_band_waveform.png")
+                if save_waveform and removal_view in {"gap", "both"}
+                else None
+            )
+            plot_band_waveforms(
+                gap_waveforms,
+                sample_rate,
+                title=(
+                    f"EEG alpha removed gap · {pass_label} · {path.stem} "
+                    f"(removed {removed_points} samples)"
+                ),
+                time_range=waveform_time_range,
+                max_seconds=waveform_seconds,
+                quality=removed_quality,
+                y_limits=original_limits,
+                save_path=gap_path,
+                show=show_waveform and removal_view in {"gap", "both"},
+            )
+            compressed_waveforms = remove_waveforms_compress_time_axis(
+                waveforms,
+                alpha_info.mask,
+                sample_rate,
+            )
+            compressed_path = (
+                _tagged_output_path(
+                    path, f"{output_tag}_alpha_removed_compressed", "_band_waveform.png"
+                )
+                if save_waveform and removal_view in {"compressed", "both"}
+                else None
+            )
+            plot_band_waveforms(
+                compressed_waveforms,
+                sample_rate,
+                title=(
+                    f"EEG alpha removed compressed · {pass_label} · {path.stem} "
+                    f"(removed {removed_points} samples)"
+                ),
+                time_range=None,
+                max_seconds=None,
+                quality=None,
+                y_limits=original_limits,
+                save_path=compressed_path,
+                show=show_waveform and removal_view in {"compressed", "both"},
+            )
+
+    if show_fft or save_fft:
+        fft_path = _tagged_output_path(path, output_tag, "_fft.png") if save_fft else None
+        plot_fft(
+            raw.astype(np.float64),
+            sample_rate,
+            time_range=fft_time_range,
+            title=f"EEG FFT · {pass_label} · {path.stem}",
+            save_path=fft_path,
+            show=show_fft,
+        )
+
+    if compare_segments is not None:
+        range_a, range_b = compare_segments
+        try:
+            if compare_segments_cleaned:
+                if reference_raw is None or reference_quality is None:
+                    raise ValueError("删减后段间对比缺少原始序列参考")
+                comparison = compare_segment_band_powers_cleaned(
+                    reference_raw.astype(np.float64),
+                    reference_quality,
+                    sample_rate,
+                    range_a,
+                    range_b,
+                )
+            else:
+                comparison = compare_segment_band_powers(
+                    raw.astype(np.float64),
+                    sample_rate,
+                    range_a,
+                    range_b,
+                )
+        except ValueError as exc:
+            print(f"跳过段间对比 ({pass_label}): {exc}")
+        else:
+            print()
+            print(format_segment_comparison(comparison))
+            if show_segment_compare or save_segment_compare:
+                cmp_path = (
+                    _tagged_output_path(path, output_tag, "_segment_compare.png")
+                    if save_segment_compare
+                    else None
+                )
+                plot_segment_power_comparison(
+                    comparison,
+                    title=f"段间节律功率 · {pass_label} · {path.stem}",
+                    save_path=cmp_path,
+                    show=show_segment_compare,
+                )
+
+    return result
+
+
 def run_analysis(
     xlsx_path: str | Path,
     sample_rate: float,
@@ -1646,209 +1345,115 @@ def run_analysis(
     save_offline_waveform_data: bool = True,
     remove_alpha_artifact_segments: bool = True,
     alpha_artifact_removal_view: str = "both",
+    dual_power_analysis: bool = False,
 ) -> BandPowerResult:
     path = Path(xlsx_path)
     if not path.is_file():
         raise FileNotFoundError(f"找不到文件: {path.resolve()}")
 
-    raw = read_eeg_signal(path)
+    raw_full = read_eeg_signal(path)
+    quality_full = build_threshold_rejection(
+        raw_full.astype(np.float64),
+        sample_rate,
+    )
+
+    if dual_power_analysis:
+        raw_cleaned, _, removed_points = clean_raw_signal(
+            raw_full.astype(np.int64),
+            quality_full,
+        )
+        quality_cleaned = build_threshold_rejection(
+            raw_cleaned.astype(np.float64),
+            sample_rate,
+        )
+        print(f"文件: {path.resolve()}")
+        print(
+            f"双份功率分析: 删减前 {raw_full.size} 点，删减后 {raw_cleaned.size} 点 "
+            f"(剔除 {removed_points} 点)"
+        )
+        common_kwargs = dict(
+            path=path,
+            sample_rate=sample_rate,
+            enable_alpha_suspicious=enable_alpha_suspicious,
+            compare_segments=compare_segments,
+            show_plot=show_plot,
+            save_plot=save_plot,
+            show_waveform=show_waveform,
+            save_waveform=save_waveform,
+            waveform_seconds=waveform_seconds,
+            waveform_time_range=waveform_time_range,
+            show_fft=show_fft,
+            save_fft=save_fft,
+            fft_time_range=fft_time_range,
+            show_segment_compare=show_segment_compare,
+            save_segment_compare=save_segment_compare,
+            remove_alpha_artifact_segments=remove_alpha_artifact_segments,
+            alpha_artifact_removal_view=alpha_artifact_removal_view,
+        )
+        _run_power_analysis_pass(
+            raw=raw_full,
+            pass_label="删减前",
+            output_tag="before_removal",
+            quality=quality_full,
+            compare_segments_cleaned=False,
+            reference_raw=None,
+            reference_quality=None,
+            save_model_window_table=save_model_window_table,
+            save_offline_waveform_data=save_offline_waveform_data,
+            **common_kwargs,
+        )
+        return _run_power_analysis_pass(
+            raw=raw_cleaned.astype(np.float64),
+            pass_label="删减后",
+            output_tag="after_removal",
+            quality=quality_cleaned,
+            compare_segments_cleaned=True,
+            reference_raw=raw_full,
+            reference_quality=quality_full,
+            save_model_window_table=False,
+            save_offline_waveform_data=False,
+            **common_kwargs,
+        )
+
     quality = read_eeg_quality(
         path,
-        expected_len=len(raw),
-        raw_values=raw,
+        expected_len=len(raw_full),
+        raw_values=raw_full,
         sample_rate=sample_rate,
     )
-    alpha_info: BandSuspiciousInfo | None = None
-    quality_for_plot = quality
-    if enable_alpha_suspicious:
-        alpha_info = build_band_rms_suspicious(
-            raw,
-            sample_rate,
-            band_name="alpha",
-        )
-        quality_for_plot = merge_quality_with_band_suspicious(quality, alpha_info)
-    analysis = compute_band_powers(raw, sample_rate=sample_rate)
-    result = analysis.result
-    duration = len(raw) / sample_rate
-
-    print(f"文件: {path.resolve()}")
-    print(f"样本数: {len(raw)}  |  采样率: {sample_rate:g} Hz  |  时长: {duration:.2f} s")
-    if quality.has_tag:
-        rejected = int(np.count_nonzero(quality.reject_mask))
-        suspicious = (
-            int(np.count_nonzero(quality.suspicious_mask))
-            if quality.suspicious_mask is not None
-            else 0
-        )
-        source_label = "CSV tag" if quality.source == "csv" else "现场计算"
-        print(
-            f"阈值拒绝: {quality.reject_rate:.1%} ({rejected}/{len(raw)} 点, {source_label})"
-        )
-        print(f"可疑片段: {quality.suspicious_rate:.1%} ({suspicious}/{len(raw)} 点)")
-    print(f"带通滤波: {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz (零相位 sosfiltfilt)")
-    if alpha_info is not None:
-        alpha_points = int(np.count_nonzero(alpha_info.mask))
-        print(
-            "Alpha suspicious: "
-            f"{alpha_info.rate:.1%} ({alpha_points}/{len(raw)} samples), "
-            f"RMS threshold={alpha_info.rms_threshold:.4g}, "
-            f"median={alpha_info.rms_median:.4g}, MAD={alpha_info.rms_mad:.4g}"
-        )
-    print()
-    print(format_results(result))
-
-    if save_model_window_table:
-        window_table = build_model_window_quality_table(
-            quality_for_plot,
-            alpha_info,
-            sample_rate,
-        )
-        if not window_table.empty:
-            window_path = path.parent / f"{path.stem}_model_windows.csv"
-            window_table.to_csv(window_path, index=False, encoding="utf-8-sig")
-            print(f"Model window quality table saved: {window_path.resolve()}")
-
-    waveforms: Dict[str, np.ndarray] | None = None
-    if save_offline_waveform_data or show_waveform or save_waveform:
-        waveforms = extract_band_waveforms(raw, sample_rate)
-
-    if save_offline_waveform_data and waveforms is not None:
-        full_path, clean_path, removed_points = export_offline_waveform_csvs(
-            path,
-            raw,
-            waveforms,
-            quality_for_plot,
-            alpha_info,
-            sample_rate,
-        )
-        print(f"Offline full waveform CSV saved: {full_path.resolve()}")
-        print(
-            f"Offline cleaned waveform CSV saved: {clean_path.resolve()} "
-            f"(removed {removed_points} samples)"
-        )
-
-    if show_plot or save_plot:
-        plot_path = path.parent / f"{path.stem}_band_power.png" if save_plot else None
-        plot_band_powers(
-            analysis,
-            title=f"EEG 节律功率 · {path.stem}",
-            quality=quality_for_plot,
-            save_path=plot_path,
-            show=show_plot,
-        )
-
-    if show_waveform or save_waveform:
-        if waveforms is None:
-            waveforms = extract_band_waveforms(raw, sample_rate)
-        wf_path = path.parent / f"{path.stem}_band_waveform.png" if save_waveform else None
-        plot_band_waveforms(
-            waveforms,
-            sample_rate,
-            title=f"EEG 节律波形 · {path.stem}",
-            time_range=waveform_time_range,
-            max_seconds=waveform_seconds,
-            quality=quality_for_plot,
-            save_path=wf_path,
-            show=show_waveform,
-        )
-        if remove_alpha_artifact_segments and alpha_info is not None:
-            removal_view = alpha_artifact_removal_view.lower().strip()
-            if removal_view not in {"gap", "compressed", "both"}:
-                removal_view = "both"
-            gap_waveforms = remove_waveforms_keep_time_axis(
-                waveforms,
-                alpha_info.mask,
-                sample_rate,
-            )
-            removed_points = int(np.count_nonzero(alpha_info.mask))
-            removed_quality = EegQualityInfo(
-                reject_mask=_fit_bool_mask(alpha_info.mask, len(raw)),
-                reject_rate=alpha_info.rate,
-                has_tag=True,
-                source="alpha_suspicious_removed",
-                suspicious_mask=np.zeros(len(raw), dtype=bool),
-                suspicious_rate=0.0,
-            )
-            original_limits = waveform_y_limits(waveforms)
-            gap_path = (
-                path.parent / f"{path.stem}_alpha_removed_gap_band_waveform.png"
-                if save_waveform and removal_view in {"gap", "both"}
-                else None
-            )
-            plot_band_waveforms(
-                gap_waveforms,
-                sample_rate,
-                title=(
-                    f"EEG alpha removed + smoothed 路 {path.stem} "
-                    f"(removed {removed_points} samples, original time axis)"
-                ),
-                time_range=waveform_time_range,
-                max_seconds=waveform_seconds,
-                quality=removed_quality,
-                y_limits=original_limits,
-                save_path=gap_path,
-                show=show_waveform and removal_view in {"gap", "both"},
-            )
-            compressed_waveforms = remove_waveforms_compress_time_axis(
-                waveforms,
-                alpha_info.mask,
-                sample_rate,
-            )
-            compressed_path = (
-                path.parent / f"{path.stem}_alpha_removed_compressed_band_waveform.png"
-                if save_waveform and removal_view in {"compressed", "both"}
-                else None
-            )
-            plot_band_waveforms(
-                compressed_waveforms,
-                sample_rate,
-                title=(
-                    f"EEG alpha removed compressed view - {path.stem} "
-                    f"(removed {removed_points} samples, compressed time axis)"
-                ),
-                time_range=None,
-                max_seconds=None,
-                quality=None,
-                y_limits=original_limits,
-                save_path=compressed_path,
-                show=show_waveform and removal_view in {"compressed", "both"},
-            )
-
-    if show_fft or save_fft:
-        fft_path = path.parent / f"{path.stem}_fft.png" if save_fft else None
-        plot_fft(
-            raw,
-            sample_rate,
-            time_range=fft_time_range,
-            title=f"EEG FFT · {path.stem}",
-            save_path=fft_path,
-            show=show_fft,
-        )
-
-    if compare_segments is not None:
-        range_a, range_b = compare_segments
-        try:
-            comparison = compare_segment_band_powers(raw, sample_rate, range_a, range_b)
-        except ValueError as exc:
-            print(f"跳过段间对比: {exc}")
-        else:
-            print()
-            print(format_segment_comparison(comparison))
-            if show_segment_compare or save_segment_compare:
-                cmp_path = path.parent / f"{path.stem}_segment_compare.png" if save_segment_compare else None
-                plot_segment_power_comparison(
-                    comparison,
-                    title=f"段间节律功率 · {path.stem}",
-                    save_path=cmp_path,
-                    show=show_segment_compare,
-                )
-
-    return result
+    return _run_power_analysis_pass(
+        raw=raw_full,
+        path=path,
+        sample_rate=sample_rate,
+        pass_label=path.stem,
+        output_tag="",
+        quality=quality,
+        enable_alpha_suspicious=enable_alpha_suspicious,
+        compare_segments=compare_segments,
+        compare_segments_cleaned=False,
+        reference_raw=None,
+        reference_quality=None,
+        show_plot=show_plot,
+        save_plot=save_plot,
+        show_waveform=show_waveform,
+        save_waveform=save_waveform,
+        waveform_seconds=waveform_seconds,
+        waveform_time_range=waveform_time_range,
+        show_fft=show_fft,
+        save_fft=save_fft,
+        fft_time_range=fft_time_range,
+        show_segment_compare=show_segment_compare,
+        save_segment_compare=save_segment_compare,
+        save_model_window_table=save_model_window_table,
+        save_offline_waveform_data=save_offline_waveform_data,
+        remove_alpha_artifact_segments=remove_alpha_artifact_segments,
+        alpha_artifact_removal_view=alpha_artifact_removal_view,
+    )
 
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"Sample/close60open60_1/close60open60_1_converted.csv"
+    xlsx_file = r"C:\Users\liudi\Desktop\Test\信号质量检测gelin\jiyu0pen30close30_gelin.xlsx"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)

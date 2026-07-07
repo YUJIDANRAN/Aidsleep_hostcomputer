@@ -32,8 +32,13 @@ from power_cal import (  ## 节律滤波与频段定义
     DEFAULT_SAMPLE_RATE,
     EEG_BANDS,
     RhythmStreamProcessor,
-    build_threshold_rejection,
     run_analysis,
+)
+from MovementArtifact import (  ## 阈值拒绝 / 质量标记
+    RealtimeAlphaThresholdRejector,
+    RealtimeQualityGate,
+    build_threshold_rejection,
+    clean_raw_signal,
 )
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
@@ -105,23 +110,13 @@ DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)，对应 compare_segments[0]
 DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
 DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
 DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
-EEG_REJECT_SEGMENT_SEC = 1.0  ## 阈值拒绝按 1 s 切片打标签，不删除/拼接原始点
 EEG_REJECT_RATE_WARN = 0.20  ## 拒绝率超过 20% 时提示本次采集不宜用于分析
-EEG_RAW_MIN_VALID = 50  ## ADC 贴近下电源轨视为饱和/脱落风险
-EEG_RAW_MAX_VALID = 4045  ## ADC 贴近上电源轨视为饱和/脱落风险
-EEG_SEGMENT_MAX_PTP = 1200.0  ## 片内峰峰值阈值，单位 ADC count
-EEG_SEGMENT_MAX_DEVIATION = 800.0  ## 相对片内中位数的最大偏移阈值
 RAW_DISPLAY_RATE = 100  ## 波形显示约 100 点/秒
 RAW_DECIM_FACTOR = max(1, int(MCU_SAMPLE_RATE / RAW_DISPLAY_RATE))  ## 500→100 降采样比
 RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
 RAW_PLOT_MAX_POINTS = int(RAW_DISPLAY_RATE * RAW_PLOT_WINDOW_SECONDS)  ## 缓冲约 200 点
 SERIAL_POLL_INTERVAL_MS = max(2, int(1000 / MCU_SAMPLE_RATE))  ## 串口轮询 2 ms
 MAX_SAMPLES_PER_POLL = 80  ## 单次 poll 最多处理的原始样本数，防止恢复后积压卡顿
-REALTIME_ALPHA_REJECT_HISTORY_SEC = 30.0
-REALTIME_ALPHA_REJECT_MIN_HISTORY_SEC = 1.0
-REALTIME_ALPHA_REJECT_MAD_MULT = 6.0
-REALTIME_ALPHA_REJECT_RATIO = 2.0
-REALTIME_ALPHA_REJECT_ABS_FLOOR = 80.0
 MIN_PLOT_WIDTH = 200  ## 绘图区最小宽度
 MIN_PLOT_HEIGHT = 120  ## 绘图区最小高度
 AXIS_MARGIN_LEFT = 72  ## 左留白给 Y 轴
@@ -156,84 +151,7 @@ SLEEP_AID_MIN_HILBERT_SAMPLES = max(64, SLEEP_AID_HILBERT_WINDOW // 2)
 SLEEP_AID_ALPHA_FREQ_MIN_HZ = 7.0
 SLEEP_AID_ALPHA_FREQ_MAX_HZ = 14.0
 SLEEP_AID_TROUGH_PHASE_RAD = math.pi
-
-
-def _build_eeg_rejection_tags(
-    values: List[int],
-    sample_rate: float,
-) -> Tuple[List[int], List[int], List[str], float, List[int], List[str], float]:
-    """按固定时间片做质量标记，返回坏段/可疑段 tag 与比例。"""
-    count = len(values)
-    if count == 0:
-        return [], [], [], 0.0, [], [], 0.0
-    segment_size = max(1, int(round(sample_rate * EEG_REJECT_SEGMENT_SEC)))
-    quality = build_threshold_rejection(np.asarray(values, dtype=np.float64), sample_rate)
-    segment_ids = [index // segment_size for index in range(count)]
-    reject_flags = quality.reject_mask.astype(int).tolist()
-    reject_reasons = quality.reject_reasons or [""] * count
-    suspicious_mask = (
-        quality.suspicious_mask
-        if quality.suspicious_mask is not None
-        else np.zeros(count, dtype=bool)
-    )
-    suspicious_flags = suspicious_mask.astype(int).tolist()
-    suspicious_reasons = quality.suspicious_reasons or [""] * count
-    return (
-        segment_ids,
-        reject_flags,
-        reject_reasons,
-        quality.reject_rate,
-        suspicious_flags,
-        suspicious_reasons,
-        quality.suspicious_rate,
-    )
-
-
-class RealtimeAlphaThresholdRejector:
-    """Realtime alpha amplitude tagger for display-only rejection marks."""
-
-    def __init__(self, sample_rate: float) -> None:
-        self._sample_rate = max(float(sample_rate), 1.0)
-        self._history_max = max(
-            1, int(round(self._sample_rate * REALTIME_ALPHA_REJECT_HISTORY_SEC))
-        )
-        self._min_history = max(
-            1, int(round(self._sample_rate * REALTIME_ALPHA_REJECT_MIN_HISTORY_SEC))
-        )
-        self._update_interval = max(1, int(round(self._sample_rate * 0.1)))
-        self._history: Deque[float] = deque(maxlen=self._history_max)
-        self._threshold = REALTIME_ALPHA_REJECT_ABS_FLOOR
-        self._samples_since_update = self._update_interval
-
-    @property
-    def threshold(self) -> float:
-        return self._threshold
-
-    def reset(self) -> None:
-        self._history.clear()
-        self._threshold = REALTIME_ALPHA_REJECT_ABS_FLOOR
-        self._samples_since_update = self._update_interval
-
-    def push(self, alpha: float) -> bool:
-        abs_value = abs(float(alpha))
-        if (
-            len(self._history) >= self._min_history
-            and self._samples_since_update >= self._update_interval
-        ):
-            values = np.fromiter(self._history, dtype=np.float64)
-            median = float(np.median(values))
-            mad = float(np.median(np.abs(values - median)))
-            self._threshold = max(
-                REALTIME_ALPHA_REJECT_ABS_FLOOR,
-                median * REALTIME_ALPHA_REJECT_RATIO,
-                median + REALTIME_ALPHA_REJECT_MAD_MULT * mad,
-            )
-            self._samples_since_update = 0
-
-        rejected = len(self._history) >= self._min_history and abs_value > self._threshold
-        self._history.append(abs_value)
-        self._samples_since_update += 1
-        return rejected
+SLEEP_AID_BURST_LOG_EVERY = 10  ## burst 日志每 N 次写一条，减轻 QTextEdit 重绘
 
 
 class AlphaPhaseTracker:
@@ -447,6 +365,13 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         self._update_axes_if_needed(self._point_count(), force=True)
         self._fit_scene()
         self._refresh_plot(force=True)  ## 重绘
+
+    def update_legend(self, legend: str) -> None:
+        if legend == self._legend_text:
+            return
+        self._legend_text = legend
+        self._path_dirty = True
+        self._refresh_plot(force=True)
 
     def _point_count(self) -> int:
         if self._multi_mode and self._series_buffers:
@@ -1010,8 +935,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_link: Optional[OscillatorSerial] = None  ## 振子串口连接
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
         self._alpha_rejector = RealtimeAlphaThresholdRejector(sample_rate)
+        self._quality_gate = RealtimeQualityGate(sample_rate)
         self._alpha_display_last_kept: Optional[float] = None
         self._alpha_display_was_removed = False
+        self._alpha_display_total_points = 0
+        self._alpha_display_rejected_points = 0
+        self._eeg_base_legend = "RAW CH1"
         self._osc_proc = OscStreamProcessor(sample_rate=OSC_SAMPLE_RATE)  ## 振子流式滤波
         self._audio_stopped.connect(self._on_audio_stopped)
         self._audio_controller = StereoAudioController(
@@ -1029,6 +958,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_compare_segments_ui()
         self._setup_eeg_replay_ui()
         self._sleep_aid_last_warm_sec = -1
+        self._sleep_aid_burst_count = 0
         self._running = False  ## 默认不采集
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
@@ -1422,6 +1352,32 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _reset_alpha_display_removal_state(self) -> None:
         self._alpha_display_last_kept = None
         self._alpha_display_was_removed = False
+        self._alpha_display_total_points = 0
+        self._alpha_display_rejected_points = 0
+
+    def _alpha_reject_status_legend(self, base_legend: str) -> str:
+        if self._display_mode != "alpha":
+            return base_legend
+        if self._alpha_display_total_points <= 0:
+            status = "alpha阈值: 等待数据"
+        else:
+            ratio = (
+                self._alpha_display_rejected_points
+                / max(self._alpha_display_total_points, 1)
+            )
+            action = (
+                "剔除"
+                if self._remove_alpha_artifact_segments_enabled()
+                else "仅标注"
+            )
+            view = self._alpha_artifact_removal_view_mode()
+            view_label = "拼接" if view == "compressed" else "断开"
+            status = (
+                f"alpha阈值={self._alpha_rejector.threshold:.1f} "
+                f"| 拒绝={ratio:.1%} ({self._alpha_display_rejected_points}/"
+                f"{self._alpha_display_total_points}) | {action}/{view_label}"
+            )
+        return f"{base_legend}  |  {status}"
 
     def _alpha_artifact_removal_view_mode(self) -> str:
         if not self._remove_alpha_artifact_segments_enabled():
@@ -1463,11 +1419,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def _run_post_test_power_analysis(
         self,
-        csv_path: Path,
+        full_csv_path: Path,
+        cleaned_csv_path: Path,
         sample_rate: float,
         reject_rate: float,
     ) -> None:
-        """测试结束后自动运行 power_cal.run_analysis（段间功率对比等）。"""
+        """测试结束后自动运行 power_cal.run_analysis（删减前/后各一份）。"""
         if reject_rate > EEG_REJECT_RATE_WARN:
             self._log(
                 f"拒绝率 {reject_rate:.1%} 超过 {EEG_REJECT_RATE_WARN:.0%}，跳过自动功率分析"
@@ -1481,7 +1438,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         else:
             range_a, range_b = compare_segments
             self._log(
-                f"开始 power_cal 分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
+                f"开始 power_cal 双份分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
                 f"段B {range_b[0]:g}–{range_b[1]:g}s"
             )
         if remove_alpha_artifacts:
@@ -1495,7 +1452,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         try:
             with redirect_stdout(buffer):
                 run_analysis(
-                    csv_path,
+                    full_csv_path,
                     sample_rate,
                     show_plot=False,
                     save_plot=True,
@@ -1514,15 +1471,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     save_offline_waveform_data=True,
                     remove_alpha_artifact_segments=remove_alpha_artifacts,
                     alpha_artifact_removal_view=alpha_removal_view,
+                    dual_power_analysis=True,
                 )
             report = buffer.getvalue().strip()
             if report:
                 for line in report.splitlines():
                     self._log(line)
-                report_path = csv_path.parent / "eeg_analysis_report.txt"
+                report_path = full_csv_path.parent / "eeg_analysis_report.txt"
                 report_path.write_text(report + "\n", encoding="utf-8")
                 self._log(f"分析报告已保存: {report_path}")
-            self._log(f"分析图表已保存至: {csv_path.parent}")
+            self._log(
+                f"分析图表已保存至: {full_csv_path.parent} "
+                f"(删减前/后分别带 _before_removal / _after_removal 后缀)"
+            )
         except Exception as exc:
             self._log(f"power_cal 分析失败: {exc}")
 
@@ -1531,8 +1492,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         saved = self._save_eeg_raw_csv()
         self._reset_timed_test_state()
         if saved is not None:
-            csv_path, sample_rate, reject_rate = saved
-            self._run_post_test_power_analysis(csv_path, sample_rate, reject_rate)
+            cleaned_path, full_path, sample_rate, reject_rate = saved
+            self._run_post_test_power_analysis(
+                full_path,
+                cleaned_path,
+                sample_rate,
+                reject_rate,
+            )
 
     def _read_time_edit_duration_sec(self) -> Optional[float]:
         """读取 timeEdit；00:00:00 表示未设置。"""
@@ -1656,65 +1622,44 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         session_dir.mkdir(parents=True, exist_ok=True)
         return session_dir / csv_name
 
-    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, float, float]]:
+    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, Path, float, float]]:
         if not self._eeg_raw_record:
             self._log("定时测试结束，但没有 EEG raw 数据可保存")
             return None
-        path = self._resolve_eeg_csv_path()
+        cleaned_path = self._resolve_eeg_csv_path()
+        full_path = cleaned_path.with_name("eeg_raw_full.csv")
         sample_rate = float(MCU_SAMPLE_RATE)
         measured = self._rhythm.measured_sample_rate
         if measured is not None and measured > 0:
             sample_rate = measured
-        (
-            segment_ids,
-            reject_flags,
-            reject_reasons,
-            reject_rate,
-            suspicious_flags,
-            suspicious_reasons,
-            suspicious_rate,
-        ) = _build_eeg_rejection_tags(self._eeg_raw_record, sample_rate)
+        raw = np.asarray(self._eeg_raw_record, dtype=np.int64)
+        quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
+        reject_rate = quality.reject_rate
+        suspicious_rate = quality.suspicious_rate
+        cleaned_raw, _, removed_points = clean_raw_signal(raw, quality)
         try:
-            with path.open("w", newline="", encoding="utf-8") as handle:
+            with full_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(
-                    [
-                        "index",
-                        "time_s",
-                        "ch1_raw",
-                        "segment_id",
-                        "is_rejected",
-                        "reject_reason",
-                        "reject_rate",
-                        "is_suspicious",
-                        "suspicious_reason",
-                        "suspicious_rate",
-                    ]
-                )
-                for index, value in enumerate(self._eeg_raw_record):
-                    writer.writerow(
-                        [
-                            index,
-                            index / sample_rate,
-                            value,
-                            segment_ids[index],
-                            reject_flags[index],
-                            reject_reasons[index],
-                            f"{reject_rate:.6f}",
-                            suspicious_flags[index],
-                            suspicious_reasons[index],
-                            f"{suspicious_rate:.6f}",
-                        ]
-                    )
+                writer.writerow(["index", "time_s", "ch1_raw"])
+                for index, value in enumerate(raw):
+                    writer.writerow([index, index / sample_rate, int(value)])
+            with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["index", "time_s", "ch1_raw"])
+                for index, value in enumerate(cleaned_raw):
+                    writer.writerow([index, index / sample_rate, int(value)])
             self._log(
-                f"EEG raw 已保存: {path} "
-                f"({len(self._eeg_raw_record)} 点 @ {sample_rate:.0f} Hz)"
+                f"EEG raw 全量已保存: {full_path} ({raw.size} 点 @ {sample_rate:.0f} Hz)"
+            )
+            self._log(
+                f"EEG raw 删减后已保存: {cleaned_path} "
+                f"({cleaned_raw.size}/{raw.size} 点, 剔除 {removed_points} 点)"
             )
             self._log(f"阈值拒绝率: {reject_rate:.1%}")
             self._log(f"可疑片段率: {suspicious_rate:.1%}")
             if reject_rate > EEG_REJECT_RATE_WARN:
                 self._log("拒绝率过高，本次数据不建议用于样本分析")
-            return path, sample_rate, reject_rate
+            return cleaned_path, full_path, sample_rate, reject_rate
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
             return None
@@ -1763,7 +1708,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             if warm > 0.0:
                 btn.setText(f"暖机 {warm:.0f}s")
             else:
-                btn.setText("停止助眠")
+                count = self._sleep_aid_burst_count
+                btn.setText(f"停止助眠 ({count})" if count > 0 else "停止助眠")
             btn.setStyleSheet(
                 "QPushButton { font-size:14px; font-weight:bold; border:none;"
                 "border-radius:8px; min-height:41px;"
@@ -1786,8 +1732,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if self._sleep_aid_controller.is_active:
             self._sleep_aid_controller.stop()
             self._refresh_sleep_aid_button()
+            skip = self._quality_gate.skip_count
+            reasons = self._quality_gate.skip_reasons
+            reason_text = (
+                ", ".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+                if reasons
+                else "无"
+            )
             self._log(
-                f"助眠音效已停止，共触发 {self._sleep_aid_controller.trigger_count} 次"
+                f"助眠音效已停止，共触发 {self._sleep_aid_controller.trigger_count} 次，"
+                f"门控跳过 {skip} 次（{reason_text}）"
             )
             return
         if self._audio_controller.is_playing:
@@ -1801,7 +1755,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._sleep_aid_tracker.reset()
         self._rhythm.reset()
         self._alpha_rejector.reset()
+        self._quality_gate.reset()
         self._reset_alpha_display_removal_state()
+        self._sleep_aid_burst_count = 0
         self._sleep_aid_controller.start()
         self._apply_display_mode("alpha")
         self.ui.checkBox.blockSignals(True)
@@ -1817,13 +1773,43 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
 
     def _on_sleep_aid_burst(self, count: float) -> None:
-        self._log(f"助眠 burst #{int(count)}")
+        """主线程触发回调：推迟 UI 更新，避免与波形重绘同 tick 争抢。"""
+        QtCore.QTimer.singleShot(0, lambda c=int(count): self._update_sleep_aid_burst_ui(c))
 
-    def _process_sleep_aid_sample(self, alpha: float) -> None:
+    def _update_sleep_aid_burst_ui(self, count: int) -> None:
+        self._sleep_aid_burst_count = count
+        if count == 1 or count % SLEEP_AID_BURST_LOG_EVERY == 0:
+            self._log(f"助眠 burst #{count}")
+        self._refresh_sleep_aid_button()
+
+    def _process_sleep_aid_sample(self, raw: int, alpha: float) -> None:
         if self._sleep_aid_controller is None or not self._sleep_aid_controller.is_active:
             return
+
+        gate = self._quality_gate
+        was_in_bad = gate.in_bad_segment
+        result = gate.push(raw)
+        if result.is_bad:
+            if not was_in_bad:
+                self._sleep_aid_tracker.reset()
+            return
+
+        if was_in_bad:
+            self._sleep_aid_tracker.reset()
+
         snapshot = self._sleep_aid_tracker.push(alpha)
-        self._sleep_aid_controller.process_snapshot(snapshot)
+        params = self._sleep_aid_controller.params
+        guard_sec = (
+            self._sleep_aid_controller.total_latency_sec
+            + params.erp_latency_sec
+            + params.burst_duration_ms / 1000.0
+            + params.quality_lookahead_sec
+        )
+        self._sleep_aid_controller.process_snapshot(
+            snapshot,
+            is_stimulus_ok=lambda: gate.is_stimulus_window_clean(guard_sec),
+            on_skip=gate.record_skip,
+        )
         warm = self._sleep_aid_controller.warmup_remaining()
         if warm > 0.0 and int(warm) != getattr(self, "_sleep_aid_last_warm_sec", -1):
             self._sleep_aid_last_warm_sec = int(warm)
@@ -2053,6 +2039,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             y_mid = RHYTHM_DEFAULT_Y_MID
             y_amp = RHYTHM_DEFAULT_Y_AMP
             title = f"EEG 实时波形 · CH1 · {label} ({low_hz:g}-{high_hz:g} Hz)"
+        self._eeg_base_legend = legend
+        if mode == "alpha":
+            legend = self._alpha_reject_status_legend(legend)
         self._waveform.configure_display(
             legend=legend,
             sample_rate=RAW_DISPLAY_RATE,
@@ -2508,11 +2497,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     rejected = self._alpha_rejector.push(value)
                     decim_rejected = decim_rejected or rejected
                 if sleep_aid:
-                    self._process_sleep_aid_sample(value)
+                    self._process_sleep_aid_sample(sample.channel1, value)
                 if self._decim_counter >= RAW_DECIM_FACTOR:
                     self._decim_counter = 0
                     display_rejected = decim_rejected
                     decim_rejected = False
+                    if band == "alpha":
+                        self._alpha_display_total_points += 1
+                        if display_rejected:
+                            self._alpha_display_rejected_points += 1
                     if remove_alpha_display and alpha_removal_view == "compressed":
                         if display_rejected:
                             self._alpha_display_was_removed = True
@@ -2536,6 +2529,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         plot_values.append(value)
                         plot_reject_flags.append(display_rejected)
 
+            if band == "alpha":
+                self._waveform.update_legend(
+                    self._alpha_reject_status_legend(self._eeg_base_legend)
+                )
             if plot_values:
                 self._waveform.append_alphas(
                     plot_values,

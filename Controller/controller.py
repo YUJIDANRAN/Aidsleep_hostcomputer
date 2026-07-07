@@ -8,31 +8,28 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
 from audiio import (
     DEFAULT_AMPLITUDE,
     DEFAULT_SAMPLE_RATE,
+    PinkNoiseBurstOutput,
     StereoSineAudioOutput,
     default_output_device,
 )
-
-try:
-    import sounddevice as sd
-except ImportError:  # pragma: no cover
-    sd = None  # type: ignore[assignment]
 
 SLEEP_AID_WARMUP_SEC = 15.0
 SLEEP_AID_MIN_INTERVAL_SEC = 0.5
 SLEEP_AID_ERP_LATENCY_SEC = 0.062
 SLEEP_AID_AUDIO_LATENCY_SEC = 0.0  ## 音频线直连振子：模拟传输可忽略（非蓝牙）
 SLEEP_AID_FILTER_DELAY_SEC = 0.030
-SLEEP_AID_PLAY_LATENCY = "low"  ## sounddevice 低延迟输出（声卡缓冲仍须实测标定）
 SLEEP_AID_TRIGGER_TOLERANCE_SEC = 0.004
 SLEEP_AID_BURST_DURATION_MS = 20.0
 SLEEP_AID_BURST_AMPLITUDE = 0.3
+SLEEP_AID_BURST_POOL_SIZE = 8
+SLEEP_AID_BURST_AUDIO_BLOCKSIZE = 256
 
 
 @dataclass(frozen=True)
@@ -206,6 +203,7 @@ class SleepAidParams:
     trigger_tolerance_sec: float = SLEEP_AID_TRIGGER_TOLERANCE_SEC
     burst_duration_ms: float = SLEEP_AID_BURST_DURATION_MS
     burst_amplitude: float = SLEEP_AID_BURST_AMPLITUDE
+    quality_lookahead_sec: float = 0.15
 
 
 def make_pink_noise_burst_stereo(
@@ -246,10 +244,6 @@ class SleepAidStimulusController:
         device: Optional[int | str] = None,
         on_triggered: Optional[Callable[[float], None]] = None,
     ) -> None:
-        if sd is None:
-            raise ImportError(
-                "sounddevice is required for sleep-aid burst: pip install sounddevice"
-            )
         self._params = params or SleepAidParams()
         self._sample_rate = float(sample_rate)
         if device is None:
@@ -263,6 +257,22 @@ class SleepAidStimulusController:
         self._started_at = 0.0
         self._last_trigger_at = 0.0
         self._trigger_count = 0
+        self._pool_index = 0
+        self._burst_pool: List[np.ndarray] = [
+            make_pink_noise_burst_stereo(
+                sample_rate=self._sample_rate,
+                duration_ms=self._params.burst_duration_ms,
+                amplitude=self._params.burst_amplitude,
+                rng=self._rng,
+            )
+        ]
+        self._burst_player = PinkNoiseBurstOutput(
+            sample_rate=self._sample_rate,
+            blocksize=SLEEP_AID_BURST_AUDIO_BLOCKSIZE,
+            device=self._device,
+        )
+        self._audio_ready = False
+        self._warmup_thread: Optional[threading.Thread] = None
 
     @property
     def is_active(self) -> bool:
@@ -297,18 +307,57 @@ class SleepAidStimulusController:
             self._started_at = time.monotonic()
             self._last_trigger_at = 0.0
             self._trigger_count = 0
+            self._pool_index = 0
+        self._start_audio_warmup_async()
 
     def stop(self) -> None:
         with self._lock:
             self._active = False
+        self._stop_burst_audio()
 
     def shutdown(self) -> None:
         self.stop()
+
+    def _start_audio_warmup_async(self) -> None:
+        if self._warmup_thread is not None and self._warmup_thread.is_alive():
+            return
+        self._warmup_thread = threading.Thread(
+            target=self._warmup_burst_audio,
+            name="sleep-aid-audio-warmup",
+            daemon=True,
+        )
+        self._warmup_thread.start()
+
+    def _warmup_burst_audio(self) -> None:
+        try:
+            self._burst_player.start()
+            self._fill_burst_pool()
+            self._audio_ready = True
+        except Exception as exc:
+            print(f"[SleepAid] 音频预热失败: {exc}")
+
+    def _fill_burst_pool(self) -> None:
+        while len(self._burst_pool) < SLEEP_AID_BURST_POOL_SIZE:
+            self._burst_pool.append(
+                make_pink_noise_burst_stereo(
+                    sample_rate=self._sample_rate,
+                    duration_ms=self._params.burst_duration_ms,
+                    amplitude=self._params.burst_amplitude,
+                    rng=self._rng,
+                )
+            )
+
+    def _stop_burst_audio(self) -> None:
+        self._audio_ready = False
+        self._burst_player.stop()
 
     def process_snapshot(
         self,
         snapshot: AlphaPhaseSnapshot,
         now: Optional[float] = None,
+        *,
+        is_stimulus_ok: Optional[Callable[[], bool]] = None,
+        on_skip: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """
         根据相位快照判断是否触发 burst。
@@ -332,6 +381,11 @@ class SleepAidStimulusController:
             if abs(snapshot.seconds_to_trough - target) > self._params.trigger_tolerance_sec:
                 return False
 
+            if is_stimulus_ok is not None and not is_stimulus_ok():
+                if on_skip is not None:
+                    on_skip("bad_window")
+                return False
+
             self._last_trigger_at = t
             self._trigger_count += 1
             count = self._trigger_count
@@ -342,16 +396,9 @@ class SleepAidStimulusController:
         return True
 
     def _play_burst(self) -> None:
-        burst = make_pink_noise_burst_stereo(
-            sample_rate=self._sample_rate,
-            duration_ms=self._params.burst_duration_ms,
-            amplitude=self._params.burst_amplitude,
-            rng=self._rng,
-        )
-        sd.play(
-            burst,
-            samplerate=self._sample_rate,
-            device=self._device,
-            blocking=False,
-            latency=SLEEP_AID_PLAY_LATENCY,
-        )
+        if not self._burst_pool:
+            return
+        burst = self._burst_pool[self._pool_index]
+        self._pool_index = (self._pool_index + 1) % len(self._burst_pool)
+        if not self._burst_player.queue_burst(burst):
+            print("[SleepAid] burst 队列已满，已丢弃")
