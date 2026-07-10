@@ -978,9 +978,82 @@ QPushButton:hover { background: #EDF2F7; }</string>
      <item>
       <widget class="QGroupBox" name="groupBox_save">
        <property name="title">
-        <string>保存位置</string>
+        <string>助眠时段</string>
        </property>
-       <layout class="QVBoxLayout" name="verticalLayout_save">
+       <layout class="QGridLayout" name="gridLayout_sleep_aid_window">
+        <property name="leftMargin">
+         <number>10</number>
+        </property>
+        <property name="topMargin">
+         <number>20</number>
+        </property>
+        <property name="rightMargin">
+         <number>10</number>
+        </property>
+        <property name="bottomMargin">
+         <number>10</number>
+        </property>
+        <property name="horizontalSpacing">
+         <number>8</number>
+        </property>
+        <property name="verticalSpacing">
+         <number>6</number>
+        </property>
+        <item row="0" column="0">
+         <widget class="QLabel" name="label_sleep_aid_start">
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+          <property name="text">
+           <string>起始(s)</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QLineEdit" name="lineEdit_3">
+          <property name="minimumSize">
+           <size>
+            <width>72</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="placeholderText">
+           <string>记录内</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="label_sleep_aid_end">
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+          <property name="text">
+           <string>结束(s)</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QLineEdit" name="lineEdit_sleep_aid_end">
+          <property name="minimumSize">
+           <size>
+            <width>72</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="placeholderText">
+           <string>记录内</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <widget class="QGroupBox" name="groupBox_session_name">
+       <property name="title">
+        <string>保存命名</string>
+       </property>
+       <layout class="QVBoxLayout" name="verticalLayout_session_name">
         <property name="leftMargin">
          <number>10</number>
         </property>
@@ -994,15 +1067,15 @@ QPushButton:hover { background: #EDF2F7; }</string>
          <number>10</number>
         </property>
         <item>
-         <widget class="QLineEdit" name="lineEdit_3">
+         <widget class="QLineEdit" name="lineEdit_session_name">
           <property name="minimumSize">
            <size>
-            <width>170</width>
+            <width>100</width>
             <height>0</height>
            </size>
           </property>
           <property name="placeholderText">
-           <string>留空→Result/时间戳文件夹/</string>
+           <string>留空→仅时间戳</string>
           </property>
          </widget>
         </item>
@@ -1092,193 +1165,6 @@ QPushButton:hover { background: #EDF2F7; }</string>
             <property name="text">
              <string>打开串口</string>
             </property>
-           </widget>
-          </item>
-         </layout>
-        </item>
-        <item>
-         <layout class="QHBoxLayout" name="horizontalLayout_serialParams">
-          <property name="spacing">
-           <number>8</number>
-          </property>
-          <item>
-           <widget class="QLabel" name="label_baudrate">
-            <property name="alignment">
-             <set>Qt::AlignCenter</set>
-            </property>
-            <property name="text">
-             <string>波特率</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QComboBox" name="comboBox_serial_baud">
-            <property name="minimumSize">
-             <size>
-              <width>76</width>
-              <height>0</height>
-             </size>
-            </property>
-            <item>
-             <property name="text">
-              <string>9600</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>19200</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>38400</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>57600</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>115200</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>230400</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>460800</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>921600</string>
-             </property>
-            </item>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLabel" name="label_parity">
-            <property name="alignment">
-             <set>Qt::AlignCenter</set>
-            </property>
-            <property name="text">
-             <string>校验位</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QComboBox" name="comboBox_serial_parity">
-            <property name="minimumSize">
-             <size>
-              <width>76</width>
-              <height>0</height>
-             </size>
-            </property>
-            <item>
-             <property name="text">
-              <string>None</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>Even</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>Odd</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>Mark</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>Space</string>
-             </property>
-            </item>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLabel" name="label_data_bits">
-            <property name="alignment">
-             <set>Qt::AlignCenter</set>
-            </property>
-            <property name="text">
-             <string>数据位</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QComboBox" name="comboBox_serial_data_bits">
-            <property name="minimumSize">
-             <size>
-              <width>76</width>
-              <height>0</height>
-             </size>
-            </property>
-            <item>
-             <property name="text">
-              <string>5</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>6</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>7</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>8</string>
-             </property>
-            </item>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLabel" name="label_stop_bits">
-            <property name="alignment">
-             <set>Qt::AlignCenter</set>
-            </property>
-            <property name="text">
-             <string>停止位</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QComboBox" name="comboBox_serial_stop_bits">
-            <property name="minimumSize">
-             <size>
-              <width>76</width>
-              <height>0</height>
-             </size>
-            </property>
-            <item>
-             <property name="text">
-              <string>1</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1.5</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>2</string>
-             </property>
-            </item>
            </widget>
           </item>
          </layout>
