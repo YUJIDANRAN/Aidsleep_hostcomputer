@@ -523,7 +523,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                <set>Qt::AlignCenter</set>
               </property>
               <property name="text">
-               <string>time1</string>
+               <string>段A</string>
               </property>
              </widget>
             </item>
@@ -533,7 +533,27 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                <set>Qt::AlignCenter</set>
               </property>
               <property name="text">
-               <string>time2</string>
+               <string>段B</string>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="3">
+             <widget class="QLabel" name="label_time3">
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+              <property name="text">
+               <string>段C</string>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="4">
+             <widget class="QLabel" name="label_time4">
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+              <property name="text">
+               <string>段D</string>
               </property>
              </widget>
             </item>
@@ -545,16 +565,60 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
              </widget>
             </item>
             <item row="1" column="1">
-             <widget class="QLineEdit" name="lineEdit"/>
+             <widget class="QLineEdit" name="lineEdit">
+              <property name="placeholderText">
+               <string>A起</string>
+              </property>
+             </widget>
             </item>
             <item row="1" column="2">
-             <widget class="QLineEdit" name="lineEdit_11"/>
+             <widget class="QLineEdit" name="lineEdit_11">
+              <property name="placeholderText">
+               <string>B起</string>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="3">
+             <widget class="QLineEdit" name="lineEdit_15">
+              <property name="placeholderText">
+               <string>C起</string>
+              </property>
+             </widget>
+            </item>
+            <item row="1" column="4">
+             <widget class="QLineEdit" name="lineEdit_17">
+              <property name="placeholderText">
+               <string>D起</string>
+              </property>
+             </widget>
             </item>
             <item row="2" column="1">
-             <widget class="QLineEdit" name="lineEdit_2"/>
+             <widget class="QLineEdit" name="lineEdit_2">
+              <property name="placeholderText">
+               <string>A止</string>
+              </property>
+             </widget>
             </item>
             <item row="2" column="2">
-             <widget class="QLineEdit" name="lineEdit_12"/>
+             <widget class="QLineEdit" name="lineEdit_12">
+              <property name="placeholderText">
+               <string>B止</string>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="3">
+             <widget class="QLineEdit" name="lineEdit_16">
+              <property name="placeholderText">
+               <string>C止</string>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="4">
+             <widget class="QLineEdit" name="lineEdit_18">
+              <property name="placeholderText">
+               <string>D止</string>
+              </property>
+             </widget>
             </item>
            </layout>
           </widget>

@@ -378,6 +378,62 @@ class PinkNoiseBurstOutput:
                     self._current = None
 
 
+def make_alert_chime(
+    *,
+    sample_rate: float = DEFAULT_SAMPLE_RATE,
+    amplitude: float = 0.28,
+) -> np.ndarray:
+    """生成短促双音提示（叮—咚），形状 (frames, 2)。"""
+    tone_ms = (180.0, 220.0)
+    gap_ms = 60.0
+    freqs_hz = (880.0, 1174.7)
+    chunks: List[np.ndarray] = []
+    for i, (freq, dur_ms) in enumerate(zip(freqs_hz, tone_ms)):
+        frames = max(1, int(sample_rate * dur_ms / 1000.0))
+        t = np.arange(frames, dtype=np.float64) / sample_rate
+        env = np.hanning(frames)
+        mono = (amplitude * env * np.sin(2.0 * np.pi * freq * t)).astype(np.float32)
+        chunks.append(np.column_stack([mono, mono]))
+        if i + 1 < len(freqs_hz):
+            gap_frames = max(1, int(sample_rate * gap_ms / 1000.0))
+            chunks.append(np.zeros((gap_frames, 2), dtype=np.float32))
+    return np.concatenate(chunks, axis=0)
+
+
+def play_alert_chime(
+    *,
+    sample_rate: float = DEFAULT_SAMPLE_RATE,
+    amplitude: float = 0.28,
+    device: Optional[int | str] = None,
+    blocking: bool = False,
+) -> bool:
+    """
+    播放测试结束提示音。
+    默认非阻塞（后台线程），避免卡住 UI；失败时返回 False。
+    """
+    if sd is None:
+        return False
+
+    waveform = make_alert_chime(sample_rate=sample_rate, amplitude=amplitude)
+
+    def _play() -> None:
+        import time as _time
+
+        # 给前一个 OutputStream（助眠 burst/连续音频）释放声卡留出一点时间
+        _time.sleep(0.15)
+        try:
+            sd.play(waveform, samplerate=sample_rate, device=device, blocking=True)
+            sd.wait()
+        except Exception as exc:  # pragma: no cover
+            print(f"[audiio alert] 播放失败: {exc}")
+
+    if blocking:
+        _play()
+        return True
+    threading.Thread(target=_play, name="alert-chime", daemon=True).start()
+    return True
+
+
 def list_audio_devices() -> List[str]:
     """列出可用音频输出设备，便于选择 device 参数。"""
     _require_sounddevice()

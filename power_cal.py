@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -223,14 +223,190 @@ class PowerAnalysis:
 
 @dataclass(frozen=True)
 class SegmentBandComparison:
-    """两段 EEG 各节律功率对比；ratio = 段2 / 段1。"""
+    """多段 EEG 各节律功率对比（2～4 段）；比值均相对第 1 段。"""
 
-    range_a: Tuple[float, float]
-    range_b: Tuple[float, float]
-    analysis_a: PowerAnalysis
-    analysis_b: PowerAnalysis
-    absolute_ratio: Dict[str, float]
-    relative_ratio: Dict[str, float]
+    ranges: Tuple[Tuple[float, float], ...]
+    analyses: Tuple[PowerAnalysis, ...]
+    absolute_ratios_vs_first: Tuple[Dict[str, float], ...]
+    relative_ratios_vs_first: Tuple[Dict[str, float], ...]
+
+    def __post_init__(self) -> None:
+        if len(self.ranges) < 2:
+            raise ValueError("段间对比至少需要 2 段")
+        if len(self.ranges) != len(self.analyses):
+            raise ValueError("ranges 与 analyses 数量须一致")
+
+    @property
+    def n_segments(self) -> int:
+        return len(self.ranges)
+
+    @property
+    def range_a(self) -> Tuple[float, float]:
+        return self.ranges[0]
+
+    @property
+    def range_b(self) -> Tuple[float, float]:
+        return self.ranges[1]
+
+    @property
+    def analysis_a(self) -> PowerAnalysis:
+        return self.analyses[0]
+
+    @property
+    def analysis_b(self) -> PowerAnalysis:
+        return self.analyses[1]
+
+    @property
+    def absolute_ratio(self) -> Dict[str, float]:
+        """兼容旧接口：第 2 段 / 第 1 段。"""
+        return self.absolute_ratios_vs_first[1]
+
+    @property
+    def relative_ratio(self) -> Dict[str, float]:
+        """兼容旧接口：第 2 段 / 第 1 段。"""
+        return self.relative_ratios_vs_first[1]
+
+
+SEGMENT_LABELS = ("A", "B", "C", "D")
+
+
+def _ratios_vs_first(analyses: Sequence[PowerAnalysis]) -> Tuple[
+    Tuple[Dict[str, float], ...],
+    Tuple[Dict[str, float], ...],
+]:
+    first = analyses[0].result
+    abs_list: List[Dict[str, float]] = []
+    rel_list: List[Dict[str, float]] = []
+    for analysis in analyses:
+        abs_r: Dict[str, float] = {}
+        rel_r: Dict[str, float] = {}
+        for name in EEG_BANDS:
+            a_abs = first.absolute[name]
+            b_abs = analysis.result.absolute[name]
+            a_rel = first.relative[name]
+            b_rel = analysis.result.relative[name]
+            abs_r[name] = b_abs / a_abs if a_abs > 0 else float("nan")
+            rel_r[name] = b_rel / a_rel if a_rel > 0 else float("nan")
+        abs_list.append(abs_r)
+        rel_list.append(rel_r)
+    return tuple(abs_list), tuple(rel_list)
+
+
+def compare_multi_segment_band_powers(
+    signal: np.ndarray,
+    sample_rate: float,
+    ranges: Sequence[Tuple[float, float]],
+) -> SegmentBandComparison:
+    """比较 2～4 段相同节律的绝对/相对功率；比值 = 各段 / 第 1 段。"""
+    if not 2 <= len(ranges) <= 4:
+        raise ValueError(f"段间对比支持 2～4 段，当前为 {len(ranges)} 段")
+    analyses: List[PowerAnalysis] = []
+    for start, end in ranges:
+        seg = _slice_signal(signal, sample_rate, start, end)
+        analyses.append(compute_band_powers(seg, sample_rate=sample_rate))
+    abs_ratios, rel_ratios = _ratios_vs_first(analyses)
+    return SegmentBandComparison(
+        ranges=tuple((float(a), float(b)) for a, b in ranges),
+        analyses=tuple(analyses),
+        absolute_ratios_vs_first=abs_ratios,
+        relative_ratios_vs_first=rel_ratios,
+    )
+
+
+def compare_segment_band_powers(
+    signal: np.ndarray,
+    sample_rate: float,
+    range_a: Tuple[float, float],
+    range_b: Tuple[float, float],
+) -> SegmentBandComparison:
+    """比较两段相同节律的绝对/相对功率，比值 = 段2 / 段1。"""
+    return compare_multi_segment_band_powers(
+        signal, sample_rate, (range_a, range_b)
+    )
+
+
+def compare_multi_segment_band_powers_cleaned(
+    raw: np.ndarray,
+    quality: EegQualityInfo,
+    sample_rate: float,
+    ranges: Sequence[Tuple[float, float]],
+) -> SegmentBandComparison:
+    """段间对比：各段先按原始时间切片，再去掉坏段/可疑段后算功率。"""
+    if not 2 <= len(ranges) <= 4:
+        raise ValueError(f"段间对比支持 2～4 段，当前为 {len(ranges)} 段")
+    min_samples = max(1, int(sample_rate))
+    analyses: List[PowerAnalysis] = []
+    sizes: List[int] = []
+    for start, end in ranges:
+        seg = slice_clean_raw_segment(raw, quality, sample_rate, start, end)
+        sizes.append(int(seg.size))
+        if seg.size < min_samples:
+            raise ValueError(
+                f"删减后有效样本过少 {sizes}，请检查段间时间或坏段比例"
+            )
+        analyses.append(
+            compute_band_powers(seg.astype(np.float64), sample_rate=sample_rate)
+        )
+    abs_ratios, rel_ratios = _ratios_vs_first(analyses)
+    return SegmentBandComparison(
+        ranges=tuple((float(a), float(b)) for a, b in ranges),
+        analyses=tuple(analyses),
+        absolute_ratios_vs_first=abs_ratios,
+        relative_ratios_vs_first=rel_ratios,
+    )
+
+
+def compare_segment_band_powers_cleaned(
+    raw: np.ndarray,
+    quality: EegQualityInfo,
+    sample_rate: float,
+    range_a: Tuple[float, float],
+    range_b: Tuple[float, float],
+) -> SegmentBandComparison:
+    """段间对比：各段先按原始时间切片，再去掉坏段/可疑段后算功率。"""
+    return compare_multi_segment_band_powers_cleaned(
+        raw, quality, sample_rate, (range_a, range_b)
+    )
+
+
+def format_segment_comparison(comp: SegmentBandComparison) -> str:
+    labels = SEGMENT_LABELS[: comp.n_segments]
+    range_bits = [
+        f"{lab}: {rng[0]:g}–{rng[1]:g} s"
+        for lab, rng in zip(labels, comp.ranges)
+    ]
+    lines = [
+        "时间段  " + "  |  ".join(range_bits),
+        "功率比 = 各段 / 段A（第 1 段）",
+    ]
+    header = f"{'节律':<8}"
+    for lab in labels:
+        header += f" {lab + '绝对':>12}"
+    header += f" {'绝对比(相对A)':>14}"
+    for lab in labels:
+        header += f" {lab + '相对%':>10}"
+    lines.append(header)
+    lines.append("-" * max(78, len(header)))
+    for name in EEG_BANDS:
+        label = BAND_LABELS[name]
+        row = f"{label:<8}"
+        for analysis in comp.analyses:
+            row += f" {analysis.result.absolute[name]:>12.4e}"
+        # 用最后一段相对 A 的比值做摘要列；多段时各比值见图
+        last_ratio = comp.absolute_ratios_vs_first[-1][name]
+        row += f" {last_ratio:>14.3f}"
+        for analysis in comp.analyses:
+            row += f" {analysis.result.relative[name] * 100.0:>10.2f}"
+        lines.append(row)
+    if comp.n_segments > 2:
+        lines.append("各段相对 A 的绝对功率比:")
+        for i, lab in enumerate(labels[1:], start=1):
+            bits = [
+                f"{BAND_LABELS[n]}={comp.absolute_ratios_vs_first[i][n]:.3f}"
+                for n in EEG_BANDS
+            ]
+            lines.append(f"  {lab}/A: " + ", ".join(bits))
+    return "\n".join(lines)
 
 
 def _slice_signal(
@@ -372,101 +548,6 @@ def _smooth_spectrum_for_plot(
     v_out = np.bincount(idx, weights=values, minlength=n_bins) / np.maximum(counts, 1)
     valid = counts > 0
     return f_out[valid], v_out[valid]
-
-
-def compare_segment_band_powers(
-    signal: np.ndarray,
-    sample_rate: float,
-    range_a: Tuple[float, float],
-    range_b: Tuple[float, float],
-) -> SegmentBandComparison:
-    """比较两段相同节律的绝对/相对功率，比值 = 段2 / 段1。"""
-    seg_a = _slice_signal(signal, sample_rate, range_a[0], range_a[1])
-    seg_b = _slice_signal(signal, sample_rate, range_b[0], range_b[1])
-    analysis_a = compute_band_powers(seg_a, sample_rate=sample_rate)
-    analysis_b = compute_band_powers(seg_b, sample_rate=sample_rate)
-
-    abs_ratio: Dict[str, float] = {}
-    rel_ratio: Dict[str, float] = {}
-    for name in EEG_BANDS:
-        a_abs = analysis_a.result.absolute[name]
-        b_abs = analysis_b.result.absolute[name]
-        a_rel = analysis_a.result.relative[name]
-        b_rel = analysis_b.result.relative[name]
-        abs_ratio[name] = b_abs / a_abs if a_abs > 0 else float("nan")
-        rel_ratio[name] = b_rel / a_rel if a_rel > 0 else float("nan")
-
-    return SegmentBandComparison(
-        range_a=range_a,
-        range_b=range_b,
-        analysis_a=analysis_a,
-        analysis_b=analysis_b,
-        absolute_ratio=abs_ratio,
-        relative_ratio=rel_ratio,
-    )
-
-
-def compare_segment_band_powers_cleaned(
-    raw: np.ndarray,
-    quality: EegQualityInfo,
-    sample_rate: float,
-    range_a: Tuple[float, float],
-    range_b: Tuple[float, float],
-) -> SegmentBandComparison:
-    """段间对比：各段先按原始时间切片，再去掉坏段/可疑段后算功率。"""
-    seg_a = slice_clean_raw_segment(raw, quality, sample_rate, range_a[0], range_a[1])
-    seg_b = slice_clean_raw_segment(raw, quality, sample_rate, range_b[0], range_b[1])
-    min_samples = max(1, int(sample_rate))
-    if seg_a.size < min_samples or seg_b.size < min_samples:
-        raise ValueError(
-            f"删减后有效样本过少 (A={seg_a.size}, B={seg_b.size})，"
-            "请检查段间时间或坏段比例"
-        )
-    analysis_a = compute_band_powers(seg_a.astype(np.float64), sample_rate=sample_rate)
-    analysis_b = compute_band_powers(seg_b.astype(np.float64), sample_rate=sample_rate)
-
-    abs_ratio: Dict[str, float] = {}
-    rel_ratio: Dict[str, float] = {}
-    for name in EEG_BANDS:
-        a_abs = analysis_a.result.absolute[name]
-        b_abs = analysis_b.result.absolute[name]
-        a_rel = analysis_a.result.relative[name]
-        b_rel = analysis_b.result.relative[name]
-        abs_ratio[name] = b_abs / a_abs if a_abs > 0 else float("nan")
-        rel_ratio[name] = b_rel / a_rel if a_rel > 0 else float("nan")
-
-    return SegmentBandComparison(
-        range_a=range_a,
-        range_b=range_b,
-        analysis_a=analysis_a,
-        analysis_b=analysis_b,
-        absolute_ratio=abs_ratio,
-        relative_ratio=rel_ratio,
-    )
-
-
-def format_segment_comparison(comp: SegmentBandComparison) -> str:
-    ra, rb = comp.range_a, comp.range_b
-    lines = [
-        f"时间段 A: {ra[0]:g}–{ra[1]:g} s  |  时间段 B: {rb[0]:g}–{rb[1]:g} s",
-        f"功率比 = B / A（段2 / 段1）",
-        f"{'节律':<8} {'A绝对':>12} {'B绝对':>12} {'绝对比':>10} "
-        f"{'A相对%':>10} {'B相对%':>10} {'相对比':>10}",
-        "-" * 78,
-    ]
-    for name in EEG_BANDS:
-        label = BAND_LABELS[name]
-        a_abs = comp.analysis_a.result.absolute[name]
-        b_abs = comp.analysis_b.result.absolute[name]
-        a_rel = comp.analysis_a.result.relative[name] * 100.0
-        b_rel = comp.analysis_b.result.relative[name] * 100.0
-        ar = comp.absolute_ratio[name]
-        rr = comp.relative_ratio[name]
-        lines.append(
-            f"{label:<8} {a_abs:>12.4e} {b_abs:>12.4e} {ar:>10.3f} "
-            f"{a_rel:>10.2f} {b_rel:>10.2f} {rr:>10.3f}"
-        )
-    return "\n".join(lines)
 
 
 def extract_band_waveforms(
@@ -831,77 +912,125 @@ def plot_fft(
 def plot_segment_power_comparison(
     comparison: SegmentBandComparison,
     *,
-    title: str = "两段 EEG 节律功率对比",
+    title: str = "多段 EEG 节律功率对比",
     save_path: str | Path | None = None,
     show: bool = True,
 ) -> None:
-    """绘制两段各节律相对/绝对功率及 B/A 比值柱状图。"""
+    """绘制 2～4 段各节律相对/绝对功率及相对第 1 段比值柱状图。"""
     import matplotlib.pyplot as plt
 
     _setup_matplotlib()
 
-    ra, rb = comparison.range_a, comparison.range_b
+    n_seg = comparison.n_segments
+    seg_labels = SEGMENT_LABELS[:n_seg]
     names = list(EEG_BANDS.keys())
-    labels = [
+    band_labels = [
         f"{BAND_LABELS[n]}\n({EEG_BANDS[n][0]:g}-{EEG_BANDS[n][1]:g} Hz)" for n in names
     ]
     colors = [BAND_COLORS[n] for n in names]
+    range_bits = "  |  ".join(
+        f"{lab}: {rng[0]:g}–{rng[1]:g} s"
+        for lab, rng in zip(seg_labels, comparison.ranges)
+    )
 
-    rel_a = [comparison.analysis_a.result.relative[n] * 100.0 for n in names]
-    rel_b = [comparison.analysis_b.result.relative[n] * 100.0 for n in names]
-    abs_a = [comparison.analysis_a.result.absolute[n] for n in names]
-    abs_b = [comparison.analysis_b.result.absolute[n] for n in names]
-    rel_ratios = [comparison.relative_ratio[n] for n in names]
-    abs_ratios = [comparison.absolute_ratio[n] for n in names]
-
-    fig, axes = plt.subplots(3, 1, figsize=(10, 11), constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(max(10, 2.2 * n_seg + 6), 11), constrained_layout=True)
     fig.suptitle(
-        f"{title}\nA: {ra[0]:g}–{ra[1]:g} s  vs  B: {rb[0]:g}–{rb[1]:g} s  |  比值 = B / A",
-        fontsize=13,
+        f"{title}\n{range_bits}\n比值 = 各段 / 段A",
+        fontsize=12,
         fontweight="bold",
     )
 
     x = np.arange(len(names))
-    width = 0.36
+    width = min(0.8 / n_seg, 0.28)
+    offsets = (np.arange(n_seg) - (n_seg - 1) / 2.0) * width
 
     ax_rel = axes[0]
-    ax_rel.bar(x - width / 2, rel_a, width, label=f"A ({ra[0]:g}–{ra[1]:g} s)", color=colors, alpha=0.55, edgecolor="white")
-    ax_rel.bar(x + width / 2, rel_b, width, label=f"B ({rb[0]:g}–{rb[1]:g} s)", color=colors, edgecolor="white", linewidth=0.8)
+    for i, (lab, analysis, offset) in enumerate(
+        zip(seg_labels, comparison.analyses, offsets)
+    ):
+        vals = [analysis.result.relative[n] * 100.0 for n in names]
+        alpha = 0.45 + 0.55 * i / max(n_seg - 1, 1)
+        ax_rel.bar(
+            x + offset,
+            vals,
+            width,
+            label=f"{lab} ({comparison.ranges[i][0]:g}–{comparison.ranges[i][1]:g} s)",
+            color=colors,
+            alpha=alpha,
+            edgecolor="white",
+            linewidth=0.6,
+        )
     ax_rel.set_xticks(x)
-    ax_rel.set_xticklabels(labels)
+    ax_rel.set_xticklabels(band_labels)
     ax_rel.set_ylabel("相对功率 (%)")
-    ax_rel.set_title("各节律相对功率")
-    ax_rel.legend(loc="upper right")
+    ax_rel.set_title(f"各节律相对功率（{n_seg} 段）")
+    ax_rel.legend(loc="upper right", fontsize=8)
     ax_rel.grid(True, axis="y", alpha=0.3)
 
     ax_abs = axes[1]
-    ax_abs.bar(x - width / 2, abs_a, width, label=f"A", color=colors, alpha=0.55, edgecolor="white")
-    ax_abs.bar(x + width / 2, abs_b, width, label=f"B", color=colors, edgecolor="white", linewidth=0.8)
+    for i, (lab, analysis, offset) in enumerate(
+        zip(seg_labels, comparison.analyses, offsets)
+    ):
+        vals = [analysis.result.absolute[n] for n in names]
+        alpha = 0.45 + 0.55 * i / max(n_seg - 1, 1)
+        ax_abs.bar(
+            x + offset,
+            vals,
+            width,
+            label=lab,
+            color=colors,
+            alpha=alpha,
+            edgecolor="white",
+            linewidth=0.6,
+        )
     ax_abs.set_xticks(x)
-    ax_abs.set_xticklabels(labels)
+    ax_abs.set_xticklabels(band_labels)
     ax_abs.set_ylabel("绝对功率")
     ax_abs.set_title("各节律绝对功率")
-    ax_abs.legend(loc="upper right")
+    ax_abs.legend(loc="upper right", fontsize=8)
     ax_abs.grid(True, axis="y", alpha=0.3)
 
     ax_ratio = axes[2]
-    valid_abs = [r if np.isfinite(r) else 0.0 for r in abs_ratios]
-    bars = ax_ratio.bar(labels, valid_abs, color=colors, edgecolor="white", linewidth=0.8)
+    # 对比段（B/C/D）相对 A 的绝对功率比；同节律分组
+    n_ratio = n_seg - 1
+    ratio_width = min(0.8 / max(n_ratio, 1), 0.28)
+    ratio_offsets = (np.arange(n_ratio) - (n_ratio - 1) / 2.0) * ratio_width
+    for j, (lab, offset) in enumerate(zip(seg_labels[1:], ratio_offsets)):
+        vals = [
+            comparison.absolute_ratios_vs_first[j + 1][n]
+            if np.isfinite(comparison.absolute_ratios_vs_first[j + 1][n])
+            else 0.0
+            for n in names
+        ]
+        alpha = 0.55 + 0.45 * j / max(n_ratio - 1, 1)
+        bars = ax_ratio.bar(
+            x + offset,
+            vals,
+            ratio_width,
+            label=f"{lab}/A",
+            color=colors,
+            alpha=alpha,
+            edgecolor="white",
+            linewidth=0.6,
+        )
+        for bar, name in zip(bars, names):
+            ratio = comparison.absolute_ratios_vs_first[j + 1][name]
+            if np.isfinite(ratio):
+                ax_ratio.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    f"{ratio:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
     ax_ratio.axhline(1.0, color="#666666", ls="--", lw=1, label="比值 = 1")
-    ax_ratio.set_ylabel("绝对功率比 (B / A)")
+    ax_ratio.set_xticks(x)
+    ax_ratio.set_xticklabels(band_labels)
+    ax_ratio.set_ylabel("绝对功率比 (相对段A)")
     ax_ratio.set_title("各节律绝对功率比")
-    ax_ratio.legend(loc="upper right")
+    ax_ratio.legend(loc="upper right", fontsize=8)
     ax_ratio.grid(True, axis="y", alpha=0.3)
-    for bar, abs_r, rel_r in zip(bars, abs_ratios, rel_ratios):
-        if np.isfinite(abs_r):
-            ax_ratio.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height(),
-                f"{abs_r:.2f}\n(相对 {rel_r:.2f})",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
 
     if save_path is not None:
         out = Path(save_path)
@@ -1082,7 +1211,7 @@ def _run_power_analysis_pass(
     output_tag: str,
     quality: EegQualityInfo,
     enable_alpha_suspicious: bool,
-    compare_segments: tuple[tuple[float, float], tuple[float, float]] | None,
+    compare_segments: Sequence[Tuple[float, float]] | None,
     compare_segments_cleaned: bool,
     reference_raw: np.ndarray | None,
     reference_quality: EegQualityInfo | None,
@@ -1284,24 +1413,22 @@ def _run_power_analysis_pass(
         )
 
     if compare_segments is not None:
-        range_a, range_b = compare_segments
+        ranges = tuple((float(a), float(b)) for a, b in compare_segments)
         try:
             if compare_segments_cleaned:
                 if reference_raw is None or reference_quality is None:
                     raise ValueError("删减后段间对比缺少原始序列参考")
-                comparison = compare_segment_band_powers_cleaned(
+                comparison = compare_multi_segment_band_powers_cleaned(
                     reference_raw.astype(np.float64),
                     reference_quality,
                     sample_rate,
-                    range_a,
-                    range_b,
+                    ranges,
                 )
             else:
-                comparison = compare_segment_band_powers(
+                comparison = compare_multi_segment_band_powers(
                     raw.astype(np.float64),
                     sample_rate,
-                    range_a,
-                    range_b,
+                    ranges,
                 )
         except ValueError as exc:
             print(f"跳过段间对比 ({pass_label}): {exc}")
@@ -1337,7 +1464,7 @@ def run_analysis(
     show_fft: bool = True,
     save_fft: bool = False,
     fft_time_range: tuple[float, float] | None = None,
-    compare_segments: tuple[tuple[float, float], tuple[float, float]] | None = None,
+    compare_segments: Sequence[Tuple[float, float]] | None = None,
     show_segment_compare: bool = True,
     save_segment_compare: bool = False,
     enable_alpha_suspicious: bool = True,
@@ -1453,7 +1580,7 @@ def run_analysis(
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"C:\Users\liudi\Desktop\Host_computer_6 - 副本\Host_computer_6\Host_computer_6\Result\20260710_113517_O60C60\eeg_raw_full.csv"
+    xlsx_file = r"Result/20260710_195055_前60秒双耳节拍200和210/eeg_raw_full.csv"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)
@@ -1464,8 +1591,8 @@ def main() -> None:
     show_fft = True
     save_fft = True
     fft_time_range = None  # None=整段 FFT；(10, 20) 仅对 10–20 s 画 FFT
-    # 两段对比：计算相同节律功率比 B/A，并出对比图
-    compare_segments = ((10, 50), (70,110))  # (段A起止秒), (段B起止秒)；None 关闭
+    # 多段对比：2～4 段均可；比值=各段/第1段；None 关闭
+    compare_segments = ((10, 50), (70, 110))  # 例如再加 (120,160), (180,220)
     show_segment_compare = True
     save_segment_compare = True
     enable_alpha_suspicious = True

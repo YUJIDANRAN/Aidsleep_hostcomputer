@@ -97,10 +97,15 @@ AUDIO_DEFAULT_LEFT_PHASE_DEG = "0"
 AUDIO_DEFAULT_RIGHT_PHASE_DEG = "90"
 DEFAULT_EEG_CSV_DIR = _ROOT / "Result"  ## timeEdit 定时测试默认 CSV 目录
 TEST_WARMUP_SEC = 10.0  ## 有定时测试时，开始后前 10 s 不保存数据
-DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)，对应 compare_segments[0][0]
+DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)
 DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
 DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
 DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
+DEFAULT_SEGMENT_C_START = ""  ## 段 C 起始，留空表示不参与对比
+DEFAULT_SEGMENT_C_END = ""
+DEFAULT_SEGMENT_D_START = ""
+DEFAULT_SEGMENT_D_END = ""
+MAX_COMPARE_SEGMENTS = 4
 EEG_REJECT_RATE_WARN = 0.20  ## 拒绝率超过 20% 时提示本次采集不宜用于分析
 TROUGH_CAL_SCRIPT = _ALGO_DIR / "TroughCalibrator.py"
 RAW_DISPLAY_RATE = 100  ## 波形显示约 100 点/秒
@@ -1291,17 +1296,31 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return session_dir
 
     def _setup_compare_segments_ui(self) -> None:
-        """lineEdit/lineEdit_2=段A起止，lineEdit_11/lineEdit_12=段B起止（秒）。"""
+        """段A–D：各列上格为起始秒、下格为结束秒；空列不参与对比（至少填 2 段）。"""
         defaults = (
             (self.ui.lineEdit, DEFAULT_SEGMENT_A_START, "A起"),
             (self.ui.lineEdit_2, DEFAULT_SEGMENT_A_END, "A止"),
             (self.ui.lineEdit_11, DEFAULT_SEGMENT_B_START, "B起"),
             (self.ui.lineEdit_12, DEFAULT_SEGMENT_B_END, "B止"),
+            (self.ui.lineEdit_15, DEFAULT_SEGMENT_C_START, "C起"),
+            (self.ui.lineEdit_16, DEFAULT_SEGMENT_C_END, "C止"),
+            (self.ui.lineEdit_17, DEFAULT_SEGMENT_D_START, "D起"),
+            (self.ui.lineEdit_18, DEFAULT_SEGMENT_D_END, "D止"),
         )
         for edit, value, hint in defaults:
-            if not edit.text().strip():
+            if value and not edit.text().strip():
                 edit.setText(value)
             edit.setPlaceholderText(hint)
+            edit.setToolTip("填起始+结束秒；段C/D 可留空，按实际填写段数对比")
+
+        if hasattr(self.ui, "label_time1"):
+            self.ui.label_time1.setText("段A")
+        if hasattr(self.ui, "label_time2"):
+            self.ui.label_time2.setText("段B")
+        if hasattr(self.ui, "label_time3"):
+            self.ui.label_time3.setText("段C")
+        if hasattr(self.ui, "label_time4"):
+            self.ui.label_time4.setText("段D")
 
         if not hasattr(self.ui, "checkBox_remove_alpha_artifacts"):
             self.ui.checkBox_remove_alpha_artifacts = QtWidgets.QCheckBox(
@@ -1321,7 +1340,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 3,
                 0,
                 1,
-                3,
+                5,
             )
             self.ui.radioButton_alpha_remove_compressed = QtWidgets.QRadioButton(
                 "平滑拼接剩余时间轴",
@@ -1351,14 +1370,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 4,
                 0,
                 1,
-                2,
+                3,
             )
             self.ui.gridLayout_compare.addWidget(
                 self.ui.radioButton_alpha_remove_gap,
                 4,
+                3,
+                1,
                 2,
-                1,
-                1,
             )
             self.ui.checkBox_remove_alpha_artifacts.toggled.connect(
                 self._sync_alpha_removal_view_controls_enabled
@@ -1373,6 +1392,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._reset_alpha_display_removal_state
             )
             self._sync_alpha_removal_view_controls_enabled(False)
+
+    def _compare_segment_edit_pairs(self) -> List[Tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]]:
+        return [
+            (self.ui.lineEdit, self.ui.lineEdit_2),
+            (self.ui.lineEdit_11, self.ui.lineEdit_12),
+            (self.ui.lineEdit_15, self.ui.lineEdit_16),
+            (self.ui.lineEdit_17, self.ui.lineEdit_18),
+        ]
 
     def _remove_alpha_artifact_segments_enabled(self) -> bool:
         checkbox = getattr(self.ui, "checkBox_remove_alpha_artifacts", None)
@@ -1427,24 +1454,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def _read_compare_segments_from_ui(
         self,
-    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
-        """读取四段输入，对应 power_cal.compare_segments = ((A起,A止), (B起,B止))。"""
-        edits = (
-            self.ui.lineEdit,
-            self.ui.lineEdit_2,
-            self.ui.lineEdit_11,
-            self.ui.lineEdit_12,
-        )
-        texts = [edit.text().strip() for edit in edits]
-        if not all(texts):
+    ) -> Optional[Tuple[Tuple[float, float], ...]]:
+        """读取段A–D：两侧都空则跳过；只填一侧视为无效；至少 2 段才返回。"""
+        segments: List[Tuple[float, float]] = []
+        for start_edit, end_edit in self._compare_segment_edit_pairs():
+            start_text = start_edit.text().strip()
+            end_text = end_edit.text().strip()
+            if not start_text and not end_text:
+                continue
+            if not start_text or not end_text:
+                return None
+            try:
+                start = float(start_text)
+                end = float(end_text)
+            except ValueError:
+                return None
+            if start >= end:
+                return None
+            segments.append((start, end))
+            if len(segments) >= MAX_COMPARE_SEGMENTS:
+                break
+        if len(segments) < 2:
             return None
-        try:
-            a_start, a_end, b_start, b_end = (float(text) for text in texts)
-        except ValueError:
-            return None
-        if a_start >= a_end or b_start >= b_end:
-            return None
-        return ((a_start, a_end), (b_start, b_end))
+        return tuple(segments)
 
     def _run_post_test_power_analysis(
         self,
@@ -1463,12 +1495,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         remove_alpha_artifacts = self._remove_alpha_artifact_segments_enabled()
         alpha_removal_view = self._alpha_artifact_removal_view_mode()
         if compare_segments is None:
-            self._log("段间对比时间未填全或无效，仅运行基础分析和离线数据导出")
+            self._log("段间对比时间未填全或不足 2 段，仅运行基础分析和离线数据导出")
         else:
-            range_a, range_b = compare_segments
+            labels = ("A", "B", "C", "D")
+            bits = [
+                f"段{lab} {rng[0]:g}–{rng[1]:g}s"
+                for lab, rng in zip(labels, compare_segments)
+            ]
             self._log(
-                f"开始 power_cal 双份分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
-                f"段B {range_b[0]:g}–{range_b[1]:g}s"
+                f"开始 power_cal 双份分析，{len(compare_segments)} 段对比: "
+                + ", ".join(bits)
             )
         if remove_alpha_artifacts:
             view_label = (
@@ -1847,6 +1883,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._sleep_aid_controller.stop()
             self._sleep_aid_timed_auto = False
             self._refresh_sleep_aid_button()
+        if self._audio_controller.is_playing:
+            self._audio_controller.stop()
+            self._refresh_audio_button()
+        self._play_timed_test_end_alert()
         if self._test_duration_sec is not None:
             self._finalize_timed_test()
         else:
@@ -1854,6 +1894,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._refresh_capture_button()
         self._update_status_bar()
         self._log("定时测试到时，已自动停止采集")
+
+    def _play_timed_test_end_alert(self) -> None:
+        """定时测试结束提示音（双音叮咚，非阻塞）。"""
+        try:
+            from audiio import play_alert_chime
+
+            if play_alert_chime():
+                self._log("已播放测试结束提示音")
+            else:
+                self._log("结束提示音不可用（未安装 sounddevice）")
+        except Exception as exc:
+            self._log(f"结束提示音播放失败: {exc}")
 
     def _setup_audio_ui_defaults(self) -> None:
         """音频区默认值：左 lineEdit_7 / 右 lineEdit_6，相位 lineEdit_9/10，时长 lineEdit_8。"""
