@@ -16,7 +16,6 @@ from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
-from scipy.signal import hilbert
 
 _ROOT = Path(__file__).resolve().parent.parent  ## 项目根目录
 _VIEW_DIR = Path(__file__).resolve().parent
@@ -40,6 +39,7 @@ from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     build_threshold_rejection,
     clean_raw_signal,
 )
+from iaf_echt import IAFEcHTPhaseTracker
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
     OSC_BANDS,
@@ -143,65 +143,17 @@ MIN_X_TIME_ZOOM = 0.2  ## X 最小缩放（时间窗最长）
 MIN_X_VISIBLE_POINTS = 50  ## X 至少显示点数，过少会连成三角折线
 MIN_Y_AMP = 20.0  ## Y 半幅下限
 MAX_Y_AMP = 200000.0  ## Y 半幅上限
-SLEEP_AID_HILBERT_WINDOW = int(MCU_SAMPLE_RATE * 0.5)  ## Hilbert 窗 0.5 s
-SLEEP_AID_MIN_HILBERT_SAMPLES = max(64, SLEEP_AID_HILBERT_WINDOW // 2)
-SLEEP_AID_ALPHA_FREQ_MIN_HZ = 7.0
-SLEEP_AID_ALPHA_FREQ_MAX_HZ = 14.0
-SLEEP_AID_TROUGH_PHASE_RAD = math.pi
 SLEEP_AID_BURST_LOG_EVERY = 10  ## burst 日志每 N 次写一条，减轻 QTextEdit 重绘
 
 
-class AlphaPhaseTracker:
-    """Alpha 带通序列 → Hilbert 瞬时相位与下一波谷时间。"""
-
-    def __init__(
-        self,
-        sample_rate: float,
-        window: int = SLEEP_AID_HILBERT_WINDOW,
-    ) -> None:
-        self.sample_rate = float(sample_rate)
-        self.window = int(window)
-        self._buf: Deque[float] = deque(maxlen=self.window)
-
-    def reset(self) -> None:
-        self._buf.clear()
-
-    def push(self, alpha: float) -> AlphaPhaseSnapshot:
-        self._buf.append(float(alpha))
-        return self.snapshot()
-
-    def snapshot(self) -> AlphaPhaseSnapshot:
-        if len(self._buf) < SLEEP_AID_MIN_HILBERT_SAMPLES:
-            return AlphaPhaseSnapshot(ready=False)
-
-        arr = np.asarray(self._buf, dtype=np.float64)
-        analytic = hilbert(arr)
-        phases = np.unwrap(np.angle(analytic))
-        phase_rad = float(phases[-1] % (2.0 * math.pi))
-
-        tail = min(50, len(phases))
-        if tail >= 2:
-            dphase = phases[-1] - phases[-tail]
-            dt = (tail - 1) / self.sample_rate
-            inst_freq_hz = abs(dphase / (2.0 * math.pi * dt))
-            inst_freq_hz = float(
-                np.clip(
-                    inst_freq_hz,
-                    SLEEP_AID_ALPHA_FREQ_MIN_HZ,
-                    SLEEP_AID_ALPHA_FREQ_MAX_HZ,
-                )
-            )
-        else:
-            inst_freq_hz = 10.0
-
-        delta = (SLEEP_AID_TROUGH_PHASE_RAD - phase_rad) % (2.0 * math.pi)
-        seconds_to_trough = delta / (2.0 * math.pi * inst_freq_hz)
-        return AlphaPhaseSnapshot(
-            ready=True,
-            phase_rad=phase_rad,
-            inst_freq_hz=inst_freq_hz,
-            seconds_to_trough=seconds_to_trough,
-        )
+def _to_alpha_phase_snapshot(snap) -> AlphaPhaseSnapshot:
+    """EcHTSnapshot → Controller 使用的 AlphaPhaseSnapshot。"""
+    return AlphaPhaseSnapshot(
+        ready=bool(snap.ready),
+        phase_rad=float(getattr(snap, "phase_rad", 0.0)),
+        inst_freq_hz=float(getattr(snap, "inst_freq_hz", 10.0)),
+        seconds_to_trough=float(getattr(snap, "seconds_to_trough", 0.0)),
+    )
 
 
 def _make_wave_pen(color: str) -> QtGui.QPen:
@@ -943,7 +895,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._audio_controller = StereoAudioController(
             on_stopped=self._audio_stopped.emit,
         )
-        self._sleep_aid_tracker = AlphaPhaseTracker(sample_rate=sample_rate)
+        self._sleep_aid_tracker = IAFEcHTPhaseTracker(sample_rate=sample_rate)
         try:
             self._sleep_aid_controller = SleepAidStimulusController(
                 on_triggered=self._on_sleep_aid_burst,
@@ -1567,6 +1519,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 reject_rate,
             )
             self._maybe_run_trough_calibration(session_dir)
+            self._maybe_run_burst_alpha_power_stats(session_dir)
 
     def _maybe_run_trough_calibration(self, session_dir: Path) -> None:
         """定时测试结束后：若有 burst 记录，运行波谷对齐标定（方法 B）。"""
@@ -1587,6 +1540,25 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
         except Exception as exc:
             self._log(f"波谷标定失败: {exc}")
+
+    def _maybe_run_burst_alpha_power_stats(self, session_dir: Path) -> None:
+        """定时测试结束后：短窗 Alpha 功率（0-100 ms）+ burst 锁定平均。"""
+        if not (session_dir / "sleep_aid_bursts.csv").is_file():
+            return
+        try:
+            from BurstAlphaPowerStats import run_burst_alpha_power_stats
+
+            result = run_burst_alpha_power_stats(session_dir, save_outputs=True)
+            for line in result.report_text.splitlines():
+                self._log(line)
+            self._log(
+                f"刺激短窗 Alpha 统计完成: "
+                f"0-100ms ↑{result.n_up} ↓{result.n_down} →{result.n_flat} "
+                f"| 50-150ms ↑{result.n_up_erp} ↓{result.n_down_erp} "
+                f"(有效 {result.n_valid}/{result.n_bursts})"
+            )
+        except Exception as exc:
+            self._log(f"刺激前后 Alpha 功率统计失败: {exc}")
 
     def _read_time_edit_duration_sec(self) -> Optional[float]:
         """读取 timeEdit；00:00:00 表示未设置。"""
@@ -2082,7 +2054,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if was_in_bad:
             self._sleep_aid_tracker.reset()
 
-        snapshot = self._sleep_aid_tracker.push(alpha)
+        snapshot = _to_alpha_phase_snapshot(self._sleep_aid_tracker.push(alpha))
         if not self._is_in_sleep_aid_burst_window():
             warm = self._sleep_aid_controller.warmup_remaining()
             if warm > 0.0 and int(warm) != getattr(self, "_sleep_aid_last_warm_sec", -1):
