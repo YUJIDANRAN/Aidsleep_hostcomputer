@@ -97,6 +97,11 @@ AUDIO_DEFAULT_LEFT_PHASE_DEG = "0"
 AUDIO_DEFAULT_RIGHT_PHASE_DEG = "90"
 DEFAULT_EEG_CSV_DIR = _ROOT / "Result"  ## timeEdit 定时测试默认 CSV 目录
 TEST_WARMUP_SEC = 10.0  ## 有定时测试时，开始后前 10 s 不保存数据
+LONG_RECORD_CHUNK_SEC = 300.0  ## 长时记录：每 5 分钟自动存一份
+WAVEFORM_WAKE_SEC = 300.0  ## 长时记录：波形显示窗口 5 分钟
+LONG_NORMAL_RAW_MIN = 900  ## 长时记录正常段：raw 下限
+LONG_NORMAL_RAW_MAX = 1300  ## 长时记录正常段：raw 上限
+LONG_NORMAL_MIN_DURATION_SEC = 120.0  ## 长时记录正常段：最短连续时长
 DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)
 DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
 DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
@@ -917,6 +922,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
         self._eeg_raw_record: List[int] = []  ## 定时测试期间记录的 CH1 raw
+        self._long_record_active = False  ## 本次测试是否启用长时记录模式
+        self._long_session_dir: Optional[Path] = None  ## 长时记录固定会话目录
+        self._long_chunks_saved = 0  ## 已自动保存的完整 5 分钟段数
+        self._waveform_display_until: Optional[float] = None  ## 波形显示截止 (monotonic)
+        self._waveform_sleep_logged = False  ## 是否已提示波形休眠
         self._sample_count = 0  ## EEG 已处理样本数
         self._osc_sample_count = 0  ## 振子已处理样本数
         self._no_data_ticks = 0  ## EEG 无数据 poll 计数
@@ -1197,12 +1207,67 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return self.ui.lineEdit_14.text().strip()
 
     def _setup_timed_test_ui(self) -> None:
-        """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时。"""
+        """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时；长时记录与波形唤醒。"""
         self.ui.timeEdit.setDisplayFormat("HH:mm:ss")
         self.ui.timeEdit.setTime(QtCore.QTime(0, 0, 0))
         self.ui.lineEdit_13.setPlaceholderText("秒(优先)")
         self.ui.lcdNumber.setDigitCount(6)
         self.ui.lcdNumber.display(0)
+        self.ui.checkBox_long_record.setToolTip(
+            "勾选后：每 5 分钟自动保存一份 EEG，结束时保存剩余数据；"
+            "结束后：正常段报告 + 坏段剔除后每分钟五节律绝对功率图；"
+            "不画 FFT/波形/段对比；波形仅显示开测后 5 分钟，可用「波形唤醒」"
+        )
+        self.ui.pushButton_wave_wake.setToolTip(
+            "长时记录模式下，每次点击将动态波形再显示 5 分钟"
+        )
+        self.ui.pushButton_wave_wake.clicked.connect(self.on_waveform_wake)
+        self.ui.checkBox_long_record.toggled.connect(self._on_long_record_toggled)
+        self._refresh_wave_wake_button()
+
+    def _on_long_record_toggled(self, _checked: bool) -> None:
+        self._refresh_wave_wake_button()
+
+    def _refresh_wave_wake_button(self) -> None:
+        enabled = bool(self.ui.checkBox_long_record.isChecked())
+        self.ui.pushButton_wave_wake.setEnabled(enabled)
+
+    @QtCore.pyqtSlot()
+    def on_waveform_wake(self) -> None:
+        """长时记录：将动态波形再唤醒 WAVEFORM_WAKE_SEC 秒。"""
+        if not self.ui.checkBox_long_record.isChecked():
+            self._log("请先勾选「长时记录」再唤醒波形")
+            return
+        if not self._running or self._test_duration_sec is None:
+            self._log("请先启动定时记录后再唤醒波形")
+            return
+        if not self._long_record_active:
+            self._log("本次采集未以长时记录模式启动，无法唤醒波形窗口")
+            return
+        self._arm_waveform_display(WAVEFORM_WAKE_SEC, clear=True)
+        self._log(f"波形显示已唤醒 {WAVEFORM_WAKE_SEC / 60.0:.0f} 分钟")
+
+    def _arm_waveform_display(self, duration_sec: float, *, clear: bool = False) -> None:
+        self._waveform_display_until = time.monotonic() + float(duration_sec)
+        self._waveform_sleep_logged = False
+        if clear:
+            self._waveform.clear()
+            self._osc_waveform.clear()
+
+    def _is_waveform_display_active(self) -> bool:
+        if not self._long_record_active:
+            return True
+        until = self._waveform_display_until
+        if until is None:
+            return False
+        if time.monotonic() < until:
+            return True
+        if not self._waveform_sleep_logged:
+            self._waveform_sleep_logged = True
+            self._waveform.clear()
+            self._osc_waveform.clear()
+            self._log("波形显示已休眠（可点「波形唤醒」再开 5 分钟）")
+        return False
 
     def _setup_sleep_aid_window_ui(self) -> None:
         """lineEdit_3 / lineEdit_sleep_aid_end：定时记录内的助眠 burst 起止秒。"""
@@ -1505,7 +1570,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"power_cal 分析失败: {exc}")
 
     def _finalize_timed_test(self) -> None:
-        """保存 EEG raw CSV 并自动运行段间功率分析。"""
+        """保存 EEG raw CSV；普通模式再跑功率分析，长时模式存盘并输出正常段报告。"""
+        if self._long_record_active:
+            self._flush_long_record_buffer(final=True)
+            session_dir = self._long_session_dir
+            if session_dir is not None:
+                self._run_long_record_postprocess(session_dir)
+            self._reset_timed_test_state()
+            if session_dir is not None:
+                self._last_eeg_session_dir = session_dir
+                self._log(
+                    f"长时记录结束：已保存至 {session_dir}"
+                    f"（正常段报告 + 每分钟绝对功率图；跳过 FFT/波形等其它图）"
+                )
+            return
+
         saved = self._save_eeg_raw_csv()
         self._reset_timed_test_state()
         if saved is not None:
@@ -1673,34 +1752,53 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_started_at = time.monotonic() if duration is not None else None
         self._sleep_aid_timed_auto = False
         self._eeg_raw_record.clear()
+        self._long_record_active = False
+        self._long_session_dir = None
+        self._long_chunks_saved = 0
+        self._waveform_display_until = None
+        self._waveform_sleep_logged = False
         if duration is None:
             self.ui.lcdNumber.display(0)
+            if self.ui.checkBox_long_record.isChecked():
+                self._log("已勾选长时记录，但未设置测试时长，本次按普通采集运行")
             return
+        self._long_record_active = bool(self.ui.checkBox_long_record.isChecked())
+        if self._long_record_active:
+            self._long_session_dir = self._resolve_session_dir()
+            self._arm_waveform_display(WAVEFORM_WAKE_SEC, clear=False)
+            self._log(
+                f"长时记录模式: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
+                f"之后记录 {self._format_duration_hms(duration)}；"
+                f"每 {LONG_RECORD_CHUNK_SEC / 60.0:.0f} 分钟自动存盘；"
+                f"不跑功率对比/FFT；波形先显示 {WAVEFORM_WAKE_SEC / 60.0:.0f} 分钟"
+            )
+            self._log(f"长时记录目录: {self._long_session_dir}")
         self._update_test_countdown_lcd()
-        self._log(
-            f"定时测试: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
-            f"之后记录 {self._format_duration_hms(duration)}，"
-            f"到时自动停止并保存；手动停止不保存"
-        )
+        if not self._long_record_active:
+            self._log(
+                f"定时测试: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
+                f"之后记录 {self._format_duration_hms(duration)}，"
+                f"到时自动停止并保存；手动停止不保存"
+            )
         window = self._read_sleep_aid_window_from_ui()
         if window is None:
             return
-        start, end = window
-        if end > duration:
+        start_sec, end_sec = window
+        if end_sec > duration:
             self._log(
-                f"助眠时段无效: 结束 {end:g}s 超过记录时长 {duration:g}s，"
+                f"助眠时段无效: 结束 {end_sec:g}s 超过测试时长 {duration:g}s，"
                 "本次定时记录不启用助眠时段"
             )
             return
         warmup = SLEEP_AID_WARMUP_SEC
-        if start < warmup:
+        if start_sec < warmup:
             self._log(
-                f"助眠起始 {start:g}s 小于暖机 {warmup:g}s："
+                f"助眠起始 {start_sec:g}s 小于暖机 {warmup:g}s："
                 f"将在采集开始后尽快启动暖机，burst 最早约在记录 {warmup:g}s 发出"
             )
-        pre_record = max(0.0, start - warmup)
+        pre_record = max(0.0, start_sec - warmup)
         self._log(
-            f"助眠时段: 记录 {start:g}–{end:g}s 发 burst（不含暖机）；"
+            f"助眠时段: 记录 {start_sec:g}–{end_sec:g}s 发 burst（不含暖机）；"
             f"暖机提前至记录第 {pre_record:g}s 前启动"
         )
 
@@ -1709,6 +1807,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_started_at = None
         self._sleep_aid_timed_auto = False
         self._eeg_raw_record.clear()
+        self._long_record_active = False
+        self._long_session_dir = None
+        self._long_chunks_saved = 0
+        self._waveform_display_until = None
+        self._waveform_sleep_logged = False
         self.ui.lcdNumber.display(0)
 
     def _update_test_countdown_lcd(self) -> None:
@@ -1737,16 +1840,33 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """在 Result 下按 时间戳 或 时间戳_命名 创建子文件夹并写入 CSV。"""
         return self._resolve_session_dir() / "eeg_raw.csv"
 
-    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, Path, float, float]]:
-        if not self._eeg_raw_record:
-            self._log("定时测试结束，但没有 EEG raw 数据可保存")
-            return None
-        cleaned_path = self._resolve_eeg_csv_path()
-        full_path = cleaned_path.with_name("eeg_raw_full.csv")
+    def _measured_eeg_sample_rate(self) -> float:
         sample_rate = float(MCU_SAMPLE_RATE)
         measured = self._rhythm.measured_sample_rate
         if measured is not None and measured > 0:
             sample_rate = measured
+        return sample_rate
+
+    def _save_eeg_raw_csv(
+        self,
+        *,
+        session_dir: Optional[Path] = None,
+        name_stem: str = "eeg_raw",
+        save_bursts: bool = True,
+        quiet_empty: bool = False,
+    ) -> Optional[Tuple[Path, Path, float, float]]:
+        if not self._eeg_raw_record:
+            if not quiet_empty:
+                self._log("定时测试结束，但没有 EEG raw 数据可保存")
+            return None
+        if session_dir is None:
+            session_dir = self._resolve_session_dir()
+        else:
+            session_dir = Path(session_dir)
+            session_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_path = session_dir / f"{name_stem}.csv"
+        full_path = session_dir / f"{name_stem}_full.csv"
+        sample_rate = self._measured_eeg_sample_rate()
         raw = np.asarray(self._eeg_raw_record, dtype=np.int64)
         quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
         reject_rate = quality.reject_rate
@@ -1774,13 +1894,94 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"可疑片段率: {suspicious_rate:.1%}")
             if reject_rate > EEG_REJECT_RATE_WARN:
                 self._log("拒绝率过高，本次数据不建议用于样本分析")
-            session_dir = full_path.parent
             self._last_eeg_session_dir = session_dir
-            self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
+            if save_bursts:
+                self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
             return cleaned_path, full_path, sample_rate, reject_rate
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
             return None
+
+    def _write_long_record_normal_report(self, session_dir: Path) -> None:
+        """长时记录结束：扫描各 chunk，输出 raw 正常段报告。"""
+        try:
+            from LongRecordNormalReport import write_normal_segments_report
+
+            result = write_normal_segments_report(
+                session_dir,
+                raw_min=LONG_NORMAL_RAW_MIN,
+                raw_max=LONG_NORMAL_RAW_MAX,
+                min_duration_sec=LONG_NORMAL_MIN_DURATION_SEC,
+            )
+            for line in result.report_text.splitlines():
+                self._log(line)
+            if result.report_txt_path is not None:
+                self._log(f"正常段报告已保存: {result.report_txt_path}")
+            if result.report_csv_path is not None:
+                self._log(f"正常段 CSV 已保存: {result.report_csv_path}")
+        except Exception as exc:
+            self._log(f"正常段报告生成失败: {exc}")
+
+    def _run_long_record_minute_band_power(self, session_dir: Path) -> None:
+        """长时记录结束：坏段剔除后按分钟算五节律绝对功率，只画一张折线图。"""
+        try:
+            from LongRecordMinuteBandPower import run_minute_band_power_analysis
+
+            result = run_minute_band_power_analysis(session_dir, save_outputs=True)
+            for line in result.report_text.splitlines():
+                self._log(line)
+            if result.plot_path is not None:
+                self._log(f"每分钟绝对功率图已保存: {result.plot_path}")
+        except Exception as exc:
+            self._log(f"每分钟节律绝对功率分析失败: {exc}")
+
+    def _run_long_record_postprocess(self, session_dir: Path) -> None:
+        """长时记录结束后的轻量后处理：正常段报告 + 每分钟绝对功率图。"""
+        self._write_long_record_normal_report(session_dir)
+        self._run_long_record_minute_band_power(session_dir)
+
+    def _flush_long_record_buffer(self, *, final: bool = False) -> None:
+        """长时记录：把当前缓冲写成下一段；final 时额外写 burst。"""
+        if self._long_session_dir is None:
+            return
+        if not self._eeg_raw_record:
+            if final:
+                self._save_sleep_aid_bursts_csv(
+                    self._long_session_dir, self._measured_eeg_sample_rate()
+                )
+            return
+        self._long_chunks_saved += 1
+        stem = f"eeg_chunk_{self._long_chunks_saved:03d}"
+        saved = self._save_eeg_raw_csv(
+            session_dir=self._long_session_dir,
+            name_stem=stem,
+            save_bursts=False,
+            quiet_empty=True,
+        )
+        self._eeg_raw_record.clear()
+        if saved is not None:
+            self._log(
+                f"长时记录已保存第 {self._long_chunks_saved} 段"
+                + ("（收尾）" if final else "")
+            )
+        if final:
+            self._save_sleep_aid_bursts_csv(
+                self._long_session_dir, self._measured_eeg_sample_rate()
+            )
+
+    def _maybe_save_long_record_chunk(self) -> None:
+        """记录阶段每满 LONG_RECORD_CHUNK_SEC 自动存一段并清空缓冲。"""
+        if not self._long_record_active or self._long_session_dir is None:
+            return
+        if not self._is_test_recording_phase():
+            return
+        elapsed = self._recording_elapsed_sec()
+        due = int(elapsed // LONG_RECORD_CHUNK_SEC)
+        while self._long_chunks_saved < due:
+            if not self._eeg_raw_record:
+                self._long_chunks_saved = due
+                break
+            self._flush_long_record_buffer(final=False)
 
     def _save_sleep_aid_bursts_csv(self, session_dir: Path, sample_rate: float) -> None:
         if not self._sleep_aid_burst_record:
@@ -2692,10 +2893,25 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sleep_aid_timed_auto = False
                 self._refresh_sleep_aid_button()
             if self._test_duration_sec is not None:
-                self._eeg_raw_record.clear()
-                self._sleep_aid_burst_record.clear()
-                self._reset_timed_test_state()
-                self._log("手动停止测试：未保存任何记录")
+                if self._long_record_active:
+                    session_dir = self._long_session_dir
+                    self._flush_long_record_buffer(final=True)
+                    if session_dir is not None:
+                        self._run_long_record_postprocess(session_dir)
+                    self._sleep_aid_burst_record.clear()
+                    self._reset_timed_test_state()
+                    if session_dir is not None:
+                        self._last_eeg_session_dir = session_dir
+                        self._log(
+                            f"手动停止长时记录：已保存剩余数据至 {session_dir}"
+                        )
+                    else:
+                        self._log("手动停止长时记录：无数据可保存")
+                else:
+                    self._eeg_raw_record.clear()
+                    self._sleep_aid_burst_record.clear()
+                    self._reset_timed_test_state()
+                    self._log("手动停止测试：未保存任何记录")
         self._refresh_capture_button()
         self._update_status_bar()
         view_label = "振子" if self._active_view == "osc" else "EEG"
@@ -2787,15 +3003,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         plot_values.append(value)
                         plot_reject_flags.append(display_rejected)
 
-            if band == "alpha":
-                self._waveform.update_legend(
-                    self._alpha_reject_status_legend(self._eeg_base_legend)
-                )
-            if plot_values:
-                self._waveform.append_alphas(
-                    plot_values,
-                    plot_reject_flags if band == "alpha" else None,
-                )
+            if self._is_waveform_display_active():
+                if band == "alpha":
+                    self._waveform.update_legend(
+                        self._alpha_reject_status_legend(self._eeg_base_legend)
+                    )
+                if plot_values:
+                    self._waveform.append_alphas(
+                        plot_values,
+                        plot_reject_flags if band == "alpha" else None,
+                    )
+            else:
+                plot_values.clear()
             self._no_data_ticks = 0
         elif got_bytes == 0:
             self._no_data_ticks += 1
@@ -2862,10 +3081,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                             self._osc_decim_counter = 0
                             plot_values.append(value)
 
-            if plot_batch:
-                self._osc_waveform.append_multi_batch(plot_batch)
-            elif plot_values:
-                self._osc_waveform.append_alphas(plot_values)
+            if self._is_waveform_display_active():
+                if plot_batch:
+                    self._osc_waveform.append_multi_batch(plot_batch)
+                elif plot_values:
+                    self._osc_waveform.append_alphas(plot_values)
                 if not axes and mode == "m_freq" and self._osc_proc.dominant_freq_hz > 0:
                     dom_f = self._osc_proc.dominant_freq_hz
                     dom_b = OSC_BAND_LABELS.get(
@@ -2905,6 +3125,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             if self._running and self._test_duration_sec is not None:
                 self._update_test_countdown_lcd()
                 self._maybe_manage_timed_sleep_aid()
+                self._maybe_save_long_record_chunk()
             now = time.monotonic()
             if now - self._last_status_update >= 0.2:
                 self._last_status_update = now
