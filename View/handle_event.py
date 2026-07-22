@@ -51,13 +51,13 @@ from osc_data import (  ## 振子三轴加速度节律分析
 )
 from MainWindow import Ui_MainWindow  ## Designer 生成的 UI
 from ks1082_serial import (
-    EegCsvReplay,
     Ks1082Serial,
     MCU_SAMPLE_RATE,
     RAW_TYPICAL_AMP,
     RAW_TYPICAL_MID,
     list_ports,
 )
+from offline_rhythm_view import CHANNEL_ORDER, OfflineRhythmStackView
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from controller import (
     AlphaPhaseSnapshot,
@@ -885,7 +885,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_port = ""  ## 当前已连接的振子串口
         self._baudrate = baudrate  ## 波特率
         self._rebuild_control_panels(baudrate)
-        self._link: Optional[Ks1082Serial | EegCsvReplay] = None  ## EEG 串口或 CSV 模拟
+        self._link: Optional[Ks1082Serial] = None  ## EEG 串口
         self._osc_link: Optional[OscillatorSerial] = None  ## 振子串口连接
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
         self._alpha_rejector = RealtimeAlphaThresholdRejector(sample_rate)
@@ -912,8 +912,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_sleep_aid_window_ui()
         self._setup_session_name_ui()
         self._setup_compare_segments_ui()
-        self._setup_eeg_replay_ui()
+        self._setup_offline_viewer_ui()
         self._last_eeg_session_dir: Optional[Path] = None
+        self._offline_view_active = False  ## 离线分层波形查看中
         self._sleep_aid_last_warm_sec = -1
         self._sleep_aid_burst_count = 0
         self._sleep_aid_burst_record: List[dict] = []
@@ -969,11 +970,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             sample_rate=sample_rate,
             parent=self.ui.page,
         )
+        self._offline_view = OfflineRhythmStackView(parent=self.ui.page)
+        self._offline_view.hide()
         self._osc_waveform = AlphaWaveformView(  ## 振子：覆盖在 page_2
             sample_rate=OSC_SAMPLE_RATE,
             parent=self.ui.page_2,
         )
         self._sync_waveform_geometry()
+        self._sync_offline_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.show()
         self._waveform.raise_()
@@ -1009,11 +1013,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._apply_display_mode("raw")  ## 默认 EEG raw 波形参数
         self._apply_osc_display_mode("m_freq")  ## 默认振子 M_Fre 波形
         if self._link is not None and self._link.is_open:
-            self._running = True  ## 串口/CSV 可用则自动采集，动态刷新 raw 波形
-            if isinstance(self._link, Ks1082Serial):
-                self._link._parser.reset()
-            else:
-                self._link.reset_playback()
+            self._running = True  ## 串口可用则自动采集，动态刷新 raw 波形
+            self._link._parser.reset()
             self._rhythm.reset()
             self._alpha_rejector.reset()
             self._reset_alpha_display_removal_state()
@@ -1108,10 +1109,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.lineEdit_session_name.setMinimumWidth(120)
 
         try:
-            self.ui.pushButton_browse_csv.clicked.disconnect()
+            self.ui.pushButton_browse_offline.clicked.disconnect()
         except TypeError:
             pass
-        self.ui.pushButton_browse_csv.clicked.connect(self._browse_eeg_replay_csv)
+        self.ui.pushButton_browse_offline.clicked.connect(self._browse_offline_eeg_csv)
+        try:
+            self.ui.pushButton_load_offline.clicked.disconnect()
+        except TypeError:
+            pass
+        self.ui.pushButton_load_offline.clicked.connect(self._load_offline_eeg_csv)
+        try:
+            self.ui.pushButton_clear_offline.clicked.disconnect()
+        except TypeError:
+            pass
+        self.ui.pushButton_clear_offline.clicked.connect(self._exit_offline_view)
         try:
             self.ui.pushButton_serial_toggle.clicked.disconnect()
         except TypeError:
@@ -1159,25 +1170,35 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         super().showEvent(event)
         self._layout_main_regions()
         self._sync_waveform_geometry()
+        self._sync_offline_geometry()
         self._sync_osc_waveform_geometry()
-        self._waveform.show()
-        self._waveform.raise_()
+        if self._offline_view_active:
+            self._waveform.hide()
+            self._offline_view.show()
+            self._offline_view.raise_()
+        else:
+            self._offline_view.hide()
+            self._waveform.show()
+            self._waveform.raise_()
         self._osc_waveform.show()
         self._osc_waveform.raise_()
         self._waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
 
-    def _setup_eeg_replay_ui(self) -> None:
-        """lineEdit_14：填写 eeg_raw.csv 路径时以文件模拟串口输入。"""
-        edit = self.ui.lineEdit_14
+    def _setup_offline_viewer_ui(self) -> None:
+        """离线 CSV 分层波形：选文件 + EEG 显示区多选勾选。"""
+        edit = self.ui.lineEdit_offline_path
         if not edit.text().strip():
-            edit.setPlaceholderText("eeg_raw.csv 路径")
+            edit.setPlaceholderText("选择 eeg_raw.csv / eeg_chunk_*.csv")
         edit.setToolTip(
-            "填写已保存的 EEG CSV（如 Result/eeg_xxx/eeg_raw.csv）时，"
-            "不读 EEG 串口，按 500 Hz 回放模拟输入"
+            "选择已保存的 EEG CSV，点击「加载」后在左侧分层显示；"
+            "勾选 raw data / 各节律控制显示通道；"
+            "工具栏「十字箭头」可拖动横轴/纵轴平移缩放"
         )
+        self.ui.pushButton_load_offline.setToolTip("加载当前路径的 CSV 并显示分层波形")
+        self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
 
-    def _browse_eeg_replay_csv(self) -> None:
+    def _browse_offline_eeg_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "选择 EEG CSV",
@@ -1185,10 +1206,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "CSV Files (*.csv *.txt);;All Files (*)",
         )
         if path:
-            self.ui.lineEdit_14.setText(path)
+            self.ui.lineEdit_offline_path.setText(path)
             self._log(f"已选择 EEG CSV: {path}")
+            self._load_offline_eeg_csv()
 
-    def _resolve_eeg_replay_csv_path(self, text: str) -> Optional[Path]:
+    def _resolve_offline_eeg_csv_path(self, text: str) -> Optional[Path]:
         raw = text.strip().strip('"').strip("'")
         if not raw:
             return None
@@ -1203,8 +1225,65 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         resolved = path.resolve()
         return resolved if resolved.is_file() else None
 
-    def _ui_eeg_csv_path(self) -> str:
-        return self.ui.lineEdit_14.text().strip()
+    def _ui_offline_eeg_csv_path(self) -> str:
+        return self.ui.lineEdit_offline_path.text().strip()
+
+    @QtCore.pyqtSlot()
+    def _load_offline_eeg_csv(self) -> None:
+        path = self._resolve_offline_eeg_csv_path(self._ui_offline_eeg_csv_path())
+        if path is None:
+            self._log("请先选择有效的 EEG CSV 文件")
+            return
+        try:
+            n, fs = self._offline_view.load_file(path)
+        except Exception as exc:
+            self._log(f"离线加载失败 ({path.name}): {exc}")
+            return
+        self._offline_view_active = True
+        for mode, checkbox in self._display_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
+        self._refresh_offline_visible_channels()
+        self._switch_to_eeg_view()
+        self._waveform.hide()
+        self._sync_offline_geometry()
+        self._offline_view.show()
+        self._offline_view.raise_()
+        self.setWindowTitle(f"EEG 离线查看 · {path.name}")
+        self._log(
+            f"离线查看已加载: {path.name}（{n} 点 @ {fs:.0f} Hz）；"
+            f"勾选通道显示，工具栏可拖动坐标轴"
+        )
+        self._update_status_bar()
+
+    @QtCore.pyqtSlot()
+    def _exit_offline_view(self) -> None:
+        if not self._offline_view_active and not self._offline_view.has_data:
+            return
+        self._offline_view_active = False
+        self._offline_view.clear()
+        self._offline_view.hide()
+        self._waveform.show()
+        self._waveform.raise_()
+        # 恢复实时互斥：仅 raw
+        for mode, checkbox in self._display_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(mode == "raw")
+            checkbox.blockSignals(False)
+        self._display_mode = ""
+        self._apply_display_mode("raw")
+        self._log("已退出离线查看，回到实时波形")
+        self._update_status_bar()
+
+    def _refresh_offline_visible_channels(self) -> None:
+        names = [
+            mode
+            for mode in CHANNEL_ORDER
+            if self._display_checkboxes.get(mode) is not None
+            and self._display_checkboxes[mode].isChecked()
+        ]
+        self._offline_view.set_visible_channels(names)
 
     def _setup_timed_test_ui(self) -> None:
         """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时；长时记录与波形唤醒。"""
@@ -2362,6 +2441,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """切换到 EEG 波形页（stackedWidget page）。"""
         self.ui.stackedWidget.setCurrentIndex(0)
         self._active_view = "eeg"
+        if self._offline_view_active:
+            self._waveform.hide()
+            self._sync_offline_geometry()
+            self._offline_view.show()
+            self._offline_view.raise_()
+            self.setWindowTitle(
+                f"EEG 离线查看 · {self._offline_view.source_name or 'CSV'}"
+            )
+            self._update_status_bar()
+            return
+        self._offline_view.hide()
+        self._waveform.show()
+        self._waveform.raise_()
         self._apply_display_mode(self._current_display_mode())
 
     def _switch_to_osc_view(self) -> None:
@@ -2437,7 +2529,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str, bool)
     def _on_display_checkbox_toggled(self, mode: str, checked: bool) -> None:
-        """勾选节律或 raw 后立即切换显示，各选项互斥。"""
+        """实时：节律/raw 互斥；离线查看：可多选分层显示。"""
+        if self._offline_view_active:
+            if not any(cb.isChecked() for cb in self._display_checkboxes.values()):
+                # 至少保留当前项，避免空图误操作后无通道
+                cb = self._display_checkboxes.get(mode)
+                if cb is not None:
+                    cb.blockSignals(True)
+                    cb.setChecked(True)
+                    cb.blockSignals(False)
+            self._refresh_offline_visible_channels()
+            if self._active_view != "eeg":
+                self._switch_to_eeg_view()
+            self._update_status_bar()
+            return
         if checked:
             for other, checkbox in self._display_checkboxes.items():
                 if other != mode:
@@ -2458,6 +2563,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """EEG 波形控件与 Designer 中 graphicsView 同位置同大小。"""
         self._waveform.setGeometry(self.ui.graphicsView.geometry())
 
+    def _sync_offline_geometry(self) -> None:
+        self._offline_view.setGeometry(self.ui.graphicsView.geometry())
+
     def _sync_osc_waveform_geometry(self) -> None:
         """振子波形控件与 EEG 绘图区同尺寸。"""
         self._osc_graphics_view.setGeometry(self.ui.graphicsView.geometry())
@@ -2470,6 +2578,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "_waveform") or not hasattr(self, "_osc_waveform"):
             return
         self._sync_waveform_geometry()
+        self._sync_offline_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
@@ -2712,33 +2821,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return port
 
     def _open_serial(self) -> bool:
-        """打开 EEG 数据源：lineEdit_14 有 CSV 则回放文件，否则读串口。"""
-        csv_path = self._resolve_eeg_replay_csv_path(self._ui_eeg_csv_path())
-        if csv_path is not None:
-            try:
-                if (
-                    isinstance(self._link, EegCsvReplay)
-                    and self._link.is_open
-                    and Path(self._link.csv_path) == csv_path
-                ):
-                    return True
-                if self._link is not None:
-                    self._link.close()
-                replay = EegCsvReplay(csv_path)
-                replay.open()
-                self._link = replay
-                self._port = f"CSV:{csv_path.name}"
-                self._log(
-                    f"EEG CSV 模拟: {csv_path} "
-                    f"({replay.sample_count} 点 @ {replay.sample_rate:.0f} Hz)"
-                )
-                self._log(f"EEG 采样率 {replay.sample_rate:.0f} Hz，显示 {RAW_DISPLAY_RATE} Hz")
-                return True
-            except Exception as exc:
-                self._link = None
-                self._log(f"EEG CSV 加载失败 ({csv_path}): {exc}")
-                return False
-
+        """打开 EEG 串口。"""
         port = self._ui_serial_port()
         serial_settings = self._serial_settings_from_ui()
         try:
@@ -2823,20 +2906,34 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"显示 {OSC_DISPLAY_RATE} Hz"
             )
         else:
+            if self._offline_view_active:
+                checked = [
+                    mode
+                    for mode, cb in self._display_checkboxes.items()
+                    if cb.isChecked()
+                ]
+                labels = ",".join(
+                    "raw" if m == "raw" else BAND_LABELS.get(m, m) for m in checked
+                ) or "—"
+                self.ui.statusbar.showMessage(
+                    f"离线查看 {self._offline_view.source_name}  |  "
+                    f"通道 [{labels}]  |  "
+                    f"{self._offline_view.sample_rate:.0f} Hz  |  "
+                    f"工具栏可拖动横/纵轴"
+                )
+                return
             mode = self._current_display_mode()
             rx = self._rhythm.measured_sample_rate
             rx_text = f"{rx:.0f}" if rx is not None else "—"
             if mode == "raw":
-                src = "CSV" if isinstance(self._link, EegCsvReplay) else "串口"
                 self.ui.statusbar.showMessage(
-                    f"RAW CH1 ({src})  |  显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
+                    f"RAW CH1 (串口)  |  显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
                 )
             else:
                 label = BAND_LABELS[mode]
                 low_hz, high_hz = EEG_BANDS[mode]
-                src = "CSV" if isinstance(self._link, EegCsvReplay) else "串口"
                 self.ui.statusbar.showMessage(
-                    f"{label} {low_hz:g}-{high_hz:g} Hz ({src})  |  "
+                    f"{label} {low_hz:g}-{high_hz:g} Hz (串口)  |  "
                     f"显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
                 )
 
@@ -2932,13 +3029,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         got_bytes = self._link.bytes_received - prev_bytes
 
         if samples:
-            if (
-                len(samples) > MAX_SAMPLES_PER_POLL
-                and not isinstance(self._link, EegCsvReplay)
-            ):
+            if len(samples) > MAX_SAMPLES_PER_POLL:
                 samples = samples[-MAX_SAMPLES_PER_POLL:]
-            mode = self._current_display_mode()
-            self._apply_display_mode(mode)
+            if self._offline_view_active:
+                mode = "raw"
+            else:
+                mode = self._current_display_mode()
+                self._apply_display_mode(mode)
             plot_values: list[float] = []
             plot_reject_flags: list[bool] = []
             band = None if mode == "raw" else mode
@@ -2972,6 +3069,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     self._process_sleep_aid_sample(
                         sample.channel1, value, self._sample_count - 1
                     )
+                if self._offline_view_active:
+                    if self._decim_counter >= RAW_DECIM_FACTOR:
+                        self._decim_counter = 0
+                        decim_rejected = False
+                    continue
                 if self._decim_counter >= RAW_DECIM_FACTOR:
                     self._decim_counter = 0
                     display_rejected = decim_rejected
@@ -3003,7 +3105,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         plot_values.append(value)
                         plot_reject_flags.append(display_rejected)
 
-            if self._is_waveform_display_active():
+            if self._offline_view_active:
+                self._no_data_ticks = 0
+            elif self._is_waveform_display_active():
                 if band == "alpha":
                     self._waveform.update_legend(
                         self._alpha_reject_status_legend(self._eeg_base_legend)
@@ -3015,24 +3119,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     )
             else:
                 plot_values.clear()
-            self._no_data_ticks = 0
+            if not self._offline_view_active:
+                self._no_data_ticks = 0
         elif got_bytes == 0:
             self._no_data_ticks += 1
         else:
             self._no_data_ticks += 1
 
         if self._no_data_ticks == 50:
-            if isinstance(self._link, EegCsvReplay):
-                if self._link.finished:
-                    self._log("EEG CSV 已播放完毕")
-                else:
-                    self._log("EEG CSV 回放等待中（请确认采集已启动）")
+            total = self._link.bytes_received
+            if total == 0:
+                self._log("EEG 串口无任何数据: 请检查 COM 口与接线")
             else:
-                total = self._link.bytes_received
-                if total == 0:
-                    self._log("EEG 串口无任何数据: 请检查 COM 口与接线")
-                else:
-                    self._log(f"EEG 已收到 {total} 字节但未解析出波形")
+                self._log(f"EEG 已收到 {total} 字节但未解析出波形")
             self._no_data_ticks = 0
 
     def _poll_osc_serial(self) -> None:

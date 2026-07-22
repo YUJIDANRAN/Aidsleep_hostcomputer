@@ -17,10 +17,8 @@ CH1 数据：
 
 from __future__ import annotations
 
-import csv
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
 try:
@@ -277,128 +275,6 @@ class Ks1082Serial:
     def iter_samples(self, timeout: Optional[float] = None) -> Iterator[AdcSample]:
         while True:
             yield self.read_sample(timeout=timeout)
-
-
-def _parse_eeg_raw_csv(path: Path) -> List[int]:
-    """读取 eeg_raw.csv，返回 ch1 序列（回放固定按 500 Hz）。"""
-    values: List[int] = []
-    with path.open(newline="", encoding="utf-8-sig") as handle:
-        reader = csv.reader(handle)
-        rows = list(reader)
-    if not rows:
-        raise ValueError("CSV 文件为空")
-
-    header = [cell.strip().lower() for cell in rows[0]]
-    data_rows = rows[1:]
-    ch1_key: Optional[str] = None
-    for key in ("ch1_raw", "channel1", "ch1", "raw"):
-        if key in header:
-            ch1_key = key
-            break
-
-    if ch1_key is not None:
-        ch1_idx = header.index(ch1_key)
-        for row in data_rows:
-            if len(row) <= ch1_idx:
-                continue
-            try:
-                values.append(int(float(row[ch1_idx].strip())))
-            except ValueError:
-                continue
-    else:
-        for row in data_rows:
-            if not row:
-                continue
-            try:
-                values.append(int(float(row[-1].strip())))
-            except ValueError:
-                continue
-
-    if not values:
-        raise ValueError("CSV 中未找到有效的 CH1 数据")
-
-    return values
-
-
-class EegCsvReplay:
-    """用已保存的 eeg_raw.csv 按采样率模拟串口输入。"""
-
-    def __init__(self, csv_path: str | Path) -> None:
-        self.csv_path = str(Path(csv_path).resolve())
-        self._values: List[int] = []
-        self._sample_rate = float(MCU_SAMPLE_RATE)
-        self._index = 0
-        self._open = False
-        self._playback_origin: Optional[float] = None
-        self.bytes_received = 0
-        self._finished_logged = False
-
-    @property
-    def sample_rate(self) -> float:
-        return self._sample_rate
-
-    @property
-    def sample_count(self) -> int:
-        return len(self._values)
-
-    @property
-    def finished(self) -> bool:
-        return self._index >= len(self._values)
-
-    def open(self) -> None:
-        path = Path(self.csv_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"EEG CSV 不存在: {path}")
-        self._values = _parse_eeg_raw_csv(path)
-        self._sample_rate = float(MCU_SAMPLE_RATE)
-        self._index = 0
-        self._playback_origin = None
-        self.bytes_received = 0
-        self._finished_logged = False
-        self._open = True
-
-    def close(self) -> None:
-        self._open = False
-
-    @property
-    def is_open(self) -> bool:
-        return self._open
-
-    def reset_playback(self) -> None:
-        self._index = 0
-        self._playback_origin = None
-        self.bytes_received = 0
-        self._finished_logged = False
-
-    def flush_input_buffer(self) -> int:
-        """重置到文件开头（兼容串口 flush 接口）。"""
-        flushed_samples = self._index
-        self.reset_playback()
-        return flushed_samples * CH1_BYTES_ON_WIRE
-
-    def discard_pending_input(self) -> int:
-        """暂停时冻结播放进度。"""
-        self._playback_origin = None
-        return 0
-
-    def _ensure_playback_origin(self, now: float) -> None:
-        if self._playback_origin is None:
-            self._playback_origin = now - (self._index / self._sample_rate)
-
-    def poll_once(self, max_reads: int = 4) -> List[AdcSample]:
-        del max_reads  ## 与 Ks1082Serial 签名一致，CSV 回放忽略
-        if not self.is_open or self.finished:
-            return []
-        now = time.monotonic()
-        self._ensure_playback_origin(now)
-        elapsed = now - self._playback_origin
-        target_index = min(len(self._values), int(elapsed * self._sample_rate))
-        out: List[AdcSample] = []
-        while self._index < target_index:
-            out.append(AdcSample(channel1=self._values[self._index]))
-            self._index += 1
-            self.bytes_received += CH1_BYTES_ON_WIRE
-        return out
 
 
 def list_ports() -> List[str]:
