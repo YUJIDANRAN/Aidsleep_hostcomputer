@@ -533,41 +533,53 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
             </property>
             <item row="0" column="1">
              <widget class="QLabel" name="label_time1">
+              <property name="visible">
+               <bool>false</bool>
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
               </property>
               <property name="text">
-               <string>段A</string>
+               <string/>
               </property>
              </widget>
             </item>
             <item row="0" column="2">
              <widget class="QLabel" name="label_time2">
+              <property name="visible">
+               <bool>false</bool>
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
               </property>
               <property name="text">
-               <string>段B</string>
+               <string/>
               </property>
              </widget>
             </item>
             <item row="0" column="3">
              <widget class="QLabel" name="label_time3">
+              <property name="visible">
+               <bool>false</bool>
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
               </property>
               <property name="text">
-               <string>段C</string>
+               <string/>
               </property>
              </widget>
             </item>
             <item row="0" column="4">
              <widget class="QLabel" name="label_time4">
+              <property name="visible">
+               <bool>false</bool>
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
               </property>
               <property name="text">
-               <string>段D</string>
+               <string/>
               </property>
              </widget>
             </item>

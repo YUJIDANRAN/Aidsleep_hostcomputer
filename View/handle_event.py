@@ -31,7 +31,12 @@ from power_cal import (  ## 节律滤波与频段定义
     DEFAULT_SAMPLE_RATE,
     EEG_BANDS,
     RhythmStreamProcessor,
+    compare_multi_segment_band_powers,
+    compute_band_powers,
+    plot_band_powers,
+    plot_segment_power_comparison,
     run_analysis,
+    slice_signal,
 )
 from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     RealtimeAlphaThresholdRejector,
@@ -57,7 +62,12 @@ from ks1082_serial import (
     RAW_TYPICAL_MID,
     list_ports,
 )
-from offline_rhythm_view import CHANNEL_ORDER, OfflineRhythmStackView
+from analysis_plot_view import (
+    CHANNEL_ORDER,
+    AnalysisPlotView,
+    OfflineRhythmStackView,
+    load_eeg_csv_with_rate,
+)
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from controller import (
     AlphaPhaseSnapshot,
@@ -102,14 +112,6 @@ WAVEFORM_WAKE_SEC = 300.0  ## 长时记录：波形显示窗口 5 分钟
 LONG_NORMAL_RAW_MIN = 900  ## 长时记录正常段：raw 下限
 LONG_NORMAL_RAW_MAX = 1300  ## 长时记录正常段：raw 上限
 LONG_NORMAL_MIN_DURATION_SEC = 120.0  ## 长时记录正常段：最短连续时长
-DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)
-DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
-DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
-DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
-DEFAULT_SEGMENT_C_START = ""  ## 段 C 起始，留空表示不参与对比
-DEFAULT_SEGMENT_C_END = ""
-DEFAULT_SEGMENT_D_START = ""
-DEFAULT_SEGMENT_D_END = ""
 MAX_COMPARE_SEGMENTS = 4
 EEG_REJECT_RATE_WARN = 0.20  ## 拒绝率超过 20% 时提示本次采集不宜用于分析
 TROUGH_CAL_SCRIPT = _ALGO_DIR / "TroughCalibrator.py"
@@ -890,8 +892,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
         self._alpha_rejector = RealtimeAlphaThresholdRejector(sample_rate)
         self._quality_gate = RealtimeQualityGate(sample_rate)
-        self._alpha_display_last_kept: Optional[float] = None
-        self._alpha_display_was_removed = False
         self._alpha_display_total_points = 0
         self._alpha_display_rejected_points = 0
         self._eeg_base_legend = "RAW CH1"
@@ -914,7 +914,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_compare_segments_ui()
         self._setup_offline_viewer_ui()
         self._last_eeg_session_dir: Optional[Path] = None
+        self._offline_csv_path: Optional[Path] = None
         self._offline_view_active = False  ## 离线分层波形查看中
+        self._analysis_plot_active = False  ## 功率对比图显示中
         self._sleep_aid_last_warm_sec = -1
         self._sleep_aid_burst_count = 0
         self._sleep_aid_burst_record: List[dict] = []
@@ -972,12 +974,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
         self._offline_view = OfflineRhythmStackView(parent=self.ui.page)
         self._offline_view.hide()
+        self._analysis_plot = AnalysisPlotView(parent=self.ui.page)
+        self._analysis_plot.hide()
         self._osc_waveform = AlphaWaveformView(  ## 振子：覆盖在 page_2
             sample_rate=OSC_SAMPLE_RATE,
             parent=self.ui.page_2,
         )
         self._sync_waveform_geometry()
         self._sync_offline_geometry()
+        self._sync_analysis_plot_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.show()
         self._waveform.raise_()
@@ -1017,7 +1022,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._link._parser.reset()
             self._rhythm.reset()
             self._alpha_rejector.reset()
-            self._reset_alpha_display_removal_state()
+            self._reset_alpha_display_stats()
             self._decim_counter = 0
             self._waveform.clear()
         if self._osc_link is not None and self._osc_link.is_open:
@@ -1124,6 +1129,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             pass
         self.ui.pushButton_clear_offline.clicked.connect(self._exit_offline_view)
         try:
+            self.ui.pushButton_5.clicked.disconnect()
+        except TypeError:
+            pass
+        self.ui.pushButton_5.clicked.connect(self._on_power_compare_clicked)
+        try:
             self.ui.pushButton_serial_toggle.clicked.disconnect()
         except TypeError:
             pass
@@ -1171,13 +1181,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._layout_main_regions()
         self._sync_waveform_geometry()
         self._sync_offline_geometry()
+        self._sync_analysis_plot_geometry()
         self._sync_osc_waveform_geometry()
-        if self._offline_view_active:
+        if self._analysis_plot_active:
             self._waveform.hide()
+            self._offline_view.hide()
+            self._analysis_plot.show()
+            self._analysis_plot.raise_()
+        elif self._offline_view_active:
+            self._waveform.hide()
+            self._analysis_plot.hide()
             self._offline_view.show()
             self._offline_view.raise_()
         else:
             self._offline_view.hide()
+            self._analysis_plot.hide()
             self._waveform.show()
             self._waveform.raise_()
         self._osc_waveform.show()
@@ -1191,9 +1209,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not edit.text().strip():
             edit.setPlaceholderText("选择 eeg_raw.csv / eeg_chunk_*.csv")
         edit.setToolTip(
-            "选择已保存的 EEG CSV，点击「加载」后在左侧分层显示；"
-            "勾选 raw data / 各节律控制显示通道；"
-            "工具栏「十字箭头」可拖动横轴/纵轴平移缩放"
+            "选择已保存的 EEG CSV，点击「加载」后在左侧显示；"
+            "raw data 始终显示，勾选其它节律叠加分层波形；"
+            "工具栏可拖动横轴/纵轴平移缩放"
         )
         self.ui.pushButton_load_offline.setToolTip("加载当前路径的 CSV 并显示分层波形")
         self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
@@ -1239,10 +1257,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"离线加载失败 ({path.name}): {exc}")
             return
+        self._offline_csv_path = path
+        self._analysis_plot_active = False
+        self._analysis_plot.hide()
         self._offline_view_active = True
+        # 离线：raw 必显；其它节律默认不勾，按需勾选
         for mode, checkbox in self._display_checkboxes.items():
             checkbox.blockSignals(True)
-            checkbox.setChecked(True)
+            checkbox.setChecked(mode == "raw")
             checkbox.blockSignals(False)
         self._refresh_offline_visible_channels()
         self._switch_to_eeg_view()
@@ -1253,7 +1275,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"EEG 离线查看 · {path.name}")
         self._log(
             f"离线查看已加载: {path.name}（{n} 点 @ {fs:.0f} Hz）；"
-            f"勾选通道显示，工具栏可拖动坐标轴"
+            f"raw 始终显示，勾选其它节律叠加分层波形"
         )
         self._update_status_bar()
 
@@ -1264,25 +1286,34 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view_active = False
         self._offline_view.clear()
         self._offline_view.hide()
-        self._waveform.show()
-        self._waveform.raise_()
-        # 恢复实时互斥：仅 raw
-        for mode, checkbox in self._display_checkboxes.items():
-            checkbox.blockSignals(True)
-            checkbox.setChecked(mode == "raw")
-            checkbox.blockSignals(False)
-        self._display_mode = ""
-        self._apply_display_mode("raw")
+        if not self._analysis_plot_active:
+            self._waveform.show()
+            self._waveform.raise_()
+            # 恢复实时互斥：仅 raw
+            for mode, checkbox in self._display_checkboxes.items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(mode == "raw")
+                checkbox.blockSignals(False)
+            self._display_mode = ""
+            self._apply_display_mode("raw")
         self._log("已退出离线查看，回到实时波形")
         self._update_status_bar()
 
     def _refresh_offline_visible_channels(self) -> None:
-        names = [
-            mode
-            for mode in CHANNEL_ORDER
-            if self._display_checkboxes.get(mode) is not None
-            and self._display_checkboxes[mode].isChecked()
-        ]
+        """raw 始终显示；其它节律仅勾选才显示。"""
+        names = ["raw"]
+        for mode in CHANNEL_ORDER:
+            if mode == "raw":
+                continue
+            cb = self._display_checkboxes.get(mode)
+            if cb is not None and cb.isChecked():
+                names.append(mode)
+        # 同步 UI：raw 勾选框保持勾选
+        raw_cb = self._display_checkboxes.get("raw")
+        if raw_cb is not None and not raw_cb.isChecked():
+            raw_cb.blockSignals(True)
+            raw_cb.setChecked(True)
+            raw_cb.blockSignals(False)
         self._offline_view.set_visible_channels(names)
 
     def _setup_timed_test_ui(self) -> None:
@@ -1392,102 +1423,60 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return session_dir
 
     def _setup_compare_segments_ui(self) -> None:
-        """段A–D：各列上格为起始秒、下格为结束秒；空列不参与对比（至少填 2 段）。"""
-        defaults = (
-            (self.ui.lineEdit, DEFAULT_SEGMENT_A_START, "A起"),
-            (self.ui.lineEdit_2, DEFAULT_SEGMENT_A_END, "A止"),
-            (self.ui.lineEdit_11, DEFAULT_SEGMENT_B_START, "B起"),
-            (self.ui.lineEdit_12, DEFAULT_SEGMENT_B_END, "B止"),
-            (self.ui.lineEdit_15, DEFAULT_SEGMENT_C_START, "C起"),
-            (self.ui.lineEdit_16, DEFAULT_SEGMENT_C_END, "C止"),
-            (self.ui.lineEdit_17, DEFAULT_SEGMENT_D_START, "D起"),
-            (self.ui.lineEdit_18, DEFAULT_SEGMENT_D_END, "D止"),
+        """段A–D：各列上格为起始秒、下格为结束秒；默认全空，按填写段数对比/显示。"""
+        fields = (
+            (self.ui.lineEdit, "A起"),
+            (self.ui.lineEdit_2, "A止"),
+            (self.ui.lineEdit_11, "B起"),
+            (self.ui.lineEdit_12, "B止"),
+            (self.ui.lineEdit_15, "C起"),
+            (self.ui.lineEdit_16, "C止"),
+            (self.ui.lineEdit_17, "D起"),
+            (self.ui.lineEdit_18, "D止"),
         )
-        for edit, value, hint in defaults:
-            if value and not edit.text().strip():
-                edit.setText(value)
+        for edit, hint in fields:
+            edit.clear()
             edit.setPlaceholderText(hint)
-            edit.setToolTip("填起始+结束秒；段C/D 可留空，按实际填写段数对比")
+            edit.setToolTip(
+                "填写起始+结束秒后点「功率对比」："
+                "仅段A→显示该时段 band_power；"
+                "多段→显示功率对比图。"
+                "测试结束时：未填写则不保存 band_power / 段对比图。"
+            )
 
         if hasattr(self.ui, "label_time1"):
-            self.ui.label_time1.setText("段A")
+            self.ui.label_time1.hide()
         if hasattr(self.ui, "label_time2"):
-            self.ui.label_time2.setText("段B")
+            self.ui.label_time2.hide()
         if hasattr(self.ui, "label_time3"):
-            self.ui.label_time3.setText("段C")
+            self.ui.label_time3.hide()
         if hasattr(self.ui, "label_time4"):
-            self.ui.label_time4.setText("段D")
+            self.ui.label_time4.hide()
+        self.ui.pushButton_5.setToolTip(
+            "用当前填写的段时间，在左侧显示区绘制单段功率或分段对比图"
+        )
 
-        if not hasattr(self.ui, "checkBox_remove_alpha_artifacts"):
-            self.ui.checkBox_remove_alpha_artifacts = QtWidgets.QCheckBox(
-                "剔除异常波形片段",
-                self.ui.groupBox_compare,
+        if not hasattr(self.ui, "checkBox_minute_abs"):
+            self.ui.checkBox_minute_abs = QtWidgets.QCheckBox(
+                "绝对功率", self.ui.groupBox_compare
             )
-            self.ui.checkBox_remove_alpha_artifacts.setObjectName(
-                "checkBox_remove_alpha_artifacts"
+            self.ui.checkBox_minute_abs.setObjectName("checkBox_minute_abs")
+            self.ui.checkBox_minute_abs.setToolTip(
+                "勾选后在左侧显示每分钟五节律绝对功率曲线；"
+                "长时多 chunk 会先按序号拼接再计算"
             )
-            self.ui.checkBox_remove_alpha_artifacts.setToolTip(
-                "开启后，power_cal 额外保存 alpha 可疑片段剔除后的 gap/compressed 波形图；"
-                "离线 full/cleaned CSV 始终保存。"
+            self.ui.gridLayout_compare.addWidget(self.ui.checkBox_minute_abs, 3, 0, 1, 2)
+            self.ui.checkBox_minute_rel = QtWidgets.QCheckBox(
+                "相对功率", self.ui.groupBox_compare
             )
-            self.ui.checkBox_remove_alpha_artifacts.setChecked(False)
-            self.ui.gridLayout_compare.addWidget(
-                self.ui.checkBox_remove_alpha_artifacts,
-                3,
-                0,
-                1,
-                5,
+            self.ui.checkBox_minute_rel.setObjectName("checkBox_minute_rel")
+            self.ui.checkBox_minute_rel.setToolTip(
+                "勾选后在左侧显示每分钟五节律相对功率曲线；"
+                "可与「绝对功率」同时勾选（上下两图）"
             )
-            self.ui.radioButton_alpha_remove_compressed = QtWidgets.QRadioButton(
-                "平滑拼接剩余时间轴",
-                self.ui.groupBox_compare,
-            )
-            self.ui.radioButton_alpha_remove_compressed.setObjectName(
-                "radioButton_alpha_remove_compressed"
-            )
-            self.ui.radioButton_alpha_remove_gap = QtWidgets.QRadioButton(
-                "直接断开/空白",
-                self.ui.groupBox_compare,
-            )
-            self.ui.radioButton_alpha_remove_gap.setObjectName(
-                "radioButton_alpha_remove_gap"
-            )
-            self.ui.radioButton_alpha_remove_compressed.setChecked(True)
-            self._alpha_removal_view_group = QtWidgets.QButtonGroup(self)
-            self._alpha_removal_view_group.setExclusive(True)
-            self._alpha_removal_view_group.addButton(
-                self.ui.radioButton_alpha_remove_compressed
-            )
-            self._alpha_removal_view_group.addButton(
-                self.ui.radioButton_alpha_remove_gap
-            )
-            self.ui.gridLayout_compare.addWidget(
-                self.ui.radioButton_alpha_remove_compressed,
-                4,
-                0,
-                1,
-                3,
-            )
-            self.ui.gridLayout_compare.addWidget(
-                self.ui.radioButton_alpha_remove_gap,
-                4,
-                3,
-                1,
-                2,
-            )
-            self.ui.checkBox_remove_alpha_artifacts.toggled.connect(
-                self._sync_alpha_removal_view_controls_enabled
-            )
-            self.ui.checkBox_remove_alpha_artifacts.toggled.connect(
-                self._reset_alpha_display_removal_state
-            )
-            self.ui.radioButton_alpha_remove_compressed.toggled.connect(
-                self._reset_alpha_display_removal_state
-            )
-            self.ui.radioButton_alpha_remove_gap.toggled.connect(
-                self._reset_alpha_display_removal_state
-            )
-            self._sync_alpha_removal_view_controls_enabled(False)
+            self.ui.gridLayout_compare.addWidget(self.ui.checkBox_minute_rel, 3, 2, 1, 3)
+            self.ui.checkBox_minute_abs.toggled.connect(self._on_minute_power_toggled)
+            self.ui.checkBox_minute_rel.toggled.connect(self._on_minute_power_toggled)
 
     def _compare_segment_edit_pairs(self) -> List[Tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]]:
         return [
@@ -1497,13 +1486,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             (self.ui.lineEdit_17, self.ui.lineEdit_18),
         ]
 
-    def _remove_alpha_artifact_segments_enabled(self) -> bool:
-        checkbox = getattr(self.ui, "checkBox_remove_alpha_artifacts", None)
-        return bool(checkbox is not None and checkbox.isChecked())
-
-    def _reset_alpha_display_removal_state(self) -> None:
-        self._alpha_display_last_kept = None
-        self._alpha_display_was_removed = False
+    def _reset_alpha_display_stats(self) -> None:
         self._alpha_display_total_points = 0
         self._alpha_display_rejected_points = 0
 
@@ -1517,41 +1500,23 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._alpha_display_rejected_points
                 / max(self._alpha_display_total_points, 1)
             )
-            action = (
-                "剔除"
-                if self._remove_alpha_artifact_segments_enabled()
-                else "仅标注"
-            )
-            view = self._alpha_artifact_removal_view_mode()
-            view_label = "拼接" if view == "compressed" else "断开"
             status = (
                 f"alpha阈值={self._alpha_rejector.threshold:.1f} "
                 f"| 拒绝={ratio:.1%} ({self._alpha_display_rejected_points}/"
-                f"{self._alpha_display_total_points}) | {action}/{view_label}"
+                f"{self._alpha_display_total_points}) | 仅标注"
             )
         return f"{base_legend}  |  {status}"
-
-    def _alpha_artifact_removal_view_mode(self) -> str:
-        if not self._remove_alpha_artifact_segments_enabled():
-            return "compressed"
-        gap_radio = getattr(self.ui, "radioButton_alpha_remove_gap", None)
-        if gap_radio is not None and gap_radio.isChecked():
-            return "gap"
-        return "compressed"
-
-    def _sync_alpha_removal_view_controls_enabled(self, checked: bool) -> None:
-        for name in (
-            "radioButton_alpha_remove_compressed",
-            "radioButton_alpha_remove_gap",
-        ):
-            radio = getattr(self.ui, name, None)
-            if radio is not None:
-                radio.setEnabled(bool(checked))
 
     def _read_compare_segments_from_ui(
         self,
     ) -> Optional[Tuple[Tuple[float, float], ...]]:
-        """读取段A–D：两侧都空则跳过；只填一侧视为无效；至少 2 段才返回。"""
+        """读取段A–D。
+
+        返回:
+          () — 全部留空
+          ((s,e), ...) — 至少 1 段有效
+          None — 填写不完整/非法
+        """
         segments: List[Tuple[float, float]] = []
         for start_edit, end_edit in self._compare_segment_edit_pairs():
             start_text = start_edit.text().strip()
@@ -1570,8 +1535,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             segments.append((start, end))
             if len(segments) >= MAX_COMPARE_SEGMENTS:
                 break
-        if len(segments) < 2:
-            return None
         return tuple(segments)
 
     def _run_post_test_power_analysis(
@@ -1588,27 +1551,31 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
             return
         compare_segments = self._read_compare_segments_from_ui()
-        remove_alpha_artifacts = self._remove_alpha_artifact_segments_enabled()
-        alpha_removal_view = self._alpha_artifact_removal_view_mode()
         if compare_segments is None:
-            self._log("段间对比时间未填全或不足 2 段，仅运行基础分析和离线数据导出")
+            self._log("段时间填写无效（须成对填写起止秒），跳过 band_power / 段对比出图")
+            save_plot = False
+            save_segment_compare = False
+            segments_for_compare = None
+        elif len(compare_segments) == 0:
+            self._log("未填写段时间：不生成 band_power / 功率对比图，仍导出离线 CSV 等")
+            save_plot = False
+            save_segment_compare = False
+            segments_for_compare = None
         else:
             labels = ("A", "B", "C", "D")
             bits = [
                 f"段{lab} {rng[0]:g}–{rng[1]:g}s"
                 for lab, rng in zip(labels, compare_segments)
             ]
+            save_plot = True
+            save_segment_compare = len(compare_segments) >= 2
+            segments_for_compare = (
+                compare_segments if len(compare_segments) >= 2 else None
+            )
             self._log(
-                f"开始 power_cal 双份分析，{len(compare_segments)} 段对比: "
-                + ", ".join(bits)
+                f"开始 power_cal 双份分析；段时间: " + ", ".join(bits)
+                + ("；将保存段对比图" if save_segment_compare else "；仅保存 band_power")
             )
-        if remove_alpha_artifacts:
-            view_label = (
-                "直接断开/空白"
-                if alpha_removal_view == "gap"
-                else "平滑拼接剩余时间轴"
-            )
-            self._log(f"已启用: 剔除异常波形片段图像导出 ({view_label})")
         buffer = io.StringIO()
         try:
             with redirect_stdout(buffer):
@@ -1616,7 +1583,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     full_csv_path,
                     sample_rate,
                     show_plot=False,
-                    save_plot=True,
+                    save_plot=save_plot,
                     show_waveform=False,
                     save_waveform=True,
                     waveform_seconds=None,
@@ -1624,14 +1591,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     show_fft=False,
                     save_fft=True,
                     fft_time_range=None,
-                    compare_segments=compare_segments,
+                    compare_segments=segments_for_compare,
                     show_segment_compare=False,
-                    save_segment_compare=compare_segments is not None,
+                    save_segment_compare=save_segment_compare,
                     enable_alpha_suspicious=True,
                     save_model_window_table=True,
                     save_offline_waveform_data=True,
-                    remove_alpha_artifact_segments=remove_alpha_artifacts,
-                    alpha_artifact_removal_view=alpha_removal_view,
                     dual_power_analysis=True,
                 )
             report = buffer.getvalue().strip()
@@ -1642,11 +1607,223 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 report_path.write_text(report + "\n", encoding="utf-8")
                 self._log(f"分析报告已保存: {report_path}")
             self._log(
-                f"分析图表已保存至: {full_csv_path.parent} "
-                f"(删减前/后分别带 _before_removal / _after_removal 后缀)"
+                f"分析输出已保存至: {full_csv_path.parent}"
+                + (
+                    "（含删减前/后 band_power）"
+                    if save_plot
+                    else "（未保存 band_power / 段对比图）"
+                )
             )
         except Exception as exc:
             self._log(f"power_cal 分析失败: {exc}")
+
+    def _resolve_power_compare_csv(self) -> Optional[Path]:
+        """功率对比数据源：离线已加载文件 > 最近会话 full csv > 浏览选择。"""
+        if self._offline_csv_path is not None and self._offline_csv_path.is_file():
+            return self._offline_csv_path
+        if self._last_eeg_session_dir is not None:
+            for name in (
+                "eeg_raw_full.csv",
+                "eeg_raw.csv",
+            ):
+                candidate = self._last_eeg_session_dir / name
+                if candidate.is_file():
+                    return candidate
+            for path in sorted(self._last_eeg_session_dir.glob("eeg_chunk_*_full.csv")):
+                return path
+            for path in sorted(self._last_eeg_session_dir.glob("*_offline_full_raw.csv")):
+                return path
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择用于功率对比的 EEG CSV",
+            str((_ROOT / "Result").resolve()),
+            "CSV Files (*.csv *.txt);;All Files (*)",
+        )
+        return Path(path) if path else None
+
+    @QtCore.pyqtSlot()
+    def _on_power_compare_clicked(self) -> None:
+        segments = self._read_compare_segments_from_ui()
+        if segments is None:
+            self._log("段时间填写无效：每段须同时填起始与结束秒，且起始 < 结束")
+            return
+        if len(segments) == 0:
+            self._log("请至少填写段A的起始与结束时间")
+            return
+        csv_path = self._resolve_power_compare_csv()
+        if csv_path is None:
+            self._log("未选择 EEG CSV，无法做功率对比")
+            return
+        try:
+            raw, sample_rate = load_eeg_csv_with_rate(csv_path)
+        except Exception as exc:
+            self._log(f"读取 CSV 失败 ({csv_path.name}): {exc}")
+            return
+        try:
+            if len(segments) == 1:
+                start, end = segments[0]
+                seg = slice_signal(raw, sample_rate, start, end)
+                analysis = compute_band_powers(seg, sample_rate=sample_rate)
+                plot_band_powers(
+                    analysis,
+                    title=f"段A 节律功率 · {start:g}–{end:g} s · {csv_path.name}",
+                    show=False,
+                    figure=self._analysis_plot.figure,
+                )
+                self._log(
+                    f"已显示段A band_power: {start:g}–{end:g} s（{csv_path.name}）"
+                )
+            else:
+                comparison = compare_multi_segment_band_powers(
+                    raw, sample_rate, segments
+                )
+                plot_segment_power_comparison(
+                    comparison,
+                    title=f"多段节律功率对比 · {csv_path.name}",
+                    show=False,
+                    figure=self._analysis_plot.figure,
+                )
+                labels = ("A", "B", "C", "D")
+                bits = [
+                    f"{lab} {rng[0]:g}–{rng[1]:g}s"
+                    for lab, rng in zip(labels, segments)
+                ]
+                self._log(f"已显示多段功率对比: " + ", ".join(bits))
+        except Exception as exc:
+            self._log(f"功率对比失败: {exc}")
+            return
+        self._show_analysis_plot_view()
+        self._analysis_plot.refresh()
+
+    def _resolve_minute_power_source(self) -> Optional[Path]:
+        """分钟功率数据源：离线文件所在会话 / 最近会话 / 选目录或 CSV。"""
+        if self._offline_csv_path is not None and self._offline_csv_path.is_file():
+            parent = self._offline_csv_path.parent
+            try:
+                from LongRecordNormalReport import list_chunk_full_csvs
+
+                if list_chunk_full_csvs(parent):
+                    return parent
+            except Exception:
+                pass
+            return self._offline_csv_path
+        if self._last_eeg_session_dir is not None and self._last_eeg_session_dir.is_dir():
+            return self._last_eeg_session_dir
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择会话内 EEG CSV（长时请选任一 chunk，或选 eeg_raw_full.csv）",
+            str((_ROOT / "Result").resolve()),
+            "CSV Files (*.csv *.txt);;All Files (*)",
+        )
+        if not path:
+            return None
+        chosen = Path(path)
+        parent = chosen.parent
+        try:
+            from LongRecordNormalReport import list_chunk_full_csvs
+
+            if list_chunk_full_csvs(parent):
+                return parent
+        except Exception:
+            pass
+        return chosen
+
+    @QtCore.pyqtSlot(bool)
+    def _on_minute_power_toggled(self, _checked: bool = False) -> None:
+        want_abs = bool(
+            getattr(self.ui, "checkBox_minute_abs", None)
+            and self.ui.checkBox_minute_abs.isChecked()
+        )
+        want_rel = bool(
+            getattr(self.ui, "checkBox_minute_rel", None)
+            and self.ui.checkBox_minute_rel.isChecked()
+        )
+        if not want_abs and not want_rel:
+            if self._analysis_plot_active:
+                self._analysis_plot.clear()
+                self._log("已取消每分钟功率图显示（未勾选绝对/相对功率）")
+            return
+
+        source = self._resolve_minute_power_source()
+        if source is None:
+            self._log("未选择数据，无法绘制每分钟功率图")
+            # 取消勾选，避免反复弹窗
+            for name in ("checkBox_minute_abs", "checkBox_minute_rel"):
+                cb = getattr(self.ui, name, None)
+                if cb is not None:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+            return
+
+        try:
+            from LongRecordMinuteBandPower import (
+                plot_minute_band_powers,
+                prepare_cleaned_minute_powers,
+            )
+
+            minutes, absolute, relative, meta = prepare_cleaned_minute_powers(source)
+        except Exception as exc:
+            self._log(f"每分钟功率计算失败: {exc}")
+            return
+
+        if meta["n_minutes"] <= 0:
+            self._log("有效数据不足 1 分钟，无法绘制每分钟功率图")
+            return
+
+        kinds = []
+        if want_abs:
+            kinds.append("绝对")
+        if want_rel:
+            kinds.append("相对")
+        title = (
+            f"每分钟节律{'/'.join(kinds)}功率（坏段剔除后，N={meta['n_minutes']}）"
+            f" · {meta['source_desc']}"
+        )
+        try:
+            plot_minute_band_powers(
+                minutes,
+                absolute=absolute if want_abs else None,
+                relative=relative if want_rel else None,
+                title=title,
+                figure=self._analysis_plot.figure,
+            )
+        except Exception as exc:
+            self._log(f"每分钟功率绘图失败: {exc}")
+            return
+
+        self._show_analysis_plot_view()
+        self._analysis_plot.refresh()
+        self._log(
+            f"已显示每分钟{'/'.join(kinds)}功率："
+            f"{meta['source_desc']}，N={meta['n_minutes']} 分钟"
+            f"（剔除 {meta['n_removed']} 点）"
+        )
+
+    def _show_analysis_plot_view(self) -> None:
+        self._analysis_plot_active = True
+        self._offline_view_active = False
+        self._offline_view.hide()
+        self._waveform.hide()
+        self._sync_analysis_plot_geometry()
+        self._analysis_plot.show()
+        self._analysis_plot.raise_()
+        self._switch_to_eeg_view()
+        self.setWindowTitle("EEG 功率对比")
+        self._update_status_bar()
+
+    def _exit_analysis_plot_view(self) -> None:
+        if not self._analysis_plot_active:
+            return
+        self._analysis_plot_active = False
+        self._analysis_plot.hide()
+        self._analysis_plot.clear()
+        if not self._offline_view_active:
+            self._waveform.show()
+            self._waveform.raise_()
+            self._display_mode = ""
+            self._apply_display_mode(self._current_display_mode())
+        self._update_status_bar()
 
     def _finalize_timed_test(self) -> None:
         """保存 EEG raw CSV；普通模式再跑功率分析，长时模式存盘并输出正常段报告。"""
@@ -2227,7 +2404,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._rhythm.reset()
         self._alpha_rejector.reset()
         self._quality_gate.reset()
-        self._reset_alpha_display_removal_state()
+        self._reset_alpha_display_stats()
         if manual or not self._sleep_aid_burst_record:
             self._sleep_aid_burst_count = 0
             self._sleep_aid_burst_record.clear()
@@ -2441,8 +2618,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """切换到 EEG 波形页（stackedWidget page）。"""
         self.ui.stackedWidget.setCurrentIndex(0)
         self._active_view = "eeg"
+        if self._analysis_plot_active:
+            self._waveform.hide()
+            self._offline_view.hide()
+            self._sync_analysis_plot_geometry()
+            self._analysis_plot.show()
+            self._analysis_plot.raise_()
+            self.setWindowTitle("EEG 功率对比")
+            self._update_status_bar()
+            return
         if self._offline_view_active:
             self._waveform.hide()
+            self._analysis_plot.hide()
             self._sync_offline_geometry()
             self._offline_view.show()
             self._offline_view.raise_()
@@ -2452,6 +2639,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._update_status_bar()
             return
         self._offline_view.hide()
+        self._analysis_plot.hide()
         self._waveform.show()
         self._waveform.raise_()
         self._apply_display_mode(self._current_display_mode())
@@ -2529,15 +2717,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str, bool)
     def _on_display_checkbox_toggled(self, mode: str, checked: bool) -> None:
-        """实时：节律/raw 互斥；离线查看：可多选分层显示。"""
+        """实时：节律/raw 互斥；离线：raw 必显，其它节律可多选叠加。"""
         if self._offline_view_active:
-            if not any(cb.isChecked() for cb in self._display_checkboxes.values()):
-                # 至少保留当前项，避免空图误操作后无通道
-                cb = self._display_checkboxes.get(mode)
-                if cb is not None:
-                    cb.blockSignals(True)
-                    cb.setChecked(True)
-                    cb.blockSignals(False)
+            if mode == "raw" and not checked:
+                raw_cb = self._display_checkboxes["raw"]
+                raw_cb.blockSignals(True)
+                raw_cb.setChecked(True)
+                raw_cb.blockSignals(False)
+                self._log("离线查看时 raw data 始终显示，不可取消勾选")
             self._refresh_offline_visible_channels()
             if self._active_view != "eeg":
                 self._switch_to_eeg_view()
@@ -2566,6 +2753,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _sync_offline_geometry(self) -> None:
         self._offline_view.setGeometry(self.ui.graphicsView.geometry())
 
+    def _sync_analysis_plot_geometry(self) -> None:
+        self._analysis_plot.setGeometry(self.ui.graphicsView.geometry())
+
     def _sync_osc_waveform_geometry(self) -> None:
         """振子波形控件与 EEG 绘图区同尺寸。"""
         self._osc_graphics_view.setGeometry(self.ui.graphicsView.geometry())
@@ -2579,6 +2769,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         self._sync_waveform_geometry()
         self._sync_offline_geometry()
+        self._sync_analysis_plot_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
@@ -2906,15 +3097,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"显示 {OSC_DISPLAY_RATE} Hz"
             )
         else:
+            if self._analysis_plot_active:
+                self.ui.statusbar.showMessage(
+                    "功率对比图  |  工具栏可拖动横/纵轴  |  填写段时间后点「功率对比」刷新"
+                )
+                return
             if self._offline_view_active:
-                checked = [
-                    mode
+                bands = [
+                    BAND_LABELS.get(mode, mode)
                     for mode, cb in self._display_checkboxes.items()
-                    if cb.isChecked()
+                    if mode != "raw" and cb.isChecked()
                 ]
-                labels = ",".join(
-                    "raw" if m == "raw" else BAND_LABELS.get(m, m) for m in checked
-                ) or "—"
+                labels = "raw" + (("+" + ",".join(bands)) if bands else "")
                 self.ui.statusbar.showMessage(
                     f"离线查看 {self._offline_view.source_name}  |  "
                     f"通道 [{labels}]  |  "
@@ -2960,7 +3154,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._last_status_update = 0.0
                 self._rhythm.reset()
                 self._alpha_rejector.reset()
-                self._reset_alpha_display_removal_state()
+                self._reset_alpha_display_stats()
                 self._waveform.clear()
                 if flushed:
                     self._log(f"EEG 已丢弃暂停期间积压的 {flushed} 字节")
@@ -3031,7 +3225,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if samples:
             if len(samples) > MAX_SAMPLES_PER_POLL:
                 samples = samples[-MAX_SAMPLES_PER_POLL:]
-            if self._offline_view_active:
+            if self._offline_view_active or self._analysis_plot_active:
                 mode = "raw"
             else:
                 mode = self._current_display_mode()
@@ -3039,14 +3233,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             plot_values: list[float] = []
             plot_reject_flags: list[bool] = []
             band = None if mode == "raw" else mode
-            remove_alpha_display = (
-                band == "alpha" and self._remove_alpha_artifact_segments_enabled()
-            )
-            alpha_removal_view = (
-                self._alpha_artifact_removal_view_mode()
-                if remove_alpha_display
-                else "none"
-            )
             decim_rejected = False
             sleep_aid = (
                 self._sleep_aid_controller is not None
@@ -3069,7 +3255,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     self._process_sleep_aid_sample(
                         sample.channel1, value, self._sample_count - 1
                     )
-                if self._offline_view_active:
+                if self._offline_view_active or self._analysis_plot_active:
                     if self._decim_counter >= RAW_DECIM_FACTOR:
                         self._decim_counter = 0
                         decim_rejected = False
@@ -3082,30 +3268,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         self._alpha_display_total_points += 1
                         if display_rejected:
                             self._alpha_display_rejected_points += 1
-                    if remove_alpha_display and alpha_removal_view == "compressed":
-                        if display_rejected:
-                            self._alpha_display_was_removed = True
-                            continue
-                        display_value = value
-                        if (
-                            self._alpha_display_was_removed
-                            and self._alpha_display_last_kept is not None
-                        ):
-                            display_value = (
-                                self._alpha_display_last_kept + value
-                            ) * 0.5
-                        self._alpha_display_was_removed = False
-                        self._alpha_display_last_kept = display_value
-                        plot_values.append(display_value)
-                        plot_reject_flags.append(False)
-                    elif remove_alpha_display and alpha_removal_view == "gap":
-                        plot_values.append(float("nan") if display_rejected else value)
-                        plot_reject_flags.append(display_rejected)
-                    else:
-                        plot_values.append(value)
-                        plot_reject_flags.append(display_rejected)
+                    plot_values.append(value)
+                    plot_reject_flags.append(display_rejected)
 
-            if self._offline_view_active:
+            if self._offline_view_active or self._analysis_plot_active:
                 self._no_data_ticks = 0
             elif self._is_waveform_display_active():
                 if band == "alpha":
@@ -3119,7 +3285,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     )
             else:
                 plot_values.clear()
-            if not self._offline_view_active:
+            if not (self._offline_view_active or self._analysis_plot_active):
                 self._no_data_ticks = 0
         elif got_bytes == 0:
             self._no_data_ticks += 1
