@@ -16,7 +16,6 @@ from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
-from scipy.signal import hilbert
 
 _ROOT = Path(__file__).resolve().parent.parent  ## 项目根目录
 _VIEW_DIR = Path(__file__).resolve().parent
@@ -40,6 +39,7 @@ from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     build_threshold_rejection,
     clean_raw_signal,
 )
+from iaf_echt import IAFEcHTPhaseTracker
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
     OSC_BANDS,
@@ -61,6 +61,7 @@ from ks1082_serial import (
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from controller import (
     AlphaPhaseSnapshot,
+    SLEEP_AID_WARMUP_SEC,
     SleepAidStimulusController,
     StereoAudioController,
     StereoAudioParams,
@@ -69,20 +70,10 @@ from controller import (
 
 DEFAULT_SERIAL_PORT = "COM6"  ## EEG 默认串口
 DEFAULT_OSC_SERIAL_PORT = "COM7"  ## 振子默认串口
-SERIAL_BAUDRATES = ("9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600")
-SERIAL_DATA_BITS = ("5", "6", "7", "8")
-SERIAL_PARITIES = (
-    ("None", "N"),
-    ("Even", "E"),
-    ("Odd", "O"),
-    ("Mark", "M"),
-    ("Space", "S"),
-)
-SERIAL_STOP_BITS = (
-    ("1", 1),
-    ("1.5", 1.5),
-    ("2", 2),
-)
+DEFAULT_SERIAL_BAUDRATE = 115200
+DEFAULT_SERIAL_BYTESIZE = 8
+DEFAULT_SERIAL_PARITY = "N"
+DEFAULT_SERIAL_STOPBITS = 1
 LOG_MAX_LINES = 20  ## 日志最大行数
 OSC_DISPLAY_RATE = 100  ## 界面波形约 100 点/秒（由 1000 Hz 每 10 点取 1 点）
 OSC_DECIM_FACTOR = max(1, int(OSC_SAMPLE_RATE / OSC_DISPLAY_RATE))  ## 1000→100 显示
@@ -106,10 +97,20 @@ AUDIO_DEFAULT_LEFT_PHASE_DEG = "0"
 AUDIO_DEFAULT_RIGHT_PHASE_DEG = "90"
 DEFAULT_EEG_CSV_DIR = _ROOT / "Result"  ## timeEdit 定时测试默认 CSV 目录
 TEST_WARMUP_SEC = 10.0  ## 有定时测试时，开始后前 10 s 不保存数据
-DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)，对应 compare_segments[0][0]
+LONG_RECORD_CHUNK_SEC = 300.0  ## 长时记录：每 5 分钟自动存一份
+WAVEFORM_WAKE_SEC = 300.0  ## 长时记录：波形显示窗口 5 分钟
+LONG_NORMAL_RAW_MIN = 900  ## 长时记录正常段：raw 下限
+LONG_NORMAL_RAW_MAX = 1300  ## 长时记录正常段：raw 上限
+LONG_NORMAL_MIN_DURATION_SEC = 120.0  ## 长时记录正常段：最短连续时长
+DEFAULT_SEGMENT_A_START = "20"  ## 段 A 起始 (s)
 DEFAULT_SEGMENT_A_END = "30"  ## 段 A 结束 (s)
 DEFAULT_SEGMENT_B_START = "100"  ## 段 B 起始 (s)
 DEFAULT_SEGMENT_B_END = "110"  ## 段 B 结束 (s)
+DEFAULT_SEGMENT_C_START = ""  ## 段 C 起始，留空表示不参与对比
+DEFAULT_SEGMENT_C_END = ""
+DEFAULT_SEGMENT_D_START = ""
+DEFAULT_SEGMENT_D_END = ""
+MAX_COMPARE_SEGMENTS = 4
 EEG_REJECT_RATE_WARN = 0.20  ## 拒绝率超过 20% 时提示本次采集不宜用于分析
 TROUGH_CAL_SCRIPT = _ALGO_DIR / "TroughCalibrator.py"
 RAW_DISPLAY_RATE = 100  ## 波形显示约 100 点/秒
@@ -147,65 +148,17 @@ MIN_X_TIME_ZOOM = 0.2  ## X 最小缩放（时间窗最长）
 MIN_X_VISIBLE_POINTS = 50  ## X 至少显示点数，过少会连成三角折线
 MIN_Y_AMP = 20.0  ## Y 半幅下限
 MAX_Y_AMP = 200000.0  ## Y 半幅上限
-SLEEP_AID_HILBERT_WINDOW = int(MCU_SAMPLE_RATE * 0.5)  ## Hilbert 窗 0.5 s
-SLEEP_AID_MIN_HILBERT_SAMPLES = max(64, SLEEP_AID_HILBERT_WINDOW // 2)
-SLEEP_AID_ALPHA_FREQ_MIN_HZ = 7.0
-SLEEP_AID_ALPHA_FREQ_MAX_HZ = 14.0
-SLEEP_AID_TROUGH_PHASE_RAD = math.pi
 SLEEP_AID_BURST_LOG_EVERY = 10  ## burst 日志每 N 次写一条，减轻 QTextEdit 重绘
 
 
-class AlphaPhaseTracker:
-    """Alpha 带通序列 → Hilbert 瞬时相位与下一波谷时间。"""
-
-    def __init__(
-        self,
-        sample_rate: float,
-        window: int = SLEEP_AID_HILBERT_WINDOW,
-    ) -> None:
-        self.sample_rate = float(sample_rate)
-        self.window = int(window)
-        self._buf: Deque[float] = deque(maxlen=self.window)
-
-    def reset(self) -> None:
-        self._buf.clear()
-
-    def push(self, alpha: float) -> AlphaPhaseSnapshot:
-        self._buf.append(float(alpha))
-        return self.snapshot()
-
-    def snapshot(self) -> AlphaPhaseSnapshot:
-        if len(self._buf) < SLEEP_AID_MIN_HILBERT_SAMPLES:
-            return AlphaPhaseSnapshot(ready=False)
-
-        arr = np.asarray(self._buf, dtype=np.float64)
-        analytic = hilbert(arr)
-        phases = np.unwrap(np.angle(analytic))
-        phase_rad = float(phases[-1] % (2.0 * math.pi))
-
-        tail = min(50, len(phases))
-        if tail >= 2:
-            dphase = phases[-1] - phases[-tail]
-            dt = (tail - 1) / self.sample_rate
-            inst_freq_hz = abs(dphase / (2.0 * math.pi * dt))
-            inst_freq_hz = float(
-                np.clip(
-                    inst_freq_hz,
-                    SLEEP_AID_ALPHA_FREQ_MIN_HZ,
-                    SLEEP_AID_ALPHA_FREQ_MAX_HZ,
-                )
-            )
-        else:
-            inst_freq_hz = 10.0
-
-        delta = (SLEEP_AID_TROUGH_PHASE_RAD - phase_rad) % (2.0 * math.pi)
-        seconds_to_trough = delta / (2.0 * math.pi * inst_freq_hz)
-        return AlphaPhaseSnapshot(
-            ready=True,
-            phase_rad=phase_rad,
-            inst_freq_hz=inst_freq_hz,
-            seconds_to_trough=seconds_to_trough,
-        )
+def _to_alpha_phase_snapshot(snap) -> AlphaPhaseSnapshot:
+    """EcHTSnapshot → Controller 使用的 AlphaPhaseSnapshot。"""
+    return AlphaPhaseSnapshot(
+        ready=bool(snap.ready),
+        phase_rad=float(getattr(snap, "phase_rad", 0.0)),
+        inst_freq_hz=float(getattr(snap, "inst_freq_hz", 10.0)),
+        seconds_to_trough=float(getattr(snap, "seconds_to_trough", 0.0)),
+    )
 
 
 def _make_wave_pen(color: str) -> QtGui.QPen:
@@ -947,7 +900,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._audio_controller = StereoAudioController(
             on_stopped=self._audio_stopped.emit,
         )
-        self._sleep_aid_tracker = AlphaPhaseTracker(sample_rate=sample_rate)
+        self._sleep_aid_tracker = IAFEcHTPhaseTracker(sample_rate=sample_rate)
         try:
             self._sleep_aid_controller = SleepAidStimulusController(
                 on_triggered=self._on_sleep_aid_burst,
@@ -956,16 +909,24 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._sleep_aid_controller = None
         self._setup_audio_ui_defaults()
         self._setup_timed_test_ui()
+        self._setup_sleep_aid_window_ui()
+        self._setup_session_name_ui()
         self._setup_compare_segments_ui()
         self._setup_eeg_replay_ui()
         self._last_eeg_session_dir: Optional[Path] = None
         self._sleep_aid_last_warm_sec = -1
         self._sleep_aid_burst_count = 0
         self._sleep_aid_burst_record: List[dict] = []
+        self._sleep_aid_timed_auto = False  ## 定时记录自动启停助眠
         self._running = False  ## 默认不采集
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
         self._eeg_raw_record: List[int] = []  ## 定时测试期间记录的 CH1 raw
+        self._long_record_active = False  ## 本次测试是否启用长时记录模式
+        self._long_session_dir: Optional[Path] = None  ## 长时记录固定会话目录
+        self._long_chunks_saved = 0  ## 已自动保存的完整 5 分钟段数
+        self._waveform_display_until: Optional[float] = None  ## 波形显示截止 (monotonic)
+        self._waveform_sleep_logged = False  ## 是否已提示波形休眠
         self._sample_count = 0  ## EEG 已处理样本数
         self._osc_sample_count = 0  ## 振子已处理样本数
         self._no_data_ticks = 0  ## EEG 无数据 poll 计数
@@ -1124,36 +1085,27 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.timeEdit.setMaximumHeight(40)
         self.ui.lcdNumber.setMinimumHeight(36)
         self.ui.lineEdit_13.setMaximumHeight(34)
-        self.ui.lineEdit_3.setMinimumWidth(170)
+        self.ui.lineEdit_3.setMaximumHeight(34)
+        self.ui.lineEdit_sleep_aid_end.setMaximumHeight(34)
+        self.ui.groupBox_save.setTitle("助眠时段")
+        self.ui.groupBox_save.setToolTip(
+            "仅定时记录生效：时间为记录阶段内秒数（不含 10 s 预热）；"
+            f"助眠暖机 {SLEEP_AID_WARMUP_SEC:g}s 会提前启动"
+        )
+        self.ui.groupBox_session_name.setTitle("保存命名")
+        self.ui.groupBox_session_name.setToolTip(
+            "填写 XXX 时保存目录为 Result/时间戳_XXX/；留空则为 Result/时间戳/"
+        )
 
-        self.ui.comboBox_serial_baud.clear()
-        self.ui.comboBox_serial_baud.addItems(SERIAL_BAUDRATES)
-        self._set_combo_text(self.ui.comboBox_serial_baud, str(baudrate))
-        self.ui.comboBox_serial_data_bits.clear()
-        self.ui.comboBox_serial_data_bits.addItems(SERIAL_DATA_BITS)
-        self._set_combo_text(self.ui.comboBox_serial_data_bits, "8")
-        self.ui.comboBox_serial_parity.clear()
-        for label, value in SERIAL_PARITIES:
-            self.ui.comboBox_serial_parity.addItem(label, value)
-        self.ui.comboBox_serial_stop_bits.clear()
-        for label, value in SERIAL_STOP_BITS:
-            self.ui.comboBox_serial_stop_bits.addItem(label, value)
-
-        for edit in (self.ui.lineEdit_5, self.ui.lineEdit_4):
-            edit.setMinimumWidth(92)
-        for combo in (
-            self.ui.comboBox_serial_baud,
-            self.ui.comboBox_serial_parity,
-            self.ui.comboBox_serial_data_bits,
-            self.ui.comboBox_serial_stop_bits,
-        ):
-            combo.setMinimumWidth(76)
         self.ui.pushButton_serial_toggle.setMinimumSize(96, 32)
         self.ui.pushButton_serial_toggle.setText("打开串口")
         self.ui.pushButton_serial_toggle.setStyleSheet(
             "QPushButton { background:#2563EB; color:white; font-weight:bold; border:none; border-radius:6px; }"
             "QPushButton:hover { background:#1D4ED8; }"
         )
+        for edit in (self.ui.lineEdit_5, self.ui.lineEdit_4):
+            edit.setMinimumWidth(92)
+        self.ui.lineEdit_session_name.setMinimumWidth(120)
 
         try:
             self.ui.pushButton_browse_csv.clicked.disconnect()
@@ -1255,27 +1207,137 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return self.ui.lineEdit_14.text().strip()
 
     def _setup_timed_test_ui(self) -> None:
-        """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时、lineEdit_3 保存路径。"""
+        """timeEdit / lineEdit_13 测试时长、lcdNumber 倒计时；长时记录与波形唤醒。"""
         self.ui.timeEdit.setDisplayFormat("HH:mm:ss")
         self.ui.timeEdit.setTime(QtCore.QTime(0, 0, 0))
         self.ui.lineEdit_13.setPlaceholderText("秒(优先)")
         self.ui.lcdNumber.setDigitCount(6)
         self.ui.lcdNumber.display(0)
-        if not self.ui.lineEdit_3.text().strip():
-            self.ui.lineEdit_3.setPlaceholderText("留空→Result/时间戳文件夹/")
+        self.ui.checkBox_long_record.setToolTip(
+            "勾选后：每 5 分钟自动保存一份 EEG，结束时保存剩余数据；"
+            "结束后：正常段报告 + 坏段剔除后每分钟五节律绝对功率图；"
+            "不画 FFT/波形/段对比；波形仅显示开测后 5 分钟，可用「波形唤醒」"
+        )
+        self.ui.pushButton_wave_wake.setToolTip(
+            "长时记录模式下，每次点击将动态波形再显示 5 分钟"
+        )
+        self.ui.pushButton_wave_wake.clicked.connect(self.on_waveform_wake)
+        self.ui.checkBox_long_record.toggled.connect(self._on_long_record_toggled)
+        self._refresh_wave_wake_button()
+
+    def _on_long_record_toggled(self, _checked: bool) -> None:
+        self._refresh_wave_wake_button()
+
+    def _refresh_wave_wake_button(self) -> None:
+        enabled = bool(self.ui.checkBox_long_record.isChecked())
+        self.ui.pushButton_wave_wake.setEnabled(enabled)
+
+    @QtCore.pyqtSlot()
+    def on_waveform_wake(self) -> None:
+        """长时记录：将动态波形再唤醒 WAVEFORM_WAKE_SEC 秒。"""
+        if not self.ui.checkBox_long_record.isChecked():
+            self._log("请先勾选「长时记录」再唤醒波形")
+            return
+        if not self._running or self._test_duration_sec is None:
+            self._log("请先启动定时记录后再唤醒波形")
+            return
+        if not self._long_record_active:
+            self._log("本次采集未以长时记录模式启动，无法唤醒波形窗口")
+            return
+        self._arm_waveform_display(WAVEFORM_WAKE_SEC, clear=True)
+        self._log(f"波形显示已唤醒 {WAVEFORM_WAKE_SEC / 60.0:.0f} 分钟")
+
+    def _arm_waveform_display(self, duration_sec: float, *, clear: bool = False) -> None:
+        self._waveform_display_until = time.monotonic() + float(duration_sec)
+        self._waveform_sleep_logged = False
+        if clear:
+            self._waveform.clear()
+            self._osc_waveform.clear()
+
+    def _is_waveform_display_active(self) -> bool:
+        if not self._long_record_active:
+            return True
+        until = self._waveform_display_until
+        if until is None:
+            return False
+        if time.monotonic() < until:
+            return True
+        if not self._waveform_sleep_logged:
+            self._waveform_sleep_logged = True
+            self._waveform.clear()
+            self._osc_waveform.clear()
+            self._log("波形显示已休眠（可点「波形唤醒」再开 5 分钟）")
+        return False
+
+    def _setup_sleep_aid_window_ui(self) -> None:
+        """lineEdit_3 / lineEdit_sleep_aid_end：定时记录内的助眠 burst 起止秒。"""
+        self.ui.lineEdit_3.setPlaceholderText("记录内")
+        self.ui.lineEdit_sleep_aid_end.setPlaceholderText("记录内")
+        self.ui.lineEdit_3.setToolTip(
+            "定时记录开始后（不含 10 s 预热）从第几秒允许发 burst"
+        )
+        self.ui.lineEdit_sleep_aid_end.setToolTip(
+            "定时记录开始后（不含 10 s 预热）在第几秒停止 burst"
+        )
+
+    def _setup_session_name_ui(self) -> None:
+        """lineEdit_session_name：Result 下子文件夹命名后缀。"""
+        edit = self.ui.lineEdit_session_name
+        edit.setPlaceholderText("留空→仅时间戳")
+        edit.setToolTip(
+            "填写 XXX 时保存目录为 Result/时间戳_XXX/；留空则为 Result/时间戳/"
+        )
+
+    @staticmethod
+    def _sanitize_session_name_tag(raw: str) -> str:
+        cleaned = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_"
+            for ch in raw.strip()
+        ).strip("_")
+        return cleaned
+
+    def _read_session_name_tag(self) -> str:
+        return self._sanitize_session_name_tag(self.ui.lineEdit_session_name.text())
+
+    def _make_session_dir_name(self, stamp: Optional[str] = None) -> str:
+        if stamp is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = self._read_session_name_tag()
+        if not tag:
+            return stamp
+        return f"{stamp}_{tag}"
+
+    def _resolve_session_dir(self, stamp: Optional[str] = None) -> Path:
+        session_dir = DEFAULT_EEG_CSV_DIR / self._make_session_dir_name(stamp)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir
 
     def _setup_compare_segments_ui(self) -> None:
-        """lineEdit/lineEdit_2=段A起止，lineEdit_11/lineEdit_12=段B起止（秒）。"""
+        """段A–D：各列上格为起始秒、下格为结束秒；空列不参与对比（至少填 2 段）。"""
         defaults = (
             (self.ui.lineEdit, DEFAULT_SEGMENT_A_START, "A起"),
             (self.ui.lineEdit_2, DEFAULT_SEGMENT_A_END, "A止"),
             (self.ui.lineEdit_11, DEFAULT_SEGMENT_B_START, "B起"),
             (self.ui.lineEdit_12, DEFAULT_SEGMENT_B_END, "B止"),
+            (self.ui.lineEdit_15, DEFAULT_SEGMENT_C_START, "C起"),
+            (self.ui.lineEdit_16, DEFAULT_SEGMENT_C_END, "C止"),
+            (self.ui.lineEdit_17, DEFAULT_SEGMENT_D_START, "D起"),
+            (self.ui.lineEdit_18, DEFAULT_SEGMENT_D_END, "D止"),
         )
         for edit, value, hint in defaults:
-            if not edit.text().strip():
+            if value and not edit.text().strip():
                 edit.setText(value)
             edit.setPlaceholderText(hint)
+            edit.setToolTip("填起始+结束秒；段C/D 可留空，按实际填写段数对比")
+
+        if hasattr(self.ui, "label_time1"):
+            self.ui.label_time1.setText("段A")
+        if hasattr(self.ui, "label_time2"):
+            self.ui.label_time2.setText("段B")
+        if hasattr(self.ui, "label_time3"):
+            self.ui.label_time3.setText("段C")
+        if hasattr(self.ui, "label_time4"):
+            self.ui.label_time4.setText("段D")
 
         if not hasattr(self.ui, "checkBox_remove_alpha_artifacts"):
             self.ui.checkBox_remove_alpha_artifacts = QtWidgets.QCheckBox(
@@ -1295,7 +1357,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 3,
                 0,
                 1,
-                3,
+                5,
             )
             self.ui.radioButton_alpha_remove_compressed = QtWidgets.QRadioButton(
                 "平滑拼接剩余时间轴",
@@ -1325,14 +1387,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 4,
                 0,
                 1,
-                2,
+                3,
             )
             self.ui.gridLayout_compare.addWidget(
                 self.ui.radioButton_alpha_remove_gap,
                 4,
+                3,
+                1,
                 2,
-                1,
-                1,
             )
             self.ui.checkBox_remove_alpha_artifacts.toggled.connect(
                 self._sync_alpha_removal_view_controls_enabled
@@ -1347,6 +1409,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._reset_alpha_display_removal_state
             )
             self._sync_alpha_removal_view_controls_enabled(False)
+
+    def _compare_segment_edit_pairs(self) -> List[Tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]]:
+        return [
+            (self.ui.lineEdit, self.ui.lineEdit_2),
+            (self.ui.lineEdit_11, self.ui.lineEdit_12),
+            (self.ui.lineEdit_15, self.ui.lineEdit_16),
+            (self.ui.lineEdit_17, self.ui.lineEdit_18),
+        ]
 
     def _remove_alpha_artifact_segments_enabled(self) -> bool:
         checkbox = getattr(self.ui, "checkBox_remove_alpha_artifacts", None)
@@ -1401,24 +1471,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def _read_compare_segments_from_ui(
         self,
-    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
-        """读取四段输入，对应 power_cal.compare_segments = ((A起,A止), (B起,B止))。"""
-        edits = (
-            self.ui.lineEdit,
-            self.ui.lineEdit_2,
-            self.ui.lineEdit_11,
-            self.ui.lineEdit_12,
-        )
-        texts = [edit.text().strip() for edit in edits]
-        if not all(texts):
+    ) -> Optional[Tuple[Tuple[float, float], ...]]:
+        """读取段A–D：两侧都空则跳过；只填一侧视为无效；至少 2 段才返回。"""
+        segments: List[Tuple[float, float]] = []
+        for start_edit, end_edit in self._compare_segment_edit_pairs():
+            start_text = start_edit.text().strip()
+            end_text = end_edit.text().strip()
+            if not start_text and not end_text:
+                continue
+            if not start_text or not end_text:
+                return None
+            try:
+                start = float(start_text)
+                end = float(end_text)
+            except ValueError:
+                return None
+            if start >= end:
+                return None
+            segments.append((start, end))
+            if len(segments) >= MAX_COMPARE_SEGMENTS:
+                break
+        if len(segments) < 2:
             return None
-        try:
-            a_start, a_end, b_start, b_end = (float(text) for text in texts)
-        except ValueError:
-            return None
-        if a_start >= a_end or b_start >= b_end:
-            return None
-        return ((a_start, a_end), (b_start, b_end))
+        return tuple(segments)
 
     def _run_post_test_power_analysis(
         self,
@@ -1437,12 +1512,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         remove_alpha_artifacts = self._remove_alpha_artifact_segments_enabled()
         alpha_removal_view = self._alpha_artifact_removal_view_mode()
         if compare_segments is None:
-            self._log("段间对比时间未填全或无效，仅运行基础分析和离线数据导出")
+            self._log("段间对比时间未填全或不足 2 段，仅运行基础分析和离线数据导出")
         else:
-            range_a, range_b = compare_segments
+            labels = ("A", "B", "C", "D")
+            bits = [
+                f"段{lab} {rng[0]:g}–{rng[1]:g}s"
+                for lab, rng in zip(labels, compare_segments)
+            ]
             self._log(
-                f"开始 power_cal 双份分析: 段A {range_a[0]:g}–{range_a[1]:g}s, "
-                f"段B {range_b[0]:g}–{range_b[1]:g}s"
+                f"开始 power_cal 双份分析，{len(compare_segments)} 段对比: "
+                + ", ".join(bits)
             )
         if remove_alpha_artifacts:
             view_label = (
@@ -1491,7 +1570,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"power_cal 分析失败: {exc}")
 
     def _finalize_timed_test(self) -> None:
-        """保存 EEG raw CSV 并自动运行段间功率分析。"""
+        """保存 EEG raw CSV；普通模式再跑功率分析，长时模式存盘并输出正常段报告。"""
+        if self._long_record_active:
+            self._flush_long_record_buffer(final=True)
+            session_dir = self._long_session_dir
+            if session_dir is not None:
+                self._run_long_record_postprocess(session_dir)
+            self._reset_timed_test_state()
+            if session_dir is not None:
+                self._last_eeg_session_dir = session_dir
+                self._log(
+                    f"长时记录结束：已保存至 {session_dir}"
+                    f"（正常段报告 + 每分钟绝对功率图；跳过 FFT/波形等其它图）"
+                )
+            return
+
         saved = self._save_eeg_raw_csv()
         self._reset_timed_test_state()
         if saved is not None:
@@ -1505,6 +1598,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 reject_rate,
             )
             self._maybe_run_trough_calibration(session_dir)
+            self._maybe_run_burst_alpha_power_stats(session_dir)
 
     def _maybe_run_trough_calibration(self, session_dir: Path) -> None:
         """定时测试结束后：若有 burst 记录，运行波谷对齐标定（方法 B）。"""
@@ -1525,6 +1619,25 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
         except Exception as exc:
             self._log(f"波谷标定失败: {exc}")
+
+    def _maybe_run_burst_alpha_power_stats(self, session_dir: Path) -> None:
+        """定时测试结束后：短窗 Alpha 功率（0-100 ms）+ burst 锁定平均。"""
+        if not (session_dir / "sleep_aid_bursts.csv").is_file():
+            return
+        try:
+            from BurstAlphaPowerStats import run_burst_alpha_power_stats
+
+            result = run_burst_alpha_power_stats(session_dir, save_outputs=True)
+            for line in result.report_text.splitlines():
+                self._log(line)
+            self._log(
+                f"刺激短窗 Alpha 统计完成: "
+                f"0-100ms ↑{result.n_up} ↓{result.n_down} →{result.n_flat} "
+                f"| 50-150ms ↑{result.n_up_erp} ↓{result.n_down_erp} "
+                f"(有效 {result.n_valid}/{result.n_bursts})"
+            )
+        except Exception as exc:
+            self._log(f"刺激前后 Alpha 功率统计失败: {exc}")
 
     def _read_time_edit_duration_sec(self) -> Optional[float]:
         """读取 timeEdit；00:00:00 表示未设置。"""
@@ -1557,6 +1670,57 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return line13_sec
         return time_edit_sec
 
+    def _read_sleep_aid_window_from_ui(self) -> Optional[Tuple[float, float]]:
+        """读取助眠 burst 起止秒（相对记录阶段，不含 TEST_WARMUP_SEC）。"""
+        start = self._parse_seconds_text(self.ui.lineEdit_3.text())
+        end = self._parse_seconds_text(self.ui.lineEdit_sleep_aid_end.text())
+        if start is None or end is None:
+            return None
+        if start < 0 or end <= start:
+            return None
+        return (start, end)
+
+    def _effective_sleep_aid_window_sec(self) -> Optional[Tuple[float, float]]:
+        """仅定时记录进行中且起止有效时返回窗口。"""
+        if self._test_duration_sec is None:
+            return None
+        window = self._read_sleep_aid_window_from_ui()
+        if window is None:
+            return None
+        start, end = window
+        if end > self._test_duration_sec:
+            return None
+        return (start, end)
+
+    def _recording_elapsed_sec(self) -> float:
+        """记录阶段已过去秒数（不含 TEST_WARMUP_SEC）。"""
+        if self._test_started_at is None:
+            return 0.0
+        return max(0.0, self._test_total_elapsed_sec() - TEST_WARMUP_SEC)
+
+    def _is_in_sleep_aid_burst_window(self) -> bool:
+        window = self._effective_sleep_aid_window_sec()
+        if window is None:
+            return True
+        start, end = window
+        elapsed = self._recording_elapsed_sec()
+        return start <= elapsed < end
+
+    def _sleep_aid_schedule_bounds_total_sec(self) -> Optional[Tuple[float, float]]:
+        """返回 [采集开始] 时刻轴上助眠应运行/发 burst 的起止秒。"""
+        window = self._effective_sleep_aid_window_sec()
+        if window is None:
+            return None
+        start, end = window
+        warmup = (
+            self._sleep_aid_controller.params.warmup_sec
+            if self._sleep_aid_controller is not None
+            else SLEEP_AID_WARMUP_SEC
+        )
+        run_start = max(0.0, TEST_WARMUP_SEC + start - warmup)
+        run_end = TEST_WARMUP_SEC + end
+        return (run_start, run_end)
+
     def _is_test_recording_phase(self) -> bool:
         """预热结束且仍在定时测试窗口内。"""
         if (
@@ -1586,21 +1750,68 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         duration = self._read_test_duration_sec()
         self._test_duration_sec = duration
         self._test_started_at = time.monotonic() if duration is not None else None
+        self._sleep_aid_timed_auto = False
         self._eeg_raw_record.clear()
+        self._long_record_active = False
+        self._long_session_dir = None
+        self._long_chunks_saved = 0
+        self._waveform_display_until = None
+        self._waveform_sleep_logged = False
         if duration is None:
             self.ui.lcdNumber.display(0)
+            if self.ui.checkBox_long_record.isChecked():
+                self._log("已勾选长时记录，但未设置测试时长，本次按普通采集运行")
             return
+        self._long_record_active = bool(self.ui.checkBox_long_record.isChecked())
+        if self._long_record_active:
+            self._long_session_dir = self._resolve_session_dir()
+            self._arm_waveform_display(WAVEFORM_WAKE_SEC, clear=False)
+            self._log(
+                f"长时记录模式: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
+                f"之后记录 {self._format_duration_hms(duration)}；"
+                f"每 {LONG_RECORD_CHUNK_SEC / 60.0:.0f} 分钟自动存盘；"
+                f"不跑功率对比/FFT；波形先显示 {WAVEFORM_WAKE_SEC / 60.0:.0f} 分钟"
+            )
+            self._log(f"长时记录目录: {self._long_session_dir}")
         self._update_test_countdown_lcd()
+        if not self._long_record_active:
+            self._log(
+                f"定时测试: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
+                f"之后记录 {self._format_duration_hms(duration)}，"
+                f"到时自动停止并保存；手动停止不保存"
+            )
+        window = self._read_sleep_aid_window_from_ui()
+        if window is None:
+            return
+        start_sec, end_sec = window
+        if end_sec > duration:
+            self._log(
+                f"助眠时段无效: 结束 {end_sec:g}s 超过测试时长 {duration:g}s，"
+                "本次定时记录不启用助眠时段"
+            )
+            return
+        warmup = SLEEP_AID_WARMUP_SEC
+        if start_sec < warmup:
+            self._log(
+                f"助眠起始 {start_sec:g}s 小于暖机 {warmup:g}s："
+                f"将在采集开始后尽快启动暖机，burst 最早约在记录 {warmup:g}s 发出"
+            )
+        pre_record = max(0.0, start_sec - warmup)
         self._log(
-            f"定时测试: 前 {TEST_WARMUP_SEC:.0f}s 不保存，"
-            f"之后记录 {self._format_duration_hms(duration)}，"
-            f"到时自动停止并保存 EEG raw CSV"
+            f"助眠时段: 记录 {start_sec:g}–{end_sec:g}s 发 burst（不含暖机）；"
+            f"暖机提前至记录第 {pre_record:g}s 前启动"
         )
 
     def _reset_timed_test_state(self) -> None:
         self._test_duration_sec = None
         self._test_started_at = None
+        self._sleep_aid_timed_auto = False
         self._eeg_raw_record.clear()
+        self._long_record_active = False
+        self._long_session_dir = None
+        self._long_chunks_saved = 0
+        self._waveform_display_until = None
+        self._waveform_sleep_logged = False
         self.ui.lcdNumber.display(0)
 
     def _update_test_countdown_lcd(self) -> None:
@@ -1626,38 +1837,36 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         return self._test_total_elapsed_sec() >= TEST_WARMUP_SEC + self._test_duration_sec
 
     def _resolve_eeg_csv_path(self) -> Path:
-        """每次在目录下新建时间戳子文件夹，再写入 CSV。"""
-        raw = self.ui.lineEdit_3.text().strip()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_dir_name = f"eeg_{stamp}"
-        csv_name = "eeg_raw.csv"
+        """在 Result 下按 时间戳 或 时间戳_命名 创建子文件夹并写入 CSV。"""
+        return self._resolve_session_dir() / "eeg_raw.csv"
 
-        if not raw:
-            session_dir = DEFAULT_EEG_CSV_DIR / session_dir_name
-            session_dir.mkdir(parents=True, exist_ok=True)
-            return session_dir / csv_name
-
-        path = Path(raw).expanduser()
-        if not path.is_absolute():
-            path = _ROOT / path
-        if path.suffix.lower() == ".csv":
-            session_dir = path.parent / session_dir_name
-            session_dir.mkdir(parents=True, exist_ok=True)
-            return session_dir / path.name
-        session_dir = path / session_dir_name
-        session_dir.mkdir(parents=True, exist_ok=True)
-        return session_dir / csv_name
-
-    def _save_eeg_raw_csv(self) -> Optional[Tuple[Path, Path, float, float]]:
-        if not self._eeg_raw_record:
-            self._log("定时测试结束，但没有 EEG raw 数据可保存")
-            return None
-        cleaned_path = self._resolve_eeg_csv_path()
-        full_path = cleaned_path.with_name("eeg_raw_full.csv")
+    def _measured_eeg_sample_rate(self) -> float:
         sample_rate = float(MCU_SAMPLE_RATE)
         measured = self._rhythm.measured_sample_rate
         if measured is not None and measured > 0:
             sample_rate = measured
+        return sample_rate
+
+    def _save_eeg_raw_csv(
+        self,
+        *,
+        session_dir: Optional[Path] = None,
+        name_stem: str = "eeg_raw",
+        save_bursts: bool = True,
+        quiet_empty: bool = False,
+    ) -> Optional[Tuple[Path, Path, float, float]]:
+        if not self._eeg_raw_record:
+            if not quiet_empty:
+                self._log("定时测试结束，但没有 EEG raw 数据可保存")
+            return None
+        if session_dir is None:
+            session_dir = self._resolve_session_dir()
+        else:
+            session_dir = Path(session_dir)
+            session_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_path = session_dir / f"{name_stem}.csv"
+        full_path = session_dir / f"{name_stem}_full.csv"
+        sample_rate = self._measured_eeg_sample_rate()
         raw = np.asarray(self._eeg_raw_record, dtype=np.int64)
         quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
         reject_rate = quality.reject_rate
@@ -1685,13 +1894,94 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"可疑片段率: {suspicious_rate:.1%}")
             if reject_rate > EEG_REJECT_RATE_WARN:
                 self._log("拒绝率过高，本次数据不建议用于样本分析")
-            session_dir = full_path.parent
             self._last_eeg_session_dir = session_dir
-            self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
+            if save_bursts:
+                self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
             return cleaned_path, full_path, sample_rate, reject_rate
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
             return None
+
+    def _write_long_record_normal_report(self, session_dir: Path) -> None:
+        """长时记录结束：扫描各 chunk，输出 raw 正常段报告。"""
+        try:
+            from LongRecordNormalReport import write_normal_segments_report
+
+            result = write_normal_segments_report(
+                session_dir,
+                raw_min=LONG_NORMAL_RAW_MIN,
+                raw_max=LONG_NORMAL_RAW_MAX,
+                min_duration_sec=LONG_NORMAL_MIN_DURATION_SEC,
+            )
+            for line in result.report_text.splitlines():
+                self._log(line)
+            if result.report_txt_path is not None:
+                self._log(f"正常段报告已保存: {result.report_txt_path}")
+            if result.report_csv_path is not None:
+                self._log(f"正常段 CSV 已保存: {result.report_csv_path}")
+        except Exception as exc:
+            self._log(f"正常段报告生成失败: {exc}")
+
+    def _run_long_record_minute_band_power(self, session_dir: Path) -> None:
+        """长时记录结束：坏段剔除后按分钟算五节律绝对功率，只画一张折线图。"""
+        try:
+            from LongRecordMinuteBandPower import run_minute_band_power_analysis
+
+            result = run_minute_band_power_analysis(session_dir, save_outputs=True)
+            for line in result.report_text.splitlines():
+                self._log(line)
+            if result.plot_path is not None:
+                self._log(f"每分钟绝对功率图已保存: {result.plot_path}")
+        except Exception as exc:
+            self._log(f"每分钟节律绝对功率分析失败: {exc}")
+
+    def _run_long_record_postprocess(self, session_dir: Path) -> None:
+        """长时记录结束后的轻量后处理：正常段报告 + 每分钟绝对功率图。"""
+        self._write_long_record_normal_report(session_dir)
+        self._run_long_record_minute_band_power(session_dir)
+
+    def _flush_long_record_buffer(self, *, final: bool = False) -> None:
+        """长时记录：把当前缓冲写成下一段；final 时额外写 burst。"""
+        if self._long_session_dir is None:
+            return
+        if not self._eeg_raw_record:
+            if final:
+                self._save_sleep_aid_bursts_csv(
+                    self._long_session_dir, self._measured_eeg_sample_rate()
+                )
+            return
+        self._long_chunks_saved += 1
+        stem = f"eeg_chunk_{self._long_chunks_saved:03d}"
+        saved = self._save_eeg_raw_csv(
+            session_dir=self._long_session_dir,
+            name_stem=stem,
+            save_bursts=False,
+            quiet_empty=True,
+        )
+        self._eeg_raw_record.clear()
+        if saved is not None:
+            self._log(
+                f"长时记录已保存第 {self._long_chunks_saved} 段"
+                + ("（收尾）" if final else "")
+            )
+        if final:
+            self._save_sleep_aid_bursts_csv(
+                self._long_session_dir, self._measured_eeg_sample_rate()
+            )
+
+    def _maybe_save_long_record_chunk(self) -> None:
+        """记录阶段每满 LONG_RECORD_CHUNK_SEC 自动存一段并清空缓冲。"""
+        if not self._long_record_active or self._long_session_dir is None:
+            return
+        if not self._is_test_recording_phase():
+            return
+        elapsed = self._recording_elapsed_sec()
+        due = int(elapsed // LONG_RECORD_CHUNK_SEC)
+        while self._long_chunks_saved < due:
+            if not self._eeg_raw_record:
+                self._long_chunks_saved = due
+                break
+            self._flush_long_record_buffer(final=False)
 
     def _save_sleep_aid_bursts_csv(self, session_dir: Path, sample_rate: float) -> None:
         if not self._sleep_aid_burst_record:
@@ -1759,6 +2049,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._link.discard_pending_input()
         if self._osc_link is not None:
             self._osc_link.discard_pending_input()
+        if (
+            self._sleep_aid_controller is not None
+            and self._sleep_aid_controller.is_active
+        ):
+            self._sleep_aid_controller.stop()
+            self._sleep_aid_timed_auto = False
+            self._refresh_sleep_aid_button()
+        if self._audio_controller.is_playing:
+            self._audio_controller.stop()
+            self._refresh_audio_button()
+        self._play_timed_test_end_alert()
         if self._test_duration_sec is not None:
             self._finalize_timed_test()
         else:
@@ -1766,6 +2067,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._refresh_capture_button()
         self._update_status_bar()
         self._log("定时测试到时，已自动停止采集")
+
+    def _play_timed_test_end_alert(self) -> None:
+        """定时测试结束提示音（双音叮咚，非阻塞）。"""
+        try:
+            from audiio import play_alert_chime
+
+            if play_alert_chime():
+                self._log("已播放测试结束提示音")
+            else:
+                self._log("结束提示音不可用（未安装 sounddevice）")
+        except Exception as exc:
+            self._log(f"结束提示音播放失败: {exc}")
 
     def _setup_audio_ui_defaults(self) -> None:
         """音频区默认值：左 lineEdit_7 / 右 lineEdit_6，相位 lineEdit_9/10，时长 lineEdit_8。"""
@@ -1816,50 +2129,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log("助眠模块不可用: 请 pip install sounddevice")
             return
         if self._sleep_aid_controller.is_active:
-            self._sleep_aid_controller.stop()
-            self._refresh_sleep_aid_button()
-            skip = self._quality_gate.skip_count
-            reasons = self._quality_gate.skip_reasons
-            reason_text = (
-                ", ".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
-                if reasons
-                else "无"
-            )
-            self._log(
-                f"助眠音效已停止，共触发 {self._sleep_aid_controller.trigger_count} 次，"
-                f"门控跳过 {skip} 次（{reason_text}）"
-            )
-            if self._sleep_aid_burst_record:
-                if self._test_duration_sec is not None and self._test_started_at is not None:
-                    self._log(
-                        f"助眠 burst 事件 {len(self._sleep_aid_burst_record)} 条，"
-                        "将在定时测试结束时与 EEG 一并保存"
-                    )
-                else:
-                    sample_rate = float(MCU_SAMPLE_RATE)
-                    measured = self._rhythm.measured_sample_rate
-                    if measured is not None and measured > 0:
-                        sample_rate = measured
-                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    session_dir = DEFAULT_EEG_CSV_DIR / f"eeg_{stamp}"
-                    session_dir.mkdir(parents=True, exist_ok=True)
-                    self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
+            self._stop_sleep_aid_stimulus(manual=True)
+            return
+        if not self._running:
+            self._log("请先开始 EEG 采集后再开启助眠音效")
+            return
+        self._start_sleep_aid_stimulus(manual=True)
+
+    def _start_sleep_aid_stimulus(self, *, manual: bool) -> None:
+        if self._sleep_aid_controller is None:
             return
         if self._audio_controller.is_playing:
             self._audio_controller.stop()
             self._refresh_audio_button()
             self._log("已停止连续音频，避免与助眠 burst 冲突")
-        if not self._running:
-            self._log("请先开始 EEG 采集后再开启助眠音效")
-            return
-
+        self._sleep_aid_timed_auto = not manual
         self._sleep_aid_tracker.reset()
         self._rhythm.reset()
         self._alpha_rejector.reset()
         self._quality_gate.reset()
         self._reset_alpha_display_removal_state()
-        self._sleep_aid_burst_count = 0
-        self._sleep_aid_burst_record.clear()
+        if manual or not self._sleep_aid_burst_record:
+            self._sleep_aid_burst_count = 0
+            self._sleep_aid_burst_record.clear()
         self._sleep_aid_controller.start()
         self._apply_display_mode("alpha")
         self.ui.checkBox.blockSignals(True)
@@ -1867,12 +2159,74 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.checkBox.blockSignals(False)
         self._refresh_sleep_aid_button()
         p = self._sleep_aid_controller.params
+        mode = "手动" if manual else "定时"
         self._log(
-            "助眠音效已启动: "
+            f"助眠音效已启动({mode}): "
             f"暖机 {p.warmup_sec:g}s，最小间隔 {p.min_interval_sec:g}s，"
             f"刺激效应延迟 {p.stimulus_effect_latency_sec * 1000:g} ms，"
             f"粉噪 burst {p.burst_duration_ms:g} ms"
         )
+        window = self._effective_sleep_aid_window_sec()
+        if window is not None and not manual:
+            start, end = window
+            self._log(f"助眠 burst 窗口: 记录 {start:g}–{end:g}s")
+
+    def _stop_sleep_aid_stimulus(self, *, manual: bool) -> None:
+        if self._sleep_aid_controller is None or not self._sleep_aid_controller.is_active:
+            return
+        if manual:
+            self._sleep_aid_timed_auto = False
+        trigger_count = self._sleep_aid_controller.trigger_count
+        self._sleep_aid_controller.stop()
+        self._refresh_sleep_aid_button()
+        skip = self._quality_gate.skip_count
+        reasons = self._quality_gate.skip_reasons
+        reason_text = (
+            ", ".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+            if reasons
+            else "无"
+        )
+        stop_mode = "手动" if manual else "定时"
+        self._log(
+            f"助眠音效已停止({stop_mode})，"
+            f"共触发 {trigger_count} 次，"
+            f"门控跳过 {skip} 次（{reason_text}）"
+        )
+        if not manual:
+            self._sleep_aid_timed_auto = False
+        if self._sleep_aid_burst_record:
+            if self._test_duration_sec is not None and self._test_started_at is not None:
+                self._log(
+                    f"助眠 burst 事件 {len(self._sleep_aid_burst_record)} 条，"
+                    "将在定时测试结束时与 EEG 一并保存"
+                )
+            elif manual:
+                sample_rate = float(MCU_SAMPLE_RATE)
+                measured = self._rhythm.measured_sample_rate
+                if measured is not None and measured > 0:
+                    sample_rate = measured
+                session_dir = self._resolve_session_dir()
+                self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
+
+    def _maybe_manage_timed_sleep_aid(self) -> None:
+        """定时记录 + 助眠时段：提前暖机、到点自动启停。"""
+        if (
+            self._sleep_aid_controller is None
+            or not self._running
+            or self._test_duration_sec is None
+            or self._test_started_at is None
+        ):
+            return
+        bounds = self._sleep_aid_schedule_bounds_total_sec()
+        if bounds is None:
+            return
+        run_start, run_end = bounds
+        total = self._test_total_elapsed_sec()
+        if run_start <= total < run_end:
+            if not self._sleep_aid_controller.is_active:
+                self._start_sleep_aid_stimulus(manual=False)
+        elif self._sleep_aid_controller.is_active and self._sleep_aid_timed_auto:
+            self._stop_sleep_aid_stimulus(manual=False)
 
     def _on_sleep_aid_burst(self, count: float) -> None:
         """主线程触发回调：推迟 UI 更新，避免与波形重绘同 tick 争抢。"""
@@ -1901,7 +2255,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if was_in_bad:
             self._sleep_aid_tracker.reset()
 
-        snapshot = self._sleep_aid_tracker.push(alpha)
+        snapshot = _to_alpha_phase_snapshot(self._sleep_aid_tracker.push(alpha))
+        if not self._is_in_sleep_aid_burst_window():
+            warm = self._sleep_aid_controller.warmup_remaining()
+            if warm > 0.0 and int(warm) != getattr(self, "_sleep_aid_last_warm_sec", -1):
+                self._sleep_aid_last_warm_sec = int(warm)
+                self._refresh_sleep_aid_button()
+            return
+
         params = self._sleep_aid_controller.params
         guard_sec = (
             self._sleep_aid_controller.total_latency_sec
@@ -1958,9 +2319,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def on_toggle_audio(self) -> None:
         """pushButton_7：开始/停止立体声正弦波输出。"""
         if self._sleep_aid_controller is not None and self._sleep_aid_controller.is_active:
-            self._sleep_aid_controller.stop()
-            self._refresh_sleep_aid_button()
-            self._log("已停止助眠音效，避免与连续音频冲突")
+            self._stop_sleep_aid_stimulus(manual=True)
         if self._audio_controller.is_playing:
             self._audio_controller.stop()
             self._refresh_audio_button()
@@ -2272,34 +2631,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             cursor.deleteChar()
 
     def _serial_settings_from_ui(self) -> Dict[str, object]:
-        baud_combo = getattr(self.ui, "comboBox_serial_baud", None)
-        data_combo = getattr(self.ui, "comboBox_serial_data_bits", None)
-        parity_combo = getattr(self.ui, "comboBox_serial_parity", None)
-        stop_combo = getattr(self.ui, "comboBox_serial_stop_bits", None)
         baudrate = self._baudrate
-        bytesize = 8
-        parity = "N"
-        stopbits = 1
-        if baud_combo is not None:
-            try:
-                baudrate = int(baud_combo.currentText())
-            except ValueError:
-                baudrate = 115200
-        if data_combo is not None:
-            try:
-                bytesize = int(data_combo.currentText())
-            except ValueError:
-                bytesize = 8
-        if parity_combo is not None:
-            parity = str(parity_combo.currentData() or "N")
-        if stop_combo is not None:
-            stopbits = stop_combo.currentData() or 1
-        self._baudrate = baudrate
         return {
             "baudrate": baudrate,
-            "bytesize": bytesize,
-            "parity": parity,
-            "stopbits": stopbits,
+            "bytesize": DEFAULT_SERIAL_BYTESIZE,
+            "parity": DEFAULT_SERIAL_PARITY,
+            "stopbits": DEFAULT_SERIAL_STOPBITS,
         }
 
     @staticmethod
@@ -2547,8 +2884,34 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._osc_link.discard_pending_input()
         if self._running:
             self._begin_timed_test_if_configured()
-        elif stopping and self._test_duration_sec is not None:
-            self._finalize_timed_test()
+        elif stopping:
+            if (
+                self._sleep_aid_controller is not None
+                and self._sleep_aid_controller.is_active
+            ):
+                self._sleep_aid_controller.stop()
+                self._sleep_aid_timed_auto = False
+                self._refresh_sleep_aid_button()
+            if self._test_duration_sec is not None:
+                if self._long_record_active:
+                    session_dir = self._long_session_dir
+                    self._flush_long_record_buffer(final=True)
+                    if session_dir is not None:
+                        self._run_long_record_postprocess(session_dir)
+                    self._sleep_aid_burst_record.clear()
+                    self._reset_timed_test_state()
+                    if session_dir is not None:
+                        self._last_eeg_session_dir = session_dir
+                        self._log(
+                            f"手动停止长时记录：已保存剩余数据至 {session_dir}"
+                        )
+                    else:
+                        self._log("手动停止长时记录：无数据可保存")
+                else:
+                    self._eeg_raw_record.clear()
+                    self._sleep_aid_burst_record.clear()
+                    self._reset_timed_test_state()
+                    self._log("手动停止测试：未保存任何记录")
         self._refresh_capture_button()
         self._update_status_bar()
         view_label = "振子" if self._active_view == "osc" else "EEG"
@@ -2640,15 +3003,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         plot_values.append(value)
                         plot_reject_flags.append(display_rejected)
 
-            if band == "alpha":
-                self._waveform.update_legend(
-                    self._alpha_reject_status_legend(self._eeg_base_legend)
-                )
-            if plot_values:
-                self._waveform.append_alphas(
-                    plot_values,
-                    plot_reject_flags if band == "alpha" else None,
-                )
+            if self._is_waveform_display_active():
+                if band == "alpha":
+                    self._waveform.update_legend(
+                        self._alpha_reject_status_legend(self._eeg_base_legend)
+                    )
+                if plot_values:
+                    self._waveform.append_alphas(
+                        plot_values,
+                        plot_reject_flags if band == "alpha" else None,
+                    )
+            else:
+                plot_values.clear()
             self._no_data_ticks = 0
         elif got_bytes == 0:
             self._no_data_ticks += 1
@@ -2715,10 +3081,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                             self._osc_decim_counter = 0
                             plot_values.append(value)
 
-            if plot_batch:
-                self._osc_waveform.append_multi_batch(plot_batch)
-            elif plot_values:
-                self._osc_waveform.append_alphas(plot_values)
+            if self._is_waveform_display_active():
+                if plot_batch:
+                    self._osc_waveform.append_multi_batch(plot_batch)
+                elif plot_values:
+                    self._osc_waveform.append_alphas(plot_values)
                 if not axes and mode == "m_freq" and self._osc_proc.dominant_freq_hz > 0:
                     dom_f = self._osc_proc.dominant_freq_hz
                     dom_b = OSC_BAND_LABELS.get(
@@ -2757,6 +3124,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 return
             if self._running and self._test_duration_sec is not None:
                 self._update_test_countdown_lcd()
+                self._maybe_manage_timed_sleep_aid()
+                self._maybe_save_long_record_chunk()
             now = time.monotonic()
             if now - self._last_status_update >= 0.2:
                 self._last_status_update = now
