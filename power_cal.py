@@ -62,10 +62,6 @@ DEFAULT_SAMPLE_RATE = float(
 BANDPASS_LOW_HZ = 0.5
 BANDPASS_HIGH_HZ = 40.0
 
-# Experimental visualization path: remove alpha-suspicious samples from all
-# bands, concatenate the remaining points, then lightly smooth the display.
-ALPHA_REMOVAL_SMOOTH_SEC = 0.08
-
 # 在 0.5–40 Hz 带通范围内的标准节律划分
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
     "delta": (0.5, 4.0),
@@ -409,7 +405,7 @@ def format_segment_comparison(comp: SegmentBandComparison) -> str:
     return "\n".join(lines)
 
 
-def _slice_signal(
+def slice_signal(
     signal: np.ndarray,
     sample_rate: float,
     start_seconds: float,
@@ -428,6 +424,16 @@ def _slice_signal(
     i_start = min(n_total - 1, int(start * sample_rate))
     i_end = max(i_start + 1, min(n_total, int(end * sample_rate)))
     return signal[i_start:i_end].copy()
+
+
+def _slice_signal(
+    signal: np.ndarray,
+    sample_rate: float,
+    start_seconds: float,
+    end_seconds: float,
+) -> np.ndarray:
+    """兼容旧名。"""
+    return slice_signal(signal, sample_rate, start_seconds, end_seconds)
 
 
 def read_eeg_column(xlsx_path: str | Path, column: int = 0) -> np.ndarray:
@@ -607,114 +613,6 @@ def export_offline_waveform_csvs(
     )
 
 
-def _moving_average(signal: np.ndarray, window_samples: int) -> np.ndarray:
-    if window_samples <= 1 or signal.size < 3:
-        return signal.copy()
-    window_samples = min(window_samples, signal.size)
-    if window_samples % 2 == 0:
-        window_samples += 1
-    kernel = np.ones(window_samples, dtype=np.float64) / window_samples
-    pad = window_samples // 2
-    padded = np.pad(signal, (pad, pad), mode="edge")
-    return np.convolve(padded, kernel, mode="valid")
-
-
-def _smooth_only_near_gaps(
-    original_signal: np.ndarray,
-    keep_mask: np.ndarray,
-    *,
-    smooth_samples: int,
-) -> np.ndarray:
-    """Concatenate kept samples and smooth only around artificial join points."""
-    kept_indices = np.flatnonzero(keep_mask)
-    y = original_signal[kept_indices].astype(np.float64, copy=True)
-    if y.size < 3 or smooth_samples <= 1:
-        return y
-
-    seam_positions = np.flatnonzero(np.diff(kept_indices) > 1) + 1
-    if seam_positions.size == 0:
-        return y
-
-    smoothed = _moving_average(y, smooth_samples)
-    half = max(1, smooth_samples // 2)
-    for seam in seam_positions:
-        start = max(0, seam - half)
-        end = min(y.size, seam + half)
-        y[start:end] = smoothed[start:end]
-    return y
-
-
-def remove_waveforms_keep_time_axis(
-    waveforms: Dict[str, np.ndarray],
-    remove_mask: np.ndarray,
-    sample_rate: float,
-    *,
-    smooth_sec: float = ALPHA_REMOVAL_SMOOTH_SEC,
-) -> Dict[str, np.ndarray]:
-    """Blank removed samples with NaN, preserving the original time axis."""
-    if not waveforms:
-        return {}
-    n_total = len(next(iter(waveforms.values())))
-    remove_mask = fit_bool_mask(remove_mask, n_total)
-    if not np.any(remove_mask):
-        return {name: wf.copy() for name, wf in waveforms.items()}
-
-    cleaned: Dict[str, np.ndarray] = {}
-    for name, wf in waveforms.items():
-        y = wf[:n_total].astype(np.float64, copy=True)
-        y[remove_mask] = np.nan
-        cleaned[name] = y
-    return cleaned
-
-
-def remove_waveforms_compress_time_axis(
-    waveforms: Dict[str, np.ndarray],
-    remove_mask: np.ndarray,
-    sample_rate: float,
-    *,
-    smooth_sec: float = ALPHA_REMOVAL_SMOOTH_SEC,
-) -> Dict[str, np.ndarray]:
-    """Remove samples, concatenate the rest, and smooth only join seams."""
-    if not waveforms:
-        return {}
-    n_total = len(next(iter(waveforms.values())))
-    remove_mask = fit_bool_mask(remove_mask, n_total)
-    if not np.any(remove_mask):
-        return {name: wf.copy() for name, wf in waveforms.items()}
-
-    keep_mask = ~remove_mask
-    if np.count_nonzero(keep_mask) < max(3, int(sample_rate * 0.5)):
-        return {name: wf.copy() for name, wf in waveforms.items()}
-
-    smooth_samples = max(1, int(round(sample_rate * smooth_sec)))
-    cleaned: Dict[str, np.ndarray] = {}
-    for name, wf in waveforms.items():
-        cleaned[name] = _smooth_only_near_gaps(
-            wf[:n_total],
-            keep_mask,
-            smooth_samples=smooth_samples,
-        )
-    return cleaned
-
-
-def waveform_y_limits(waveforms: Dict[str, np.ndarray]) -> Dict[str, tuple[float, float]]:
-    limits: Dict[str, tuple[float, float]] = {}
-    for name, wf in waveforms.items():
-        finite = np.asarray(wf, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            limits[name] = (-1.0, 1.0)
-            continue
-        ymin = float(np.min(finite))
-        ymax = float(np.max(finite))
-        if ymin == ymax:
-            pad = max(1.0, abs(ymin) * 0.1)
-        else:
-            pad = (ymax - ymin) * 0.08
-        limits[name] = (ymin - pad, ymax + pad)
-    return limits
-
-
 def format_results(result: BandPowerResult) -> str:
     lines = [
         f"{'节律':<8} {'频段(Hz)':<14} {'绝对功率':>14} {'相对功率(%)':>14}",
@@ -753,6 +651,7 @@ def plot_band_powers(
     quality: EegQualityInfo | None = None,
     save_path: str | Path | None = None,
     show: bool = True,
+    figure=None,
 ) -> None:
     """绘制功率谱（分节律着色）与各节律绝对/相对功率柱状图。"""
     import matplotlib.pyplot as plt
@@ -768,7 +667,14 @@ def plot_band_powers(
     rel_pct = [result.relative[n] * 100.0 for n in names]
     abs_pow = [result.absolute[n] for n in names]
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 11), constrained_layout=True)
+    own_figure = figure is None
+    if own_figure:
+        fig, axes = plt.subplots(3, 1, figsize=(10, 11), constrained_layout=True)
+    else:
+        fig = figure
+        fig.clear()
+        axes = fig.subplots(3, 1)
+
     quality_text = ""
     if quality is not None and quality.has_tag:
         quality_text = (
@@ -835,6 +741,10 @@ def plot_band_powers(
         out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out, dpi=150, bbox_inches="tight")
         print(f"图片已保存: {out.resolve()}")
+
+    if not own_figure:
+        fig.tight_layout()
+        return
 
     if show:
         plt.show()
@@ -915,6 +825,7 @@ def plot_segment_power_comparison(
     title: str = "多段 EEG 节律功率对比",
     save_path: str | Path | None = None,
     show: bool = True,
+    figure=None,
 ) -> None:
     """绘制 2～4 段各节律相对/绝对功率及相对第 1 段比值柱状图。"""
     import matplotlib.pyplot as plt
@@ -933,7 +844,16 @@ def plot_segment_power_comparison(
         for lab, rng in zip(seg_labels, comparison.ranges)
     )
 
-    fig, axes = plt.subplots(3, 1, figsize=(max(10, 2.2 * n_seg + 6), 11), constrained_layout=True)
+    own_figure = figure is None
+    if own_figure:
+        fig, axes = plt.subplots(
+            3, 1, figsize=(max(10, 2.2 * n_seg + 6), 11), constrained_layout=True
+        )
+    else:
+        fig = figure
+        fig.clear()
+        axes = fig.subplots(3, 1)
+
     fig.suptitle(
         f"{title}\n{range_bits}\n比值 = 各段 / 段A",
         fontsize=12,
@@ -1037,6 +957,10 @@ def plot_segment_power_comparison(
         out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out, dpi=150, bbox_inches="tight")
         print(f"段间对比图已保存: {out.resolve()}")
+
+    if not own_figure:
+        fig.tight_layout()
+        return
 
     if show:
         plt.show()
@@ -1228,8 +1152,6 @@ def _run_power_analysis_pass(
     save_segment_compare: bool,
     save_model_window_table: bool,
     save_offline_waveform_data: bool,
-    remove_alpha_artifact_segments: bool,
-    alpha_artifact_removal_view: str,
 ) -> BandPowerResult:
     alpha_info: BandSuspiciousInfo | None = None
     quality_for_plot = quality
@@ -1336,70 +1258,6 @@ def _run_power_analysis_pass(
             save_path=wf_path,
             show=show_waveform,
         )
-        if remove_alpha_artifact_segments and alpha_info is not None:
-            removal_view = alpha_artifact_removal_view.lower().strip()
-            if removal_view not in {"gap", "compressed", "both"}:
-                removal_view = "both"
-            gap_waveforms = remove_waveforms_keep_time_axis(
-                waveforms,
-                alpha_info.mask,
-                sample_rate,
-            )
-            removed_points = int(np.count_nonzero(alpha_info.mask))
-            removed_quality = EegQualityInfo(
-                reject_mask=fit_bool_mask(alpha_info.mask, len(raw)),
-                reject_rate=alpha_info.rate,
-                has_tag=True,
-                source="alpha_suspicious_removed",
-                suspicious_mask=np.zeros(len(raw), dtype=bool),
-                suspicious_rate=0.0,
-            )
-            original_limits = waveform_y_limits(waveforms)
-            gap_path = (
-                _tagged_output_path(path, f"{output_tag}_alpha_removed_gap", "_band_waveform.png")
-                if save_waveform and removal_view in {"gap", "both"}
-                else None
-            )
-            plot_band_waveforms(
-                gap_waveforms,
-                sample_rate,
-                title=(
-                    f"EEG alpha removed gap · {pass_label} · {path.stem} "
-                    f"(removed {removed_points} samples)"
-                ),
-                time_range=waveform_time_range,
-                max_seconds=waveform_seconds,
-                quality=removed_quality,
-                y_limits=original_limits,
-                save_path=gap_path,
-                show=show_waveform and removal_view in {"gap", "both"},
-            )
-            compressed_waveforms = remove_waveforms_compress_time_axis(
-                waveforms,
-                alpha_info.mask,
-                sample_rate,
-            )
-            compressed_path = (
-                _tagged_output_path(
-                    path, f"{output_tag}_alpha_removed_compressed", "_band_waveform.png"
-                )
-                if save_waveform and removal_view in {"compressed", "both"}
-                else None
-            )
-            plot_band_waveforms(
-                compressed_waveforms,
-                sample_rate,
-                title=(
-                    f"EEG alpha removed compressed · {pass_label} · {path.stem} "
-                    f"(removed {removed_points} samples)"
-                ),
-                time_range=None,
-                max_seconds=None,
-                quality=None,
-                y_limits=original_limits,
-                save_path=compressed_path,
-                show=show_waveform and removal_view in {"compressed", "both"},
-            )
 
     if show_fft or save_fft:
         fft_path = _tagged_output_path(path, output_tag, "_fft.png") if save_fft else None
@@ -1470,8 +1328,6 @@ def run_analysis(
     enable_alpha_suspicious: bool = True,
     save_model_window_table: bool = True,
     save_offline_waveform_data: bool = True,
-    remove_alpha_artifact_segments: bool = True,
-    alpha_artifact_removal_view: str = "both",
     dual_power_analysis: bool = False,
 ) -> BandPowerResult:
     path = Path(xlsx_path)
@@ -1514,8 +1370,6 @@ def run_analysis(
             fft_time_range=fft_time_range,
             show_segment_compare=show_segment_compare,
             save_segment_compare=save_segment_compare,
-            remove_alpha_artifact_segments=remove_alpha_artifact_segments,
-            alpha_artifact_removal_view=alpha_artifact_removal_view,
         )
         _run_power_analysis_pass(
             raw=raw_full,
@@ -1573,8 +1427,6 @@ def run_analysis(
         save_segment_compare=save_segment_compare,
         save_model_window_table=save_model_window_table,
         save_offline_waveform_data=save_offline_waveform_data,
-        remove_alpha_artifact_segments=remove_alpha_artifact_segments,
-        alpha_artifact_removal_view=alpha_artifact_removal_view,
     )
 
 
@@ -1598,9 +1450,6 @@ def main() -> None:
     enable_alpha_suspicious = True
     save_model_window_table = True
     save_offline_waveform_data = True
-    # Checkbox-ready switch: True saves gap-view and compressed-view removal plots.
-    remove_alpha_artifact_segments = True
-    alpha_artifact_removal_view = "both"  # "gap" | "compressed" | "both"
     # =====================================
 
     run_analysis(
@@ -1621,8 +1470,6 @@ def main() -> None:
         enable_alpha_suspicious=enable_alpha_suspicious,
         save_model_window_table=save_model_window_table,
         save_offline_waveform_data=save_offline_waveform_data,
-        remove_alpha_artifact_segments=remove_alpha_artifact_segments,
-        alpha_artifact_removal_view=alpha_artifact_removal_view,
     )
 
 
