@@ -22,31 +22,11 @@ if str(_ALGO_DIR) not in sys.path:
 from MovementArtifact import (  # noqa: E402
     BandSuspiciousInfo,
     EegQualityInfo,
-    EEG_ADAPTIVE_MAD_MULT,
-    EEG_RAW_MAX_VALID,
-    EEG_RAW_MIN_VALID,
-    EEG_REJECT_SEGMENT_SEC,
-    EEG_SEGMENT_MAX_DEVIATION,
-    EEG_SEGMENT_MAX_PTP,
-    EEG_SUSPICIOUS_ALPHA_RMS_FLOOR,
-    EEG_SUSPICIOUS_ALPHA_RMS_MAD_MULT,
-    EEG_SUSPICIOUS_ALPHA_RMS_RATIO,
-    EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT,
-    EEG_SUSPICIOUS_DELTA_RMS_RATIO,
-    EEG_SUSPICIOUS_MIN_DIFF,
-    EEG_SUSPICIOUS_MIN_PTP,
-    MODEL_ALPHA_SUSPICIOUS_DROP_RATIO,
-    MODEL_ALPHA_SUSPICIOUS_WARN_RATIO,
-    MODEL_REJECT_DROP_RATIO,
-    MODEL_SUSPICIOUS_DROP_RATIO,
-    MODEL_SUSPICIOUS_WARN_RATIO,
-    MODEL_WINDOW_SEC,
     build_band_rms_suspicious,
     build_model_window_quality_table,
     build_threshold_rejection,
     clean_raw_signal,
     export_offline_raw_csvs,
-    fit_bool_mask,
     merge_quality_with_band_suspicious,
     read_eeg_quality,
     rejected_spans as quality_mask_spans,
@@ -352,19 +332,6 @@ def compare_multi_segment_band_powers_cleaned(
     )
 
 
-def compare_segment_band_powers_cleaned(
-    raw: np.ndarray,
-    quality: EegQualityInfo,
-    sample_rate: float,
-    range_a: Tuple[float, float],
-    range_b: Tuple[float, float],
-) -> SegmentBandComparison:
-    """段间对比：各段先按原始时间切片，再去掉坏段/可疑段后算功率。"""
-    return compare_multi_segment_band_powers_cleaned(
-        raw, quality, sample_rate, (range_a, range_b)
-    )
-
-
 def format_segment_comparison(comp: SegmentBandComparison) -> str:
     labels = SEGMENT_LABELS[: comp.n_segments]
     range_bits = [
@@ -628,14 +595,6 @@ def format_results(result: BandPowerResult) -> str:
     lines.append("-" * 54)
     lines.append(f"{'合计':<8} {'0.5-40.0':<14} {result.total_power:>14.6e} {'100.00':>14}")
     return "\n".join(lines)
-
-
-def analyze_xlsx(
-    xlsx_path: str | Path,
-    sample_rate: float = DEFAULT_SAMPLE_RATE,
-) -> PowerAnalysis:
-    raw = read_eeg_column(xlsx_path)
-    return compute_band_powers(raw, sample_rate=sample_rate)
 
 
 def _setup_matplotlib() -> None:

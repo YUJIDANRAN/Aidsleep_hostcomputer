@@ -4,7 +4,6 @@ from __future__ import annotations  ## 前向引用类型
 
 import csv  ## 定时测试 EEG raw 导出
 import io  ## 捕获 power_cal 分析输出
-import math
 import os  ## 环境变量读串口
 import sys  ## 路径与退出
 import time  ## 状态栏刷新节流
@@ -403,13 +402,6 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
             for alpha, rejected in zip(alphas, reject_flags):
                 self._points.append(alpha)  ## 批量追加
                 self._reject_flags.append(1 if rejected else 0)
-        self._path_dirty = True
-        self._refresh_plot()
-
-    def append_alphas_plain(self, alphas: Iterable[float]) -> None:
-        for alpha in alphas:
-            self._points.append(alpha)  ## 批量追加
-            self._reject_flags.append(0)
         self._path_dirty = True
         self._refresh_plot()
 
@@ -1204,17 +1196,104 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_waveform.refresh_layout()
 
     def _setup_offline_viewer_ui(self) -> None:
-        """离线 CSV 分层波形：选文件 + EEG 显示区多选勾选。"""
+        """离线波形与分钟功率同一套路径B：拼 full → 统一剔坏段 → 可选按分钟截取。"""
         edit = self.ui.lineEdit_offline_path
         if not edit.text().strip():
-            edit.setPlaceholderText("选择 eeg_raw.csv / eeg_chunk_*.csv")
+            edit.setPlaceholderText("选会话内任一 CSV（路径B：full拼接→剔坏）")
         edit.setToolTip(
-            "选择已保存的 EEG CSV，点击「加载」后在左侧显示；"
-            "raw data 始终显示，勾选其它节律叠加分层波形；"
-            "工具栏可拖动横轴/纵轴平移缩放"
+            "选会话目录中任一 EEG CSV 即可。"
+            "加载与分钟功率相同（路径B）：拼接 eeg_chunk_*_full → 统一剔坏段 → 显示；"
+            "填写分钟则在剔坏后时间轴上截取。"
         )
-        self.ui.pushButton_load_offline.setToolTip("加载当前路径的 CSV 并显示分层波形")
+        self.ui.lineEdit_offline_min_start.setToolTip(
+            "起始分钟（含）。在 full拼接并统一剔坏后的时间轴上截取，与功率图分钟对齐。"
+        )
+        self.ui.lineEdit_offline_min_end.setToolTip(
+            "结束分钟（含）。例如 3 与 9 → 显示剔坏后第 3～9 分钟。"
+        )
+        self.ui.pushButton_load_offline.setToolTip(
+            "路径B：拼 full → 剔坏段 →（可选）截取分钟后显示"
+        )
         self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
+
+    def _parse_offline_minute_range(self) -> Optional[Tuple[int, int]]:
+        """解析分钟起止；都空返回 None；只填一侧或非法则抛 ValueError。"""
+        start_text = self.ui.lineEdit_offline_min_start.text().strip()
+        end_text = self.ui.lineEdit_offline_min_end.text().strip()
+        if not start_text and not end_text:
+            return None
+        if not start_text or not end_text:
+            raise ValueError("请同时填写起始分钟与结束分钟，或都留空显示剔坏后全部")
+        try:
+            start_m = int(float(start_text))
+            end_m = int(float(end_text))
+        except ValueError as exc:
+            raise ValueError("分钟须为数字，例如起 3、止 9") from exc
+        if start_m < 1 or end_m < 1:
+            raise ValueError("分钟从 1 开始计数")
+        if end_m < start_m:
+            raise ValueError(f"结束分钟 {end_m} 不能小于起始分钟 {start_m}")
+        return start_m, end_m
+
+    def _offline_path_b_source(self, path: Path) -> Path:
+        """路径B数据源：会话有 chunk full 则用目录；否则用对应 full 或所选文件。"""
+        import re
+
+        from LongRecordNormalReport import list_chunk_full_csvs
+
+        parent = path.parent
+        if list_chunk_full_csvs(parent):
+            return parent
+
+        if re.fullmatch(r"eeg_chunk_\d+\.csv", path.name, flags=re.IGNORECASE):
+            full = parent / path.name.replace(".csv", "_full.csv")
+            if full.is_file():
+                return full
+        if path.name.lower() == "eeg_raw.csv":
+            full = parent / "eeg_raw_full.csv"
+            if full.is_file():
+                return full
+        return path
+
+    def _load_offline_selected_slice(
+        self,
+        path: Path,
+        minute_range: Optional[Tuple[int, int]],
+    ) -> tuple[np.ndarray, float, str, float]:
+        """路径B：与分钟功率一致——full（可多chunk拼接）→ 统一剔坏段 → 可选截取分钟。"""
+        from LongRecordMinuteBandPower import load_raw_for_minute_analysis
+
+        source = self._offline_path_b_source(path)
+        raw, fs, source_desc = load_raw_for_minute_analysis(source)
+        quality = build_threshold_rejection(raw.astype(np.float64), float(fs))
+        cleaned, _, n_removed = clean_raw_signal(raw.astype(np.int64), quality)
+        cleaned = cleaned.astype(np.float64)
+        cleaned_min = cleaned.size / float(fs) / 60.0 if fs > 0 else 0.0
+        base_title = (
+            f"路径B·{source_desc}·剔坏后"
+            f"（删{n_removed}点，约{cleaned_min:.1f}分钟）"
+        )
+
+        if minute_range is None:
+            if cleaned.size < 8:
+                raise ValueError("剔坏后有效样本过少")
+            return cleaned, float(fs), base_title, 0.0
+
+        start_m, end_m = minute_range
+        n_per_min = max(1, int(round(float(fs) * 60.0)))
+        i0 = (start_m - 1) * n_per_min
+        i1 = end_m * n_per_min
+        if i0 >= cleaned.size:
+            raise ValueError(
+                f"起始分钟 {start_m} 超出剔坏后长度（约 {cleaned_min:.1f} 分钟）；"
+                f"与功率图同一时间轴"
+            )
+        segment = cleaned[i0 : min(i1, int(cleaned.size))]
+        if segment.size < 8:
+            raise ValueError(f"截取后样本过少（{segment.size} 点）")
+        time_offset_s = float((start_m - 1) * 60)
+        title = f"{base_title} · 分钟{start_m}–{end_m}"
+        return segment, float(fs), title, time_offset_s
 
     def _browse_offline_eeg_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1253,7 +1332,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log("请先选择有效的 EEG CSV 文件")
             return
         try:
-            n, fs = self._offline_view.load_file(path)
+            minute_range = self._parse_offline_minute_range()
+        except ValueError as exc:
+            self._log(str(exc))
+            return
+        try:
+            raw, fs, title, time_offset_s = self._load_offline_selected_slice(
+                path, minute_range
+            )
+            n, fs = self._offline_view.load_raw(
+                raw,
+                fs,
+                source_name=title,
+                time_offset_s=time_offset_s,
+            )
         except Exception as exc:
             self._log(f"离线加载失败 ({path.name}): {exc}")
             return
@@ -1272,10 +1364,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._sync_offline_geometry()
         self._offline_view.show()
         self._offline_view.raise_()
-        self.setWindowTitle(f"EEG 离线查看 · {path.name}")
+        self.setWindowTitle(f"EEG 离线查看 · {title}")
+        range_tip = (
+            f"；截取分钟 {minute_range[0]}–{minute_range[1]}（墙钟约 "
+            f"{time_offset_s:.0f}–{time_offset_s + n / fs:.0f} s）"
+            if minute_range is not None
+            else ""
+        )
         self._log(
-            f"离线查看已加载: {path.name}（{n} 点 @ {fs:.0f} Hz）；"
-            f"raw 始终显示，勾选其它节律叠加分层波形"
+            f"离线查看已加载: {title}（{n} 点 @ {fs:.0f} Hz"
+            f"{range_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
         )
         self._update_status_bar()
 
@@ -1324,8 +1422,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.lcdNumber.setDigitCount(6)
         self.ui.lcdNumber.display(0)
         self.ui.checkBox_long_record.setToolTip(
-            "勾选后：每 5 分钟自动保存一份 EEG，结束时保存剩余数据；"
-            "结束后：正常段报告 + 坏段剔除后每分钟五节律绝对功率图；"
+            "勾选后：每 5 分钟只保存 full；结束时路径B统一剔坏，再按段写出 "
+            "eeg_chunk_XXX.csv（对应各 XXX_full）；"
+            "并出正常段报告 + 每分钟五节律绝对功率图；"
             "不画 FFT/波形/段对比；波形仅显示开测后 5 分钟，可用「波形唤醒」"
         )
         self.ui.pushButton_wave_wake.setToolTip(
@@ -1837,7 +1936,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._last_eeg_session_dir = session_dir
                 self._log(
                     f"长时记录结束：已保存至 {session_dir}"
-                    f"（正常段报告 + 每分钟绝对功率图；跳过 FFT/波形等其它图）"
+                    f"（路径B分段删减 eeg_chunk_XXX.csv + 正常段报告 + 每分钟绝对功率图；"
+                    f"跳过 FFT/波形等其它图）"
                 )
             return
 
@@ -2110,7 +2210,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         name_stem: str = "eeg_raw",
         save_bursts: bool = True,
         quiet_empty: bool = False,
-    ) -> Optional[Tuple[Path, Path, float, float]]:
+        save_cleaned: bool = True,
+    ) -> Optional[Tuple[Optional[Path], Path, float, float]]:
+        """保存当前缓冲。
+
+        save_cleaned=True：同时写 {stem}.csv（本段当场剔坏，仅适合单段短时测试）。
+        长时 chunk 应 save_cleaned=False，只写 *_full.csv；剔坏文件改由路径B在结束后统一生成。
+        """
         if not self._eeg_raw_record:
             if not quiet_empty:
                 self._log("定时测试结束，但没有 EEG raw 数据可保存")
@@ -2127,25 +2233,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
         reject_rate = quality.reject_rate
         suspicious_rate = quality.suspicious_rate
-        cleaned_raw, _, removed_points = clean_raw_signal(raw, quality)
         try:
             with full_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(["index", "time_s", "ch1_raw"])
                 for index, value in enumerate(raw):
                     writer.writerow([index, index / sample_rate, int(value)])
-            with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["index", "time_s", "ch1_raw"])
-                for index, value in enumerate(cleaned_raw):
-                    writer.writerow([index, index / sample_rate, int(value)])
             self._log(
                 f"EEG raw 全量已保存: {full_path} ({raw.size} 点 @ {sample_rate:.0f} Hz)"
             )
-            self._log(
-                f"EEG raw 删减后已保存: {cleaned_path} "
-                f"({cleaned_raw.size}/{raw.size} 点, 剔除 {removed_points} 点)"
-            )
+
+            out_cleaned: Optional[Path] = None
+            if save_cleaned:
+                cleaned_raw, _, removed_points = clean_raw_signal(raw, quality)
+                with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(["index", "time_s", "ch1_raw"])
+                    for index, value in enumerate(cleaned_raw):
+                        writer.writerow([index, index / sample_rate, int(value)])
+                out_cleaned = cleaned_path
+                self._log(
+                    f"EEG raw 删减后已保存: {cleaned_path} "
+                    f"({cleaned_raw.size}/{raw.size} 点, 剔除 {removed_points} 点)"
+                )
             self._log(f"阈值拒绝率: {reject_rate:.1%}")
             self._log(f"可疑片段率: {suspicious_rate:.1%}")
             if reject_rate > EEG_REJECT_RATE_WARN:
@@ -2153,9 +2263,79 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._last_eeg_session_dir = session_dir
             if save_bursts:
                 self._save_sleep_aid_bursts_csv(session_dir, sample_rate)
-            return cleaned_path, full_path, sample_rate, reject_rate
+            return out_cleaned, full_path, sample_rate, reject_rate
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
+            return None
+
+    def _save_path_b_cleaned_csv(self, session_dir: Path) -> Optional[List[Path]]:
+        """路径B：拼所有 *_full → 统一剔坏 → 按各 full 原始区间拆成对应分段 clean 文件。
+
+        例：eeg_chunk_001_full.csv → eeg_chunk_001.csv（内容来自整晚统一剔坏后再切回）。
+        """
+        from analysis_plot_view import load_eeg_csv_with_rate
+        from LongRecordNormalReport import list_chunk_full_csvs
+
+        session_dir = Path(session_dir)
+        full_files = list_chunk_full_csvs(session_dir)
+        if not full_files:
+            self._log("路径B删减保存跳过：目录中无 eeg_chunk_*_full.csv")
+            return None
+        try:
+            parts: List[np.ndarray] = []
+            rates: List[float] = []
+            # (full_path, concat_start, concat_end)
+            spans: List[Tuple[Path, int, int]] = []
+            offset = 0
+            for full_path in full_files:
+                raw_i, fs_i = load_eeg_csv_with_rate(full_path)
+                raw_i = np.asarray(raw_i, dtype=np.float64)
+                n_i = int(raw_i.size)
+                parts.append(raw_i)
+                rates.append(float(fs_i))
+                spans.append((full_path, offset, offset + n_i))
+                offset += n_i
+
+            raw = np.concatenate(parts)
+            sample_rate = float(np.median(np.asarray(rates, dtype=np.float64)))
+            quality = build_threshold_rejection(raw, sample_rate)
+            cleaned, kept_index, n_removed = clean_raw_signal(
+                raw.astype(np.int64), quality
+            )
+            cleaned = np.asarray(cleaned)
+            kept_index = np.asarray(kept_index, dtype=np.int64)
+
+            saved: List[Path] = []
+            for full_path, i0, i1 in spans:
+                mask = (kept_index >= i0) & (kept_index < i1)
+                seg = cleaned[mask]
+                name = full_path.name
+                if name.lower().endswith("_full.csv"):
+                    out_name = name[: -len("_full.csv")] + ".csv"
+                else:
+                    out_name = f"{full_path.stem}_cleaned.csv"
+                out_path = session_dir / out_name
+                with out_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(["index", "time_s", "ch1_raw"])
+                    for index, value in enumerate(seg):
+                        writer.writerow(
+                            [index, index / sample_rate, int(value)]
+                        )
+                saved.append(out_path)
+                self._log(
+                    f"路径B分段删减: {full_path.name} → {out_name} "
+                    f"({seg.size}/{i1 - i0} 点保留)"
+                )
+
+            self._log(
+                f"路径B删减完成：{len(saved)} 段（{len(full_files)} 个 full 统一剔坏后拆回 → "
+                f"共保留 {cleaned.size}/{raw.size}，剔除 {n_removed}；"
+                f"拒绝率 {quality.reject_rate:.1%}）"
+            )
+            return saved
+        except Exception as exc:
+            self._log(f"路径B删减 CSV 保存失败: {exc}")
             return None
 
     def _write_long_record_normal_report(self, session_dir: Path) -> None:
@@ -2192,7 +2372,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"每分钟节律绝对功率分析失败: {exc}")
 
     def _run_long_record_postprocess(self, session_dir: Path) -> None:
-        """长时记录结束后的轻量后处理：正常段报告 + 每分钟绝对功率图。"""
+        """长时记录结束后：路径B删减CSV + 正常段报告 + 每分钟绝对功率图。"""
+        self._save_path_b_cleaned_csv(session_dir)
         self._write_long_record_normal_report(session_dir)
         self._run_long_record_minute_band_power(session_dir)
 
@@ -2208,16 +2389,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         self._long_chunks_saved += 1
         stem = f"eeg_chunk_{self._long_chunks_saved:03d}"
+        # 长时只存 full；删减版由结束后路径B统一剔坏再拆成 eeg_chunk_XXX.csv
         saved = self._save_eeg_raw_csv(
             session_dir=self._long_session_dir,
             name_stem=stem,
             save_bursts=False,
             quiet_empty=True,
+            save_cleaned=False,
         )
         self._eeg_raw_record.clear()
         if saved is not None:
             self._log(
-                f"长时记录已保存第 {self._long_chunks_saved} 段"
+                f"长时记录已保存第 {self._long_chunks_saved} 段 full"
                 + ("（收尾）" if final else "")
             )
         if final:

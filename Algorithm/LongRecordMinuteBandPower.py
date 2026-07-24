@@ -162,15 +162,6 @@ def compute_minute_band_powers(
     return minutes, absolute, relative
 
 
-def compute_minute_band_absolute_powers(
-    cleaned: np.ndarray,
-    sample_rate: float,
-) -> tuple[np.ndarray, Dict[str, np.ndarray]]:
-    """兼容旧接口：仅返回绝对功率。"""
-    minutes, absolute, _relative = compute_minute_band_powers(cleaned, sample_rate)
-    return minutes, absolute
-
-
 def plot_minute_band_powers(
     minutes: np.ndarray,
     *,
