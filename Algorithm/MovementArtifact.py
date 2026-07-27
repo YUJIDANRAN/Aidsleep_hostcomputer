@@ -18,16 +18,16 @@ EEG_REJECT_SEGMENT_SEC = 1
 
 # ADC 贴边饱和坏段阈值：原始值 <= 50 或 >= 4045 时标红。
 # 适合 12 bit ADC (0-4095)。如果硬件有效范围变窄/变宽，再同步调整。
-EEG_RAW_MIN_VALID = 50
-EEG_RAW_MAX_VALID = 4045
+EEG_RAW_MIN_VALID = 400
+EEG_RAW_MAX_VALID = 2000
 
 # 原始 1 秒片段峰峰值坏段阈值：max(segment)-min(segment) 超过该值标红。
 # 主要抓大幅运动伪迹、严重电极扰动、接触不良；调小会更严格。
-EEG_SEGMENT_MAX_PTP = 1200.0
+EEG_SEGMENT_MAX_PTP = 500.0
 
 # 原始 1 秒片段偏离中位数坏段阈值：单点离该秒中位数太远时标红。
 # 主要抓特别大的尖峰/跳变；调小会更严格。
-EEG_SEGMENT_MAX_DEVIATION = 800.0
+EEG_SEGMENT_MAX_DEVIATION = 300.0
 
 # 自适应可疑段倍率：阈值 = 全部 1 秒片段的 median + N*MAD。
 # 同时作用于 EEG_SUSPICIOUS_MIN_PTP 和 EEG_SUSPICIOUS_MIN_DIFF 对应规则。
@@ -42,7 +42,7 @@ EEG_SUSPICIOUS_MIN_PTP = 200.0
 # 原始 1 秒内最大相邻跳变可疑段最低阈值。
 # 实际阈值取 max(该值, median + EEG_ADAPTIVE_MAD_MULT*MAD)。
 # 主要抓短促尖峰、突然跳点；调小会更容易标黄。
-EEG_SUSPICIOUS_MIN_DIFF = 60.0
+EEG_SUSPICIOUS_MIN_DIFF = 80.0
 
 # δ(0.5-4 Hz)滤波后 RMS 可疑段 MAD 倍率。
 # 阈值候选 = delta_rms_median + N*delta_rms_MAD。
@@ -62,6 +62,10 @@ EEG_MULTIBAND_PTP_RATIO = 2.0
 EEG_MULTIBAND_PTP_MAD_MULT = 5.0
 EEG_MULTIBAND_SYNC_MIN_BANDS = 3  # 超阈频段数 → suspicious
 EEG_MULTIBAND_SYNC_REJECT_MIN_BANDS = 4  # 超阈频段数 → rejected
+
+# 剔坏后拼接：接头两侧局部中位对齐（方案A），窗长过短易被尖峰带偏。
+EEG_SPLICE_ALIGN_WINDOW_SEC = 0.25
+EEG_SPLICE_ALIGN_DEFAULT_FS = 500.0
 
 BANDPASS_LOW_HZ = 0.5
 BANDPASS_HIGH_HZ = 40.0
@@ -900,13 +904,90 @@ def build_raw_remove_mask(
     return reject_mask | suspicious_mask
 
 
+def _iter_kept_runs(remove_mask: np.ndarray):
+    """yield 保留段 [start, end)（原序列下标，半开）。"""
+    n = int(remove_mask.size)
+    i = 0
+    while i < n:
+        if remove_mask[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not remove_mask[j]:
+            j += 1
+        yield i, j
+        i = j
+
+
+def splice_kept_runs_align_median(
+    raw: np.ndarray,
+    remove_mask: np.ndarray,
+    sample_rate: float,
+    *,
+    window_sec: float = EEG_SPLICE_ALIGN_WINDOW_SEC,
+) -> tuple[np.ndarray, np.ndarray]:
+    """删点后按保留段拼接：每段接头用局部中位数对齐后再粘（方案A）。
+
+    返回 (拼接后序列, 保留点在原序列中的下标)。
+    """
+    raw_arr = np.asarray(raw)
+    count = int(raw_arr.size)
+    if count == 0:
+        return raw_arr.copy(), np.zeros(0, dtype=np.int64)
+
+    remove_mask = np.asarray(remove_mask, dtype=bool)
+    if remove_mask.size != count:
+        raise ValueError(
+            f"remove_mask 长度 {remove_mask.size} 与 raw {count} 不一致"
+        )
+
+    kept_index = np.flatnonzero(~remove_mask)
+    if kept_index.size == 0:
+        return raw_arr[:0].copy(), kept_index
+
+    fs = max(float(sample_rate), 1.0)
+    window_n = max(1, int(round(fs * float(window_sec))))
+    runs = list(_iter_kept_runs(remove_mask))
+    if len(runs) <= 1:
+        return raw_arr[kept_index].copy(), kept_index
+
+    parts: list[np.ndarray] = []
+    # 累积平移量：后段相对「已拼接波形」的基线对齐
+    for run_i, (start, end) in enumerate(runs):
+        piece = raw_arr[start:end].astype(np.float64, copy=True)
+        if run_i == 0:
+            parts.append(piece)
+            continue
+        prev = parts[-1]
+        prev_tail = prev[-min(window_n, prev.size) :]
+        next_head = piece[: min(window_n, piece.size)]
+        shift = float(np.median(prev_tail) - np.median(next_head))
+        piece += shift
+        parts.append(piece)
+
+    cleaned = np.concatenate(parts)
+    # 写回整型 raw 时取整，避免 CSV 出现过多小数
+    if np.issubdtype(raw_arr.dtype, np.integer):
+        cleaned = np.rint(cleaned).astype(raw_arr.dtype, copy=False)
+    else:
+        cleaned = cleaned.astype(raw_arr.dtype, copy=False)
+    return cleaned, kept_index
+
+
 def clean_raw_signal(
     raw: np.ndarray,
     quality: EegQualityInfo,
     *,
     remove_suspicious: bool = True,
+    sample_rate: float | None = None,
+    align_median: bool = True,
+    align_window_sec: float = EEG_SPLICE_ALIGN_WINDOW_SEC,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """去掉坏段/可疑段后的 raw 及保留点在原序列中的索引。"""
+    """去掉坏段/可疑段后的 raw 及保留点在原序列中的索引。
+
+    align_median=True（默认）：保留段接头按局部中位数对齐后再拼接（方案A），
+    减轻硬拼接台阶带来的假低频。
+    """
     raw_arr = np.asarray(raw)
     count = raw_arr.size
     if count == 0:
@@ -916,8 +997,23 @@ def clean_raw_signal(
         count,
         remove_suspicious=remove_suspicious,
     )
-    kept_index = np.flatnonzero(~remove_mask)
-    return raw_arr[kept_index], kept_index, int(np.count_nonzero(remove_mask))
+    n_removed = int(np.count_nonzero(remove_mask))
+    if not align_median:
+        kept_index = np.flatnonzero(~remove_mask)
+        return raw_arr[kept_index], kept_index, n_removed
+
+    fs = (
+        float(sample_rate)
+        if sample_rate is not None and sample_rate > 0
+        else EEG_SPLICE_ALIGN_DEFAULT_FS
+    )
+    cleaned, kept_index = splice_kept_runs_align_median(
+        raw_arr,
+        remove_mask,
+        fs,
+        window_sec=align_window_sec,
+    )
+    return cleaned, kept_index, n_removed
 
 
 def slice_clean_raw_segment(
@@ -928,6 +1024,7 @@ def slice_clean_raw_segment(
     end_seconds: float,
     *,
     remove_suspicious: bool = True,
+    align_median: bool = True,
 ) -> np.ndarray:
     """按原始时间范围切片，并去掉该段内的 reject/suspicious 点。"""
     raw_arr = np.asarray(raw)
@@ -949,9 +1046,16 @@ def slice_clean_raw_segment(
         count,
         remove_suspicious=remove_suspicious,
     )
+    seg_remove = remove_mask[i_start:i_end]
     segment = raw_arr[i_start:i_end]
-    keep = ~remove_mask[i_start:i_end]
-    return segment[keep]
+    if not align_median:
+        return segment[~seg_remove]
+    cleaned, _ = splice_kept_runs_align_median(
+        segment,
+        seg_remove,
+        float(sample_rate),
+    )
+    return cleaned
 
 
 def export_offline_raw_csvs(
@@ -1006,6 +1110,7 @@ def export_offline_raw_csvs(
         raw_arr,
         quality,
         remove_suspicious=remove_suspicious,
+        sample_rate=sample_rate,
     )
     clean_data: dict[str, object] = {
         "index": np.arange(cleaned_raw.size, dtype=np.int64),

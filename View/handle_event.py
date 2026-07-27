@@ -1206,23 +1206,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_waveform.refresh_layout()
 
     def _setup_offline_viewer_ui(self) -> None:
-        """离线波形与分钟功率同一套路径B：拼 full → 统一剔坏段 → 可选按分钟截取。"""
+        """离线波形：选 *_full 显示完整 raw；选无 _full 显示已剔坏文件。"""
         edit = self.ui.lineEdit_offline_path
         if not edit.text().strip():
-            edit.setPlaceholderText("选会话内任一 CSV（路径B：full拼接→剔坏）")
+            edit.setPlaceholderText("选 CSV：*_full=完整，无full=剔坏后")
         edit.setToolTip(
-            "选会话目录中任一 EEG CSV 即可。"
-            "加载与分钟功率相同（路径B）：拼接 eeg_chunk_*_full → 统一剔坏段 → 显示；"
-            "填写分钟则在剔坏后时间轴上截取。"
+            "选 eeg_chunk_XXX_full.csv → 完整原始；选 eeg_chunk_XXX.csv → 剔坏后。"
+            "分钟从所选文件起点计；跨度超过该文件时，自动向后拼接同类型 chunk。"
         )
         self.ui.lineEdit_offline_min_start.setToolTip(
-            "起始分钟（含）。在 full拼接并统一剔坏后的时间轴上截取，与功率图分钟对齐。"
+            "起始分钟（含）。从所选文件起点计；超出单文件则向后拼接。"
         )
         self.ui.lineEdit_offline_min_end.setToolTip(
-            "结束分钟（含）。例如 3 与 9 → 显示剔坏后第 3～9 分钟。"
+            "结束分钟（含）。例如 1 与 25 → 从所选文件起共 25 分钟（不足则拼接后续 chunk）。"
         )
         self.ui.pushButton_load_offline.setToolTip(
-            "路径B：拼 full → 剔坏段 →（可选）截取分钟后显示"
+            "*_full → 完整；无 _full → 剔坏后；分钟超出单文件则自动拼接"
         )
         self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
 
@@ -1233,7 +1232,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not start_text and not end_text:
             return None
         if not start_text or not end_text:
-            raise ValueError("请同时填写起始分钟与结束分钟，或都留空显示剔坏后全部")
+            raise ValueError("请同时填写起始分钟与结束分钟，或都留空显示全部")
         try:
             start_m = int(float(start_text))
             end_m = int(float(end_text))
@@ -1245,65 +1244,101 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raise ValueError(f"结束分钟 {end_m} 不能小于起始分钟 {start_m}")
         return start_m, end_m
 
-    def _offline_path_b_source(self, path: Path) -> Path:
-        """路径B数据源：会话有 chunk full 则用目录；否则用对应 full 或所选文件。"""
+    @staticmethod
+    def _is_offline_full_csv(path: Path) -> bool:
+        """文件名以 _full.csv 结尾 → 完整原始；否则视为剔坏后文件。"""
+        return path.name.lower().endswith("_full.csv")
+
+    def _list_offline_sibling_chunks(self, path: Path) -> List[Path]:
+        """同会话、同类型（full / 剔坏）的 eeg_chunk_* 按序号排列。"""
         import re
 
-        from LongRecordNormalReport import list_chunk_full_csvs
+        from LongRecordNormalReport import _chunk_sort_key
 
         parent = path.parent
-        if list_chunk_full_csvs(parent):
-            return parent
-
-        if re.fullmatch(r"eeg_chunk_\d+\.csv", path.name, flags=re.IGNORECASE):
-            full = parent / path.name.replace(".csv", "_full.csv")
-            if full.is_file():
-                return full
-        if path.name.lower() == "eeg_raw.csv":
-            full = parent / "eeg_raw_full.csv"
-            if full.is_file():
-                return full
-        return path
+        if self._is_offline_full_csv(path):
+            return sorted(parent.glob("eeg_chunk_*_full.csv"), key=_chunk_sort_key)
+        cleaned: List[Path] = []
+        for p in parent.glob("eeg_chunk_*.csv"):
+            name = p.name
+            if name.lower().endswith("_full.csv"):
+                continue
+            if re.fullmatch(r"eeg_chunk_\d+\.csv", name, flags=re.IGNORECASE):
+                cleaned.append(p)
+        return sorted(cleaned, key=_chunk_sort_key)
 
     def _load_offline_selected_slice(
         self,
         path: Path,
         minute_range: Optional[Tuple[int, int]],
     ) -> tuple[np.ndarray, float, str, float]:
-        """路径B：与分钟功率一致——full（可多chunk拼接）→ 统一剔坏段 → 可选截取分钟。"""
-        from LongRecordMinuteBandPower import load_raw_for_minute_analysis
-
-        source = self._offline_path_b_source(path)
-        raw, fs, source_desc = load_raw_for_minute_analysis(source)
-        quality = build_threshold_rejection(raw.astype(np.float64), float(fs))
-        cleaned, _, n_removed = clean_raw_signal(raw.astype(np.int64), quality)
-        cleaned = cleaned.astype(np.float64)
-        cleaned_min = cleaned.size / float(fs) / 60.0 if fs > 0 else 0.0
-        base_title = (
-            f"路径B·{source_desc}·剔坏后"
-            f"（删{n_removed}点，约{cleaned_min:.1f}分钟）"
-        )
+        """按所选文件类型加载；分钟跨度超出单文件时向后拼接同类型 chunk。"""
+        raw, fs = load_eeg_csv_with_rate(path)
+        data = np.asarray(raw, dtype=np.float64)
+        fs = float(fs)
+        is_full = self._is_offline_full_csv(path)
+        kind = "完整" if is_full else "剔坏后"
+        used_names = [path.name]
 
         if minute_range is None:
-            if cleaned.size < 8:
-                raise ValueError("剔坏后有效样本过少")
-            return cleaned, float(fs), base_title, 0.0
+            if data.size < 8:
+                raise ValueError(f"{kind}数据有效样本过少")
+            base_title = f"{kind}·{path.name}"
+            return data, fs, base_title, 0.0
 
         start_m, end_m = minute_range
-        n_per_min = max(1, int(round(float(fs) * 60.0)))
+        n_per_min = max(1, int(round(fs * 60.0)))
         i0 = (start_m - 1) * n_per_min
         i1 = end_m * n_per_min
-        if i0 >= cleaned.size:
+
+        siblings = self._list_offline_sibling_chunks(path)
+        need_concat = i1 > data.size or i0 >= data.size
+        path_res = path.resolve()
+        sibling_res = [p.resolve() for p in siblings]
+        if need_concat and path_res in sibling_res:
+            # 从所选 chunk 起向后拼，直到覆盖结束分钟（或拼完）
+            start_idx = sibling_res.index(path_res)
+            parts: List[np.ndarray] = []
+            used_names = []
+            total = 0
+            rates: List[float] = []
+            for p in siblings[start_idx:]:
+                raw_i, fs_i = load_eeg_csv_with_rate(p)
+                parts.append(np.asarray(raw_i, dtype=np.float64))
+                rates.append(float(fs_i))
+                used_names.append(p.name)
+                total += int(parts[-1].size)
+                if total >= i1:
+                    break
+            data = np.concatenate(parts) if parts else data
+            if rates:
+                fs = float(np.median(np.asarray(rates, dtype=np.float64)))
+                n_per_min = max(1, int(round(fs * 60.0)))
+                i0 = (start_m - 1) * n_per_min
+                i1 = end_m * n_per_min
+
+        total_min = data.size / fs / 60.0 if fs > 0 else 0.0
+        if i0 >= data.size:
             raise ValueError(
-                f"起始分钟 {start_m} 超出剔坏后长度（约 {cleaned_min:.1f} 分钟）；"
-                f"与功率图同一时间轴"
+                f"起始分钟 {start_m} 超出{kind}可用长度（约 {total_min:.1f} 分钟；"
+                f"已用 {', '.join(used_names[:3])}"
+                f"{'…' if len(used_names) > 3 else ''}）"
             )
-        segment = cleaned[i0 : min(i1, int(cleaned.size))]
+        segment = data[i0 : min(i1, int(data.size))]
         if segment.size < 8:
             raise ValueError(f"截取后样本过少（{segment.size} 点）")
         time_offset_s = float((start_m - 1) * 60)
+        if len(used_names) == 1:
+            base_title = f"{kind}·{used_names[0]}"
+        else:
+            base_title = (
+                f"{kind}·拼接{len(used_names)}个"
+                f"（{used_names[0]}…{used_names[-1]}）"
+            )
         title = f"{base_title} · 分钟{start_m}–{end_m}"
-        return segment, float(fs), title, time_offset_s
+        if segment.size < (i1 - i0):
+            title += f"（实际约 {segment.size / fs / 60.0:.1f} 分钟，后续 chunk 不足）"
+        return segment, fs, title, time_offset_s
 
     def _browse_offline_eeg_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -2294,7 +2329,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
             out_cleaned: Optional[Path] = None
             if save_cleaned:
-                cleaned_raw, _, removed_points = clean_raw_signal(raw, quality)
+                cleaned_raw, _, removed_points = clean_raw_signal(
+                    raw, quality, sample_rate=sample_rate
+                )
                 with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(["index", "time_s", "ch1_raw"])
@@ -2349,7 +2386,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             sample_rate = float(np.median(np.asarray(rates, dtype=np.float64)))
             quality = build_threshold_rejection(raw, sample_rate)
             cleaned, kept_index, n_removed = clean_raw_signal(
-                raw.astype(np.int64), quality
+                raw.astype(np.int64), quality, sample_rate=sample_rate
             )
             cleaned = np.asarray(cleaned)
             kept_index = np.asarray(kept_index, dtype=np.int64)

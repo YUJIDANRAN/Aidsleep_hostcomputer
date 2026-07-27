@@ -1303,6 +1303,7 @@ def run_analysis(
         raw_cleaned, _, removed_points = clean_raw_signal(
             raw_full.astype(np.int64),
             quality_full,
+            sample_rate=sample_rate,
         )
         quality_cleaned = build_threshold_rejection(
             raw_cleaned.astype(np.float64),

@@ -256,7 +256,9 @@ def prepare_cleaned_minute_powers(
     """
     raw, sample_rate, source_desc = load_raw_for_minute_analysis(source)
     quality = build_threshold_rejection(raw, sample_rate)
-    cleaned, _, n_removed = clean_raw_signal(raw.astype(np.int64), quality)
+    cleaned, _, n_removed = clean_raw_signal(
+        raw.astype(np.int64), quality, sample_rate=sample_rate
+    )
     cleaned = cleaned.astype(np.float64)
     minutes, absolute, relative = compute_minute_band_powers(cleaned, sample_rate)
     meta = {
