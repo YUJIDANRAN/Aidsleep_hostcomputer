@@ -1165,6 +1165,13 @@ QPushButton:hover { background: #EDF2F7; }</string>
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QPushButton" name="pushButton_save_location">
+          <property name="text">
+           <string>保存位置...</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

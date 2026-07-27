@@ -35,6 +35,24 @@ CHANNEL_COLORS = {
     **BAND_COLORS,
 }
 MAX_PLOT_POINTS = 25000
+# 短区间提高上限：约 5 分钟 @500Hz 可接近全分辨率
+MAX_PLOT_POINTS_SHORT = 200000
+
+
+def _adaptive_max_plot_points(n_samples: int, sample_rate: float) -> int:
+    """显示越短，允许的绘图点数越多，短窗尽量少抽点。"""
+    n = max(0, int(n_samples))
+    fs = float(sample_rate) if sample_rate and sample_rate > 0 else float(DEFAULT_SAMPLE_RATE)
+    duration_s = n / fs if fs > 0 else 0.0
+    if duration_s <= 0:
+        return MAX_PLOT_POINTS
+    if duration_s <= 60:  # ≤1 分钟：尽量全点
+        return max(MAX_PLOT_POINTS_SHORT, n)
+    if duration_s <= 180:  # ≤3 分钟（如 12–15）：高分辨率
+        return MAX_PLOT_POINTS_SHORT
+    if duration_s <= 600:  # ≤10 分钟
+        return 80000
+    return MAX_PLOT_POINTS
 
 
 def _time_tick_step_seconds(span_s: float) -> float:
@@ -244,10 +262,13 @@ class OfflineRhythmStackView(_MatplotlibHostView):
             return
 
         n = len(visible)
+        max_pts = _adaptive_max_plot_points(int(self._time_s.size), self._sample_rate)
         axes = self._figure.subplots(n, 1, sharex=True, squeeze=False)
         for i, name in enumerate(visible):
             ax = axes[i, 0]
-            t, y = _downsample_pair(self._time_s, self._channels[name])
+            t, y = _downsample_pair(
+                self._time_s, self._channels[name], max_points=max_pts
+            )
             color = CHANNEL_COLORS.get(name, "#1976D2")
             ax.plot(t, y, color=color, linewidth=0.8)
             ax.set_ylabel(CHANNEL_LABELS.get(name, name), fontsize=9)

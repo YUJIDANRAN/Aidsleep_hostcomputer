@@ -903,6 +903,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_timed_test_ui()
         self._setup_sleep_aid_window_ui()
         self._setup_session_name_ui()
+        self._eeg_save_root: Optional[Path] = None  ## None → 默认 Result
         self._setup_compare_segments_ui()
         self._setup_offline_viewer_ui()
         self._last_eeg_session_dir: Optional[Path] = None
@@ -1092,8 +1093,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
         self.ui.groupBox_session_name.setTitle("保存命名")
         self.ui.groupBox_session_name.setToolTip(
-            "填写 XXX 时保存目录为 Result/时间戳_XXX/；留空则为 Result/时间戳/"
+            "填写 XXX 时子目录为 时间戳_XXX/；留空则为 时间戳/。"
+            "点「保存位置...」选根目录，取消则仍用默认 Result。"
         )
+        self.ui.pushButton_save_location.setToolTip(
+            "选择保存根目录；取消则默认工程下 Result/"
+        )
+        try:
+            self.ui.pushButton_save_location.clicked.disconnect()
+        except TypeError:
+            pass
+        self.ui.pushButton_save_location.clicked.connect(self._on_choose_save_location)
 
         self.ui.pushButton_serial_toggle.setMinimumSize(96, 32)
         self.ui.pushButton_serial_toggle.setText("打开串口")
@@ -1490,11 +1500,42 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
 
     def _setup_session_name_ui(self) -> None:
-        """lineEdit_session_name：Result 下子文件夹命名后缀。"""
+        """lineEdit_session_name：会话子文件夹命名后缀；根目录由「保存位置...」选择。"""
         edit = self.ui.lineEdit_session_name
         edit.setPlaceholderText("留空→仅时间戳")
         edit.setToolTip(
-            "填写 XXX 时保存目录为 Result/时间戳_XXX/；留空则为 Result/时间戳/"
+            "填写 XXX 时子目录为 时间戳_XXX/；留空则为 时间戳/。"
+            "根目录点「保存位置...」选择，取消则默认 Result。"
+        )
+
+    @QtCore.pyqtSlot()
+    def _on_choose_save_location(self) -> None:
+        """直接打开文件夹选择；取消则保持默认 Result。命名仍用上方输入框。"""
+        start = (
+            str(self._eeg_save_root)
+            if self._eeg_save_root is not None
+            else str(DEFAULT_EEG_CSV_DIR.resolve())
+        )
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择保存根目录", start
+        )
+        if not chosen:
+            return
+        root = Path(chosen).expanduser()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._log(f"保存位置无效，已保持原设置: {exc}")
+            return
+        self._eeg_save_root = root.resolve()
+        root_desc = str(self._eeg_save_root)
+        tag = self._read_session_name_tag()
+        tag_tip = f"时间戳_{tag}" if tag else "时间戳"
+        self._log(f"保存根目录: {root_desc}；子目录命名: {tag_tip}")
+        self.ui.groupBox_session_name.setToolTip(
+            f"当前根目录: {root_desc}\n"
+            f"子目录: {tag_tip}/\n"
+            "点「保存位置...」可改目录；命名用上方输入框。"
         )
 
     @staticmethod
@@ -1516,8 +1557,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return stamp
         return f"{stamp}_{tag}"
 
+    def _save_root_dir(self) -> Path:
+        """保存根目录：对话框所选，或默认 Result。"""
+        if self._eeg_save_root is not None:
+            return self._eeg_save_root
+        return DEFAULT_EEG_CSV_DIR
+
     def _resolve_session_dir(self, stamp: Optional[str] = None) -> Path:
-        session_dir = DEFAULT_EEG_CSV_DIR / self._make_session_dir_name(stamp)
+        root = self._save_root_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        session_dir = root / self._make_session_dir_name(stamp)
         session_dir.mkdir(parents=True, exist_ok=True)
         return session_dir
 
