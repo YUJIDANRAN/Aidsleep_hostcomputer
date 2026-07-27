@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 
 try:
     import serial
@@ -37,6 +37,8 @@ SAMPLES_PER_SYNC_GROUP = SYNC_CNT_WRAP // SYNC_CNT_STEP  ## 16 点/组
 CH1_BYTES_ON_WIRE = 2
 CH2_BYTES_ON_WIRE = 0  ## 仅 CH1=0；若固件仍发 CH2 则改为 2
 WIRE_BYTES_PER_TICK = CH1_BYTES_ON_WIRE + CH2_BYTES_ON_WIRE
+MULTI_CHANNEL_COUNT = 6
+MULTI_BYTES_PER_TICK = MULTI_CHANNEL_COUNT * 2
 MCU_SAMPLE_RATE = 500
 BYTES_PER_SECOND = int(
     MCU_SAMPLE_RATE
@@ -56,26 +58,41 @@ RAW_TYPICAL_AMP = 2200.0  ## raw 显示默认半幅
 
 @dataclass(frozen=True)
 class AdcSample:
-    """单点 CH1 采样。"""
+    """One ADC sample tick; channels has CH1 in single mode, CH1~CH6 in multi mode."""
 
     channel1: int
     channel2: int = 0
+    channels: Tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.channels:
+            object.__setattr__(self, "channels", (self.channel1,))
 
     @staticmethod
-    def decode_ch1_le(data_low: int, data_high: int) -> int:
-        """
-        解码 CH1：先发 L 后发 H；0xFE 还原为低字节 0xFF。
-        结果限制在 12 位 ADC / Send_Filter_Data 常见范围 0~4095。
-        """
+    def decode_u16_le(data_low: int, data_high: int) -> int:
+        """Decode little-endian word; 0xFE on low byte is restored to 0xFF."""
         low = data_low & 0xFF
         if low == LOW_BYTE_ESCAPE:
             low = 0xFF
         high = data_high & 0xFF
         return ((high << 8) | low) & ADC_12BIT_MASK
 
+    @staticmethod
+    def decode_ch1_le(data_low: int, data_high: int) -> int:
+        return AdcSample.decode_u16_le(data_low, data_high)
+
     @classmethod
-    def from_ch1_bytes(cls, data_low: int, data_high: int) -> AdcSample:
-        return cls(channel1=cls.decode_ch1_le(data_low, data_high))
+    def from_ch1_bytes(cls, data_low: int, data_high: int) -> "AdcSample":
+        value = cls.decode_ch1_le(data_low, data_high)
+        return cls(channel1=value, channels=(value,))
+
+    @classmethod
+    def from_channel_bytes(cls, payload: bytes, channel_count: int) -> "AdcSample":
+        values = tuple(
+            cls.decode_u16_le(payload[index * 2], payload[index * 2 + 1])
+            for index in range(channel_count)
+        )
+        return cls(channel1=values[0] if values else 0, channels=values)
 
 
 class AdcStreamParser:
@@ -91,6 +108,17 @@ class AdcStreamParser:
     def reset(self) -> None:
         self._buf = bytearray()
         self._ticks_in_group = 0  ## 0~15，对应 send_data_cnt 0,2,...,30
+        self._channel_count = getattr(self, "_channel_count", 1)
+
+    def set_channel_count(self, channel_count: int) -> None:
+        """Switch between single-channel and six-channel wire protocols."""
+        self._channel_count = MULTI_CHANNEL_COUNT if channel_count > 1 else 1
+        self._buf.clear()
+        self._ticks_in_group = 0
+
+    @property
+    def channel_count(self) -> int:
+        return self._channel_count
 
     def _trim_buffer_if_needed(self) -> None:
         if len(self._buf) <= MAX_PARSER_BUF:
@@ -126,14 +154,22 @@ class AdcStreamParser:
                     del self._buf[0]
                     continue
                 del self._buf[0]
-            if len(self._buf) < CH1_BYTES_ON_WIRE:
-                break
-            data_low, data_high = self._buf[0], self._buf[1]
-            del self._buf[:CH1_BYTES_ON_WIRE]
-            self._consume_ch2_if_present()
-            out.append(AdcSample.from_ch1_bytes(data_low, data_high))
+            if self._channel_count > 1:
+                if len(self._buf) < MULTI_BYTES_PER_TICK:
+                    break
+                payload = bytes(self._buf[:MULTI_BYTES_PER_TICK])
+                del self._buf[:MULTI_BYTES_PER_TICK]
+                out.append(AdcSample.from_channel_bytes(payload, self._channel_count))
+            else:
+                if len(self._buf) < CH1_BYTES_ON_WIRE:
+                    break
+                data_low, data_high = self._buf[0], self._buf[1]
+                del self._buf[:CH1_BYTES_ON_WIRE]
+                self._consume_ch2_if_present()
+                out.append(AdcSample.from_ch1_bytes(data_low, data_high))
             self._ticks_in_group = (self._ticks_in_group + 1) % SAMPLES_PER_SYNC_GROUP
         return out
+
 
 
 class Ks1082Serial:
@@ -219,6 +255,13 @@ class Ks1082Serial:
     def discard_pending_input(self) -> int:
         """暂停采集时调用：读空硬件缓冲并重置解析状态。"""
         return self.flush_input_buffer()
+
+    def set_channel_count(self, channel_count: int) -> None:
+        self._parser.set_channel_count(channel_count)
+
+    @property
+    def channel_count(self) -> int:
+        return self._parser.channel_count
 
     def feed_bytes(self, data: bytes) -> List[AdcSample]:
         self.bytes_received += len(data)

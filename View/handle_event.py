@@ -121,6 +121,7 @@ RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
 RAW_PLOT_MAX_POINTS = int(RAW_DISPLAY_RATE * RAW_PLOT_WINDOW_SECONDS)  ## 缓冲约 200 点
 SERIAL_POLL_INTERVAL_MS = max(2, int(1000 / MCU_SAMPLE_RATE))  ## 串口轮询 2 ms
 MAX_SAMPLES_PER_POLL = 80  ## 单次 poll 最多处理的原始样本数，防止恢复后积压卡顿
+EEG_MULTI_CHANNEL_COUNT = 6  ## six-channel EEG protocol: CH1~CH6
 MIN_PLOT_WIDTH = 200  ## 绘图区最小宽度
 MIN_PLOT_HEIGHT = 120  ## 绘图区最小高度
 AXIS_MARGIN_LEFT = 72  ## 左留白给 Y 轴
@@ -855,6 +856,99 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
         self._update_axes_if_needed(count, force=force_axes)  ## 坐标轴低频/按需重绘
 
 
+class MultiChannelEegView(QtWidgets.QWidget):
+    """Six-channel EEG split view; each channel owns one waveform widget."""
+
+    def __init__(
+        self,
+        sample_rate: float = DEFAULT_SAMPLE_RATE,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._views: List[AlphaWaveformView] = [
+            AlphaWaveformView(sample_rate=sample_rate, parent=self)
+            for _ in range(EEG_MULTI_CHANNEL_COUNT)
+        ]
+        self._mode = "raw"
+        self._last_config: tuple = ()
+
+    def setGeometry(self, rect: QtCore.QRect) -> None:  # type: ignore[override]
+        super().setGeometry(rect)
+        self._layout_views()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._layout_views()
+
+    def _layout_views(self) -> None:
+        gap = 6
+        rows = EEG_MULTI_CHANNEL_COUNT
+        width = max(1, self.width())
+        height = max(1, self.height())
+        cell_h = max(1, (height - gap * (rows - 1)) // rows)
+        for index, view in enumerate(self._views):
+            y = index * (cell_h + gap)
+            if index == rows - 1:
+                cell_height = max(1, height - y)
+            else:
+                cell_height = cell_h
+            view.setGeometry(QtCore.QRect(0, y, width, cell_height))
+            view.refresh_layout()
+
+    def configure_display(
+        self,
+        *,
+        mode: str,
+        sample_rate: float,
+        max_points: int,
+        line_color: str,
+        fixed_y_axis: bool,
+        y_mid: float,
+        y_amp: float,
+        y_axis_label: str = "Amplitude",
+        min_y_amp: float = MIN_Y_AMP,
+        max_y_amp: float = MAX_Y_AMP,
+    ) -> None:
+        config = (mode, sample_rate, max_points, line_color, fixed_y_axis, y_mid, y_amp, y_axis_label, min_y_amp, max_y_amp)
+        if config == self._last_config:
+            return
+        self._mode = mode
+        self._last_config = config
+        for index, view in enumerate(self._views, start=1):
+            view.configure_display(
+                legend=f"CH{index} {mode.upper()}",
+                sample_rate=sample_rate,
+                max_points=max_points,
+                line_color=line_color,
+                fixed_y_axis=fixed_y_axis,
+                y_mid=y_mid,
+                y_amp=y_amp,
+                use_full_plot_height=True,
+                y_axis_label=y_axis_label,
+                min_y_amp=min_y_amp,
+                max_y_amp=max_y_amp,
+            )
+
+    def clear(self) -> None:
+        for view in self._views:
+            view.clear()
+
+    def refresh_layout(self) -> None:
+        self._layout_views()
+        for view in self._views:
+            view.refresh_layout()
+
+    def append_channel_values_batch(self, batches: Iterable[Iterable[float]]) -> None:
+        per_channel = [[] for _ in range(EEG_MULTI_CHANNEL_COUNT)]
+        for values in batches:
+            for index, value in enumerate(values):
+                if index < EEG_MULTI_CHANNEL_COUNT:
+                    per_channel[index].append(value)
+        for index, values in enumerate(per_channel):
+            if values:
+                self._views[index].append_alphas_plain(values)
+
+
 class Ks1082MainWindow(QtWidgets.QMainWindow):
     """主窗口：串口采集 + 波形显示。"""
 
@@ -890,6 +984,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._link: Optional[Ks1082Serial] = None  ## EEG 串口
         self._osc_link: Optional[OscillatorSerial] = None  ## 振子串口连接
         self._rhythm = RhythmStreamProcessor(sample_rate=sample_rate)  ## EEG 节律流式滤波
+        self._multi_rhythm = [
+            RhythmStreamProcessor(sample_rate=sample_rate)
+            for _ in range(EEG_MULTI_CHANNEL_COUNT)
+        ]
         self._alpha_rejector = RealtimeAlphaThresholdRejector(sample_rate)
         self._quality_gate = RealtimeQualityGate(sample_rate)
         self._alpha_display_total_points = 0
@@ -936,6 +1034,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_no_data_ticks = 0  ## 振子无数据 poll 计数
         self._last_status_update = 0.0  ## 上次刷新状态栏时刻
         self._display_mode = ""  ## 当前 EEG 显示模式
+        self._eeg_channel_mode = "single"  ## single | multi
         self._osc_display_mode = ""  ## 当前振子显示模式
         self._osc_display_kind = "band"  ## band | axis
         self._osc_axis_display_key: tuple[str, ...] = ()
@@ -974,6 +1073,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
         self._offline_view = OfflineRhythmStackView(parent=self.ui.page)
         self._offline_view.hide()
+        self._multi_waveform = MultiChannelEegView(
+            sample_rate=sample_rate,
+            parent=self.ui.page,
+        )
+        self._multi_waveform.hide()
         self._analysis_plot = AnalysisPlotView(parent=self.ui.page)
         self._analysis_plot.hide()
         self._osc_waveform = AlphaWaveformView(  ## 振子：覆盖在 page_2
@@ -981,11 +1085,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             parent=self.ui.page_2,
         )
         self._sync_waveform_geometry()
+        self._sync_multi_waveform_geometry()
         self._sync_offline_geometry()
         self._sync_analysis_plot_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.show()
         self._waveform.raise_()
+        self._multi_waveform.hide()
         self._osc_waveform.show()
         self._osc_waveform.raise_()
         self.ui.graphicsView.hide()  ## 用自定义波形控件替代占位 QGraphicsView
@@ -1003,6 +1109,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             checkbox.toggled.connect(
                 lambda checked, m=mode: self._on_display_checkbox_toggled(m, checked)
             )
+        self.ui.comboBox_eeg_channel_mode.currentIndexChanged.connect(
+            self._on_eeg_channel_mode_changed
+        )
+        self.ui.comboBox_eeg_display_channel.currentIndexChanged.connect(
+            self._on_eeg_display_channel_changed
+        )
+        self.ui.comboBox_eeg_display_channel.setEnabled(False)
         for mode, checkbox in self._osc_display_checkboxes.items():
             checkbox.toggled.connect(
                 lambda checked, m=mode: self._on_osc_checkbox_toggled(m, checked)
@@ -1025,6 +1138,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._reset_alpha_display_stats()
             self._decim_counter = 0
             self._waveform.clear()
+            self._multi_waveform.clear()
         if self._osc_link is not None and self._osc_link.is_open:
             self._running = True
             self._osc_proc.reset()
@@ -1180,16 +1294,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         super().showEvent(event)
         self._layout_main_regions()
         self._sync_waveform_geometry()
+        self._sync_multi_waveform_geometry()
         self._sync_offline_geometry()
         self._sync_analysis_plot_geometry()
         self._sync_osc_waveform_geometry()
         if self._analysis_plot_active:
             self._waveform.hide()
+            self._multi_waveform.hide()
             self._offline_view.hide()
             self._analysis_plot.show()
             self._analysis_plot.raise_()
         elif self._offline_view_active:
             self._waveform.hide()
+            self._multi_waveform.hide()
             self._analysis_plot.hide()
             self._offline_view.show()
             self._offline_view.raise_()
@@ -1201,6 +1318,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_waveform.show()
         self._osc_waveform.raise_()
         self._waveform.refresh_layout()
+        self._multi_waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
 
     def _setup_offline_viewer_ui(self) -> None:
@@ -2620,6 +2738,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._active_view = "eeg"
         if self._analysis_plot_active:
             self._waveform.hide()
+            self._multi_waveform.hide()
             self._offline_view.hide()
             self._sync_analysis_plot_geometry()
             self._analysis_plot.show()
@@ -2629,6 +2748,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         if self._offline_view_active:
             self._waveform.hide()
+            self._multi_waveform.hide()
             self._analysis_plot.hide()
             self._sync_offline_geometry()
             self._offline_view.show()
@@ -2640,9 +2760,67 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         self._offline_view.hide()
         self._analysis_plot.hide()
-        self._waveform.show()
-        self._waveform.raise_()
+        self._show_current_eeg_waveform()
         self._apply_display_mode(self._current_display_mode())
+
+    def _is_multi_eeg_mode(self) -> bool:
+        return self._eeg_channel_mode == "multi"
+
+    def _selected_eeg_display_channel(self) -> int:
+        """Return -1 for all channels, or 0~5 for CH1~CH6 in six-channel mode."""
+        if not self._is_multi_eeg_mode():
+            return 0
+        index = self.ui.comboBox_eeg_display_channel.currentIndex()
+        if index <= 0:
+            return -1
+        return min(index - 1, EEG_MULTI_CHANNEL_COUNT - 1)
+
+    def _show_current_eeg_waveform(self) -> None:
+        show_all_channels = self._is_multi_eeg_mode() and self._selected_eeg_display_channel() < 0
+        if show_all_channels:
+            self._waveform.hide()
+            self._sync_multi_waveform_geometry()
+            self._multi_waveform.show()
+            self._multi_waveform.raise_()
+        else:
+            self._multi_waveform.hide()
+            self._sync_waveform_geometry()
+            self._waveform.show()
+            self._waveform.raise_()
+
+    @QtCore.pyqtSlot(int)
+    def _on_eeg_channel_mode_changed(self, index: int) -> None:
+        mode = "multi" if index == 1 else "single"
+        if mode == self._eeg_channel_mode:
+            return
+        self._eeg_channel_mode = mode
+        self.ui.comboBox_eeg_display_channel.setEnabled(mode == "multi")
+        if mode == "single":
+            self.ui.comboBox_eeg_display_channel.blockSignals(True)
+            self.ui.comboBox_eeg_display_channel.setCurrentIndex(0)
+            self.ui.comboBox_eeg_display_channel.blockSignals(False)
+        self._reset_eeg_display_after_channel_change()
+        if self._link is not None:
+            self._link.set_channel_count(EEG_MULTI_CHANNEL_COUNT if mode == "multi" else 1)
+        self._log("EEG serial protocol switched to six-channel" if mode == "multi" else "EEG serial protocol switched to single-channel")
+
+    @QtCore.pyqtSlot(int)
+    def _on_eeg_display_channel_changed(self, index: int) -> None:
+        if not self._is_multi_eeg_mode():
+            return
+        self._reset_eeg_display_after_channel_change()
+
+    def _reset_eeg_display_after_channel_change(self) -> None:
+        self._display_mode = ""
+        self._decim_counter = 0
+        self._rhythm.reset()
+        for processor in self._multi_rhythm:
+            processor.reset()
+        self._waveform.clear()
+        self._multi_waveform.clear()
+        self._apply_display_mode(self._current_display_mode())
+        if self._active_view == "eeg" and not (self._offline_view_active or self._analysis_plot_active):
+            self._show_current_eeg_waveform()
 
     def _switch_to_osc_view(self) -> None:
         """切换到振子波形页（stackedWidget page_2）。"""
@@ -2750,6 +2928,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """EEG 波形控件与 Designer 中 graphicsView 同位置同大小。"""
         self._waveform.setGeometry(self.ui.graphicsView.geometry())
 
+    def _sync_multi_waveform_geometry(self) -> None:
+        self._multi_waveform.setGeometry(self.ui.graphicsView.geometry())
+
     def _sync_offline_geometry(self) -> None:
         self._offline_view.setGeometry(self.ui.graphicsView.geometry())
 
@@ -2768,10 +2949,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "_waveform") or not hasattr(self, "_osc_waveform"):
             return
         self._sync_waveform_geometry()
+        self._sync_multi_waveform_geometry()
         self._sync_offline_geometry()
         self._sync_analysis_plot_geometry()
         self._sync_osc_waveform_geometry()
         self._waveform.refresh_layout()
+        self._multi_waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
 
     def _current_display_mode(self) -> str:
@@ -2810,18 +2993,37 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._eeg_base_legend = legend
         if mode == "alpha":
             legend = self._alpha_reject_status_legend(legend)
-        self._waveform.configure_display(
-            legend=legend,
-            sample_rate=RAW_DISPLAY_RATE,
-            max_points=RAW_PLOT_MAX_POINTS,
-            line_color=line_color,
-            fixed_y_axis=True,
-            y_mid=y_mid,
-            y_amp=y_amp,
-            use_full_plot_height=True,
-            min_y_amp=MIN_Y_AMP,
-            max_y_amp=MAX_Y_AMP,
-        )
+        if self._is_multi_eeg_mode() and self._selected_eeg_display_channel() < 0:
+            self._multi_waveform.configure_display(
+                mode=mode,
+                sample_rate=RAW_DISPLAY_RATE,
+                max_points=RAW_PLOT_MAX_POINTS,
+                line_color=line_color,
+                fixed_y_axis=True,
+                y_mid=y_mid,
+                y_amp=y_amp,
+                min_y_amp=MIN_Y_AMP,
+                max_y_amp=MAX_Y_AMP,
+            )
+            title = title.replace("CH1", "CH1-CH6")
+        else:
+            selected_channel = self._selected_eeg_display_channel()
+            channel_label = f"CH{selected_channel + 1}" if self._is_multi_eeg_mode() else "CH1"
+            if self._is_multi_eeg_mode():
+                legend = legend.replace("CH1", channel_label)
+                title = title.replace("CH1", channel_label)
+            self._waveform.configure_display(
+                legend=legend,
+                sample_rate=RAW_DISPLAY_RATE,
+                max_points=RAW_PLOT_MAX_POINTS,
+                line_color=line_color,
+                fixed_y_axis=True,
+                y_mid=y_mid,
+                y_amp=y_amp,
+                use_full_plot_height=True,
+                min_y_amp=MIN_Y_AMP,
+                max_y_amp=MAX_Y_AMP,
+            )
         if self._active_view == "eeg":
             self.setWindowTitle(title)
 
@@ -3225,6 +3427,41 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if samples:
             if len(samples) > MAX_SAMPLES_PER_POLL:
                 samples = samples[-MAX_SAMPLES_PER_POLL:]
+            if self._is_multi_eeg_mode() and not (self._offline_view_active or self._analysis_plot_active):
+                mode = self._current_display_mode()
+                self._apply_display_mode(mode)
+                band = None if mode == "raw" else mode
+                selected_channel = self._selected_eeg_display_channel()
+                plot_batches: list[list[float]] = []
+                plot_values: list[float] = []
+                for sample in samples:
+                    channels = sample.channels[:EEG_MULTI_CHANNEL_COUNT]
+                    if len(channels) < EEG_MULTI_CHANNEL_COUNT:
+                        continue
+                    if self._is_test_recording_phase():
+                        self._eeg_raw_record.append(sample.channel1)
+                    self._sample_count += 1
+                    self._decim_counter += 1
+                    if band is None:
+                        values = [float(value) for value in channels]
+                    else:
+                        values = [
+                            self._multi_rhythm[index].push(value, band)
+                            for index, value in enumerate(channels)
+                        ]
+                    if self._decim_counter >= RAW_DECIM_FACTOR:
+                        self._decim_counter = 0
+                        if selected_channel < 0:
+                            plot_batches.append(values)
+                        else:
+                            plot_values.append(values[selected_channel])
+                if self._is_waveform_display_active():
+                    if selected_channel < 0 and plot_batches:
+                        self._multi_waveform.append_channel_values_batch(plot_batches)
+                    elif selected_channel >= 0 and plot_values:
+                        self._waveform.append_alphas_plain(plot_values)
+                self._no_data_ticks = 0
+                return
             if self._offline_view_active or self._analysis_plot_active:
                 mode = "raw"
             else:
