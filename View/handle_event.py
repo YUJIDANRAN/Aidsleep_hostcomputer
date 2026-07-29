@@ -870,6 +870,7 @@ class MultiChannelEegView(QtWidgets.QWidget):
             for _ in range(EEG_MULTI_CHANNEL_COUNT)
         ]
         self._mode = "raw"
+        self._active_channels: tuple[int, ...] = tuple(range(EEG_MULTI_CHANNEL_COUNT))
         self._last_config: tuple = ()
 
     def setGeometry(self, rect: QtCore.QRect) -> None:  # type: ignore[override]
@@ -882,18 +883,23 @@ class MultiChannelEegView(QtWidgets.QWidget):
 
     def _layout_views(self) -> None:
         gap = 6
-        rows = EEG_MULTI_CHANNEL_COUNT
+        active = getattr(self, "_active_channels", tuple(range(EEG_MULTI_CHANNEL_COUNT)))
+        rows = max(1, len(active))
         width = max(1, self.width())
         height = max(1, self.height())
         cell_h = max(1, (height - gap * (rows - 1)) // rows)
+        active_set = set(active)
+        visible_row = 0
         for index, view in enumerate(self._views):
-            y = index * (cell_h + gap)
-            if index == rows - 1:
-                cell_height = max(1, height - y)
-            else:
-                cell_height = cell_h
+            if index not in active_set:
+                view.hide()
+                continue
+            y = visible_row * (cell_h + gap)
+            cell_height = max(1, height - y) if visible_row == rows - 1 else cell_h
             view.setGeometry(QtCore.QRect(0, y, width, cell_height))
+            view.show()
             view.refresh_layout()
+            visible_row += 1
 
     def configure_display(
         self,
@@ -908,15 +914,20 @@ class MultiChannelEegView(QtWidgets.QWidget):
         y_axis_label: str = "Amplitude",
         min_y_amp: float = MIN_Y_AMP,
         max_y_amp: float = MAX_Y_AMP,
+        active_channels: Optional[Iterable[int]] = None,
     ) -> None:
-        config = (mode, sample_rate, max_points, line_color, fixed_y_axis, y_mid, y_amp, y_axis_label, min_y_amp, max_y_amp)
+        channels = tuple(active_channels) if active_channels is not None else tuple(range(EEG_MULTI_CHANNEL_COUNT))
+        if not channels:
+            channels = (0,)
+        self._active_channels = tuple(ch for ch in channels if 0 <= ch < EEG_MULTI_CHANNEL_COUNT)
+        config = (mode, sample_rate, max_points, line_color, fixed_y_axis, y_mid, y_amp, y_axis_label, min_y_amp, max_y_amp, self._active_channels)
         if config == self._last_config:
             return
         self._mode = mode
         self._last_config = config
-        for index, view in enumerate(self._views, start=1):
+        for index, view in enumerate(self._views):
             view.configure_display(
-                legend=f"CH{index} {mode.upper()}",
+                legend=f"CH{index + 1} {mode.upper()}",
                 sample_rate=sample_rate,
                 max_points=max_points,
                 line_color=line_color,
@@ -928,6 +939,7 @@ class MultiChannelEegView(QtWidgets.QWidget):
                 min_y_amp=min_y_amp,
                 max_y_amp=max_y_amp,
             )
+        self._layout_views()
 
     def clear(self) -> None:
         for view in self._views:
@@ -940,9 +952,10 @@ class MultiChannelEegView(QtWidgets.QWidget):
 
     def append_channel_values_batch(self, batches: Iterable[Iterable[float]]) -> None:
         per_channel = [[] for _ in range(EEG_MULTI_CHANNEL_COUNT)]
+        active_set = set(self._active_channels)
         for values in batches:
             for index, value in enumerate(values):
-                if index < EEG_MULTI_CHANNEL_COUNT:
+                if index < EEG_MULTI_CHANNEL_COUNT and index in active_set:
                     per_channel[index].append(value)
         for index, values in enumerate(per_channel):
             if values:
@@ -1062,6 +1075,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "y": self.ui.checkBox_14,
             "z": self.ui.checkBox_15,
         }
+        self._eeg_channel_checkboxes = {
+            0: self.ui.checkBox_eeg_ch1,
+            1: self.ui.checkBox_eeg_ch2,
+            2: self.ui.checkBox_eeg_ch3,
+            3: self.ui.checkBox_eeg_ch4,
+            4: self.ui.checkBox_eeg_ch5,
+            5: self.ui.checkBox_eeg_ch6,
+        }
 
         self._osc_graphics_view = QtWidgets.QGraphicsView(self.ui.page_2)  ## 振子页占位
         self._osc_graphics_view.setGeometry(self.ui.graphicsView.geometry())
@@ -1112,10 +1133,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.comboBox_eeg_channel_mode.currentIndexChanged.connect(
             self._on_eeg_channel_mode_changed
         )
-        self.ui.comboBox_eeg_display_channel.currentIndexChanged.connect(
-            self._on_eeg_display_channel_changed
-        )
-        self.ui.comboBox_eeg_display_channel.setEnabled(False)
+        for channel, checkbox in self._eeg_channel_checkboxes.items():
+            checkbox.toggled.connect(
+                lambda checked, ch=channel: self._on_eeg_channel_checkbox_toggled(ch, checked)
+            )
+        self._set_eeg_channel_checkboxes_enabled(False)
         for mode, checkbox in self._osc_display_checkboxes.items():
             checkbox.toggled.connect(
                 lambda checked, m=mode: self._on_osc_checkbox_toggled(m, checked)
@@ -1266,11 +1288,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         gap = 10
         bottom_h = max(175, min(225, int(height * 0.2)))
         top_h = max(320, height - bottom_h - margin * 2 - gap)
-        right_w = max(420, min(720, int(width * 0.34)))
+        right_w = max(620, min(760, int(width * 0.36)))
         left_w = width - right_w - margin * 2 - gap
         if left_w < 520:
             left_w = max(320, int(width * 0.58))
-            right_w = max(280, width - left_w - margin * 2 - gap)
+            right_w = max(620, width - left_w - margin * 2 - gap)
 
         plot_rect = QtCore.QRect(margin, margin, left_w, top_h)
         self.ui.stackedWidget.setGeometry(plot_rect)
@@ -2766,18 +2788,25 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _is_multi_eeg_mode(self) -> bool:
         return self._eeg_channel_mode == "multi"
 
-    def _selected_eeg_display_channel(self) -> int:
-        """Return -1 for all channels, or 0~5 for CH1~CH6 in six-channel mode."""
+    def _selected_eeg_channels(self) -> tuple[int, ...]:
         if not self._is_multi_eeg_mode():
-            return 0
-        index = self.ui.comboBox_eeg_display_channel.currentIndex()
-        if index <= 0:
-            return -1
-        return min(index - 1, EEG_MULTI_CHANNEL_COUNT - 1)
+            return (0,)
+        selected = tuple(
+            channel
+            for channel, checkbox in self._eeg_channel_checkboxes.items()
+            if checkbox.isChecked()
+        )
+        return selected or (0,)
+
+    def _set_eeg_channel_checkboxes_enabled(self, enabled: bool) -> None:
+        for channel, checkbox in self._eeg_channel_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setEnabled(enabled)
+            checkbox.setChecked(enabled or channel == 0)
+            checkbox.blockSignals(False)
 
     def _show_current_eeg_waveform(self) -> None:
-        show_all_channels = self._is_multi_eeg_mode() and self._selected_eeg_display_channel() < 0
-        if show_all_channels:
+        if self._is_multi_eeg_mode():
             self._waveform.hide()
             self._sync_multi_waveform_geometry()
             self._multi_waveform.show()
@@ -2794,19 +2823,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if mode == self._eeg_channel_mode:
             return
         self._eeg_channel_mode = mode
-        self.ui.comboBox_eeg_display_channel.setEnabled(mode == "multi")
-        if mode == "single":
-            self.ui.comboBox_eeg_display_channel.blockSignals(True)
-            self.ui.comboBox_eeg_display_channel.setCurrentIndex(0)
-            self.ui.comboBox_eeg_display_channel.blockSignals(False)
+        self._set_eeg_channel_checkboxes_enabled(mode == "multi")
         self._reset_eeg_display_after_channel_change()
         if self._link is not None:
             self._link.set_channel_count(EEG_MULTI_CHANNEL_COUNT if mode == "multi" else 1)
         self._log("EEG serial protocol switched to six-channel" if mode == "multi" else "EEG serial protocol switched to single-channel")
 
-    @QtCore.pyqtSlot(int)
-    def _on_eeg_display_channel_changed(self, index: int) -> None:
+    @QtCore.pyqtSlot(int, bool)
+    def _on_eeg_channel_checkbox_toggled(self, channel: int, checked: bool) -> None:
         if not self._is_multi_eeg_mode():
+            return
+        if not self._selected_eeg_channels():
+            checkbox = self._eeg_channel_checkboxes[channel]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
             return
         self._reset_eeg_display_after_channel_change()
 
@@ -2993,7 +3024,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._eeg_base_legend = legend
         if mode == "alpha":
             legend = self._alpha_reject_status_legend(legend)
-        if self._is_multi_eeg_mode() and self._selected_eeg_display_channel() < 0:
+        if self._is_multi_eeg_mode():
+            selected_channels = self._selected_eeg_channels()
             self._multi_waveform.configure_display(
                 mode=mode,
                 sample_rate=RAW_DISPLAY_RATE,
@@ -3004,14 +3036,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 y_amp=y_amp,
                 min_y_amp=MIN_Y_AMP,
                 max_y_amp=MAX_Y_AMP,
+                active_channels=selected_channels,
             )
-            title = title.replace("CH1", "CH1-CH6")
+            channel_text = "+".join(f"CH{channel + 1}" for channel in selected_channels)
+            title = title.replace("CH1", channel_text)
         else:
-            selected_channel = self._selected_eeg_display_channel()
-            channel_label = f"CH{selected_channel + 1}" if self._is_multi_eeg_mode() else "CH1"
-            if self._is_multi_eeg_mode():
-                legend = legend.replace("CH1", channel_label)
-                title = title.replace("CH1", channel_label)
             self._waveform.configure_display(
                 legend=legend,
                 sample_rate=RAW_DISPLAY_RATE,
@@ -3431,9 +3460,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 mode = self._current_display_mode()
                 self._apply_display_mode(mode)
                 band = None if mode == "raw" else mode
-                selected_channel = self._selected_eeg_display_channel()
                 plot_batches: list[list[float]] = []
-                plot_values: list[float] = []
                 for sample in samples:
                     channels = sample.channels[:EEG_MULTI_CHANNEL_COUNT]
                     if len(channels) < EEG_MULTI_CHANNEL_COUNT:
@@ -3451,15 +3478,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                         ]
                     if self._decim_counter >= RAW_DECIM_FACTOR:
                         self._decim_counter = 0
-                        if selected_channel < 0:
-                            plot_batches.append(values)
-                        else:
-                            plot_values.append(values[selected_channel])
-                if self._is_waveform_display_active():
-                    if selected_channel < 0 and plot_batches:
-                        self._multi_waveform.append_channel_values_batch(plot_batches)
-                    elif selected_channel >= 0 and plot_values:
-                        self._waveform.append_alphas_plain(plot_values)
+                        plot_batches.append(values)
+                if self._is_waveform_display_active() and plot_batches:
+                    self._multi_waveform.append_channel_values_batch(plot_batches)
                 self._no_data_ticks = 0
                 return
             if self._offline_view_active or self._analysis_plot_active:
