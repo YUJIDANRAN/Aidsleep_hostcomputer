@@ -185,6 +185,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._visible: List[str] = list(CHANNEL_ORDER)
         self._source_name = ""
         self._axes: List = []
+        self._remove_mask: Optional[np.ndarray] = None
         super().__init__(parent, empty_message="选择 CSV 并点击「加载」")
 
     @property
@@ -204,6 +205,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._channels.clear()
         self._source_name = ""
         self._axes = []
+        self._remove_mask = None
         self._draw_empty("选择 CSV 并点击「加载」")
 
     def load_raw(
@@ -213,8 +215,12 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         *,
         source_name: str = "",
         time_offset_s: float = 0.0,
+        remove_mask: Optional[np.ndarray] = None,
     ) -> tuple[int, float]:
-        """用已截取/拼接的 raw 填充视图；横轴 = time_offset_s + 局部时间。"""
+        """用已截取/拼接的 raw 填充视图；横轴 = time_offset_s + 局部时间。
+
+        remove_mask: 与 raw 等长的布尔数组，True=坏段；在 raw 轴画红色高亮。
+        """
         raw_arr = np.asarray(raw, dtype=np.float64)
         if raw_arr.size < 8:
             raise ValueError(f"有效样本过少 ({raw_arr.size})")
@@ -227,6 +233,15 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._channels = {"raw": raw_arr, **bands}
         self._source_name = source_name or "offline"
         self._visible = ["raw"]
+        if remove_mask is None:
+            self._remove_mask = None
+        else:
+            mask = np.asarray(remove_mask, dtype=bool).reshape(-1)
+            if mask.size != n:
+                raise ValueError(
+                    f"remove_mask 长度 {mask.size} 与 raw {n} 不一致"
+                )
+            self._remove_mask = mask
         self.redraw()
         self._enable_pan()
         return n, self._sample_rate
@@ -251,6 +266,23 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         else:
             self._draw_empty("请先加载 CSV")
 
+    @staticmethod
+    def _mask_true_spans(mask: np.ndarray) -> List[tuple]:
+        """返回 mask 中连续 True 的 [start, end) 下标列表。"""
+        spans: List[tuple] = []
+        n = int(mask.size)
+        i = 0
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and mask[j]:
+                j += 1
+            spans.append((i, j))
+            i = j
+        return spans
+
     def redraw(self) -> None:
         self._figure.clear()
         self._axes = []
@@ -264,6 +296,16 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         n = len(visible)
         max_pts = _adaptive_max_plot_points(int(self._time_s.size), self._sample_rate)
         axes = self._figure.subplots(n, 1, sharex=True, squeeze=False)
+        reject_spans = (
+            self._mask_true_spans(self._remove_mask)
+            if self._remove_mask is not None and self._remove_mask.size
+            else []
+        )
+        dt = (
+            float(self._time_s[1] - self._time_s[0])
+            if self._time_s.size >= 2
+            else (1.0 / max(self._sample_rate, 1.0))
+        )
         for i, name in enumerate(visible):
             ax = axes[i, 0]
             t, y = _downsample_pair(
@@ -271,6 +313,12 @@ class OfflineRhythmStackView(_MatplotlibHostView):
             )
             color = CHANNEL_COLORS.get(name, "#1976D2")
             ax.plot(t, y, color=color, linewidth=0.8)
+            if name == "raw" and reject_spans:
+                t_full = self._time_s
+                for i0, i1 in reject_spans:
+                    t0 = float(t_full[i0])
+                    t1 = float(t_full[i1 - 1]) + dt
+                    ax.axvspan(t0, t1, color="#E53935", alpha=0.28, lw=0)
             ax.set_ylabel(CHANNEL_LABELS.get(name, name), fontsize=9)
             ax.grid(True, which="major", alpha=0.25)
             ax.tick_params(labelsize=8)
@@ -278,8 +326,10 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         axes[-1, 0].set_xlabel("Time (s)", fontsize=9)
         self._bind_time_axis_ticks(self._axes)
         title = self._source_name or "offline"
+        mark_tip = "  |  红带=坏段" if reject_spans else ""
         self._figure.suptitle(
-            f"{title}  |  {self._sample_rate:.0f} Hz  |  raw 必显，勾选叠加节律",
+            f"{title}  |  {self._sample_rate:.0f} Hz  |  raw 必显，勾选叠加节律"
+            f"{mark_tip}",
             fontsize=10,
         )
         self._figure.tight_layout()

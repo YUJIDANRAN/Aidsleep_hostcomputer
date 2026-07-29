@@ -676,6 +676,59 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
               </property>
              </widget>
             </item>
+            <item row="3" column="0" colspan="2">
+             <widget class="QCheckBox" name="checkBox_minute_abs">
+              <property name="toolTip">
+               <string>勾选后在左侧显示按「窗长」切片的五节律绝对功率曲线</string>
+              </property>
+              <property name="text">
+               <string>绝对功率</string>
+              </property>
+             </widget>
+            </item>
+            <item row="3" column="2" colspan="3">
+             <widget class="QCheckBox" name="checkBox_minute_rel">
+              <property name="toolTip">
+               <string>勾选后在左侧显示按「窗长」切片的五节律相对功率曲线</string>
+              </property>
+              <property name="text">
+               <string>相对功率</string>
+              </property>
+             </widget>
+            </item>
+            <item row="4" column="0">
+             <widget class="QLabel" name="label_power_window">
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+              <property name="text">
+               <string>窗长(秒)</string>
+              </property>
+             </widget>
+            </item>
+            <item row="4" column="1" colspan="2">
+             <widget class="QLineEdit" name="lineEdit_power_window_sec">
+              <property name="toolTip">
+               <string>绝对/相对功率按此时长切片：填30→每30秒一窗；填60→每60秒一窗。留空同60。</string>
+              </property>
+              <property name="text">
+               <string>60</string>
+              </property>
+              <property name="placeholderText">
+               <string>默认60</string>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="0" colspan="5">
+             <widget class="QCheckBox" name="checkBox_reject_mask_power">
+              <property name="toolTip">
+               <string>勾选后：离线查看 *_full 时用红色标出坏段；绝对/相对功率在连续好段内按窗长计算，不跨坏段硬拼接。</string>
+              </property>
+              <property name="text">
+               <string>标红坏段·功率不拼接</string>
+              </property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

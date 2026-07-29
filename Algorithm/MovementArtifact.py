@@ -27,7 +27,7 @@ EEG_SEGMENT_MAX_PTP = 500.0
 
 # 原始 1 秒片段偏离中位数坏段阈值：单点离该秒中位数太远时标红。
 # 主要抓特别大的尖峰/跳变；调小会更严格。
-EEG_SEGMENT_MAX_DEVIATION = 300.0
+EEG_SEGMENT_MAX_DEVIATION = 250.0
 
 # 自适应可疑段倍率：阈值 = 全部 1 秒片段的 median + N*MAD。
 # 同时作用于 EEG_SUSPICIOUS_MIN_PTP 和 EEG_SUSPICIOUS_MIN_DIFF 对应规则。
@@ -42,7 +42,7 @@ EEG_SUSPICIOUS_MIN_PTP = 200.0
 # 原始 1 秒内最大相邻跳变可疑段最低阈值。
 # 实际阈值取 max(该值, median + EEG_ADAPTIVE_MAD_MULT*MAD)。
 # 主要抓短促尖峰、突然跳点；调小会更容易标黄。
-EEG_SUSPICIOUS_MIN_DIFF = 80.0
+EEG_SUSPICIOUS_MIN_DIFF = 60.0
 
 # δ(0.5-4 Hz)滤波后 RMS 可疑段 MAD 倍率。
 # 阈值候选 = delta_rms_median + N*delta_rms_MAD。

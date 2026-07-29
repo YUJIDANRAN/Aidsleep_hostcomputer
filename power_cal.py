@@ -463,14 +463,77 @@ def _band_power_from_psd(
     return float(trapezoid(psd[mask], freqs[mask]))
 
 
+def trim_filter_edges(
+    filtered: np.ndarray,
+    sample_rate: float,
+    edge_trim_sec: float,
+    *,
+    min_keep_sec: float = 1.0,
+) -> np.ndarray:
+    """丢掉 filtfilt 两端暂态区；若去边后过短则原样返回。"""
+    arr = np.asarray(filtered, dtype=np.float64).reshape(-1)
+    trim = float(edge_trim_sec)
+    fs = float(sample_rate)
+    if not np.isfinite(trim) or trim <= 0 or not np.isfinite(fs) or fs <= 0:
+        return arr
+    n_trim = int(round(trim * fs))
+    if n_trim <= 0:
+        return arr
+    min_keep = max(8, int(round(max(0.0, float(min_keep_sec)) * fs)))
+    if arr.size - 2 * n_trim < min_keep:
+        return arr
+    return arr[n_trim : arr.size - n_trim]
+
+
 def compute_band_powers(
     signal: np.ndarray,
     sample_rate: float = DEFAULT_SAMPLE_RATE,
     welch_seconds: float = 2.0,
+    *,
+    edge_trim_sec: float = 0.0,
 ) -> PowerAnalysis:
-    """对滤波后信号做 Welch PSD，积分得到各频段绝对功率与相对功率。"""
+    """对滤波后信号做 Welch PSD，积分得到各频段绝对功率与相对功率。
+
+    edge_trim_sec>0 时，带通后丢掉两端此时长，减轻零相位滤波边界暂态。
+    """
+    analysis, _rms, _ptp = compute_band_powers_with_metrics(
+        signal,
+        sample_rate,
+        welch_seconds,
+        edge_trim_sec=edge_trim_sec,
+    )
+    return analysis
+
+
+def compute_band_powers_with_metrics(
+    signal: np.ndarray,
+    sample_rate: float = DEFAULT_SAMPLE_RATE,
+    welch_seconds: float = 2.0,
+    *,
+    edge_trim_sec: float = 0.0,
+) -> tuple[PowerAnalysis, float, float]:
+    """同 compute_band_powers，额外返回去边后滤波波形的 RMS 与峰峰值。"""
     filtered = bandpass_filter(signal, sample_rate)
+    filtered = trim_filter_edges(
+        filtered,
+        sample_rate,
+        edge_trim_sec,
+        min_keep_sec=max(0.5, float(welch_seconds)),
+    )
+    if filtered.size == 0:
+        rms = 0.0
+        ptp = 0.0
+    else:
+        rms = float(np.sqrt(np.mean(np.square(filtered))))
+        ptp = float(np.ptp(filtered))
     nperseg = min(len(filtered), max(int(sample_rate * welch_seconds), 256))
+    if filtered.size < 8:
+        empty_f = np.zeros(0, dtype=np.float64)
+        absolute = {name: 0.0 for name in EEG_BANDS}
+        relative = {name: 0.0 for name in EEG_BANDS}
+        result = BandPowerResult(absolute=absolute, relative=relative, total_power=0.0)
+        return PowerAnalysis(result=result, freqs=empty_f, psd=empty_f), rms, ptp
+
     freqs, psd = welch(filtered, fs=sample_rate, nperseg=nperseg)
 
     absolute: Dict[str, float] = {}
@@ -484,7 +547,20 @@ def compute_band_powers(
         relative = {name: absolute[name] / total for name in EEG_BANDS}
 
     result = BandPowerResult(absolute=absolute, relative=relative, total_power=total)
-    return PowerAnalysis(result=result, freqs=freqs, psd=psd)
+    return PowerAnalysis(result=result, freqs=freqs, psd=psd), rms, ptp
+
+
+def filtered_window_metrics(
+    signal: np.ndarray,
+    sample_rate: float,
+    *,
+    edge_trim_sec: float = 0.0,
+) -> tuple[float, float]:
+    """返回窗内带通（可选去边）后的 RMS 与峰峰值，供质量门控。"""
+    _analysis, rms, ptp = compute_band_powers_with_metrics(
+        signal, sample_rate, edge_trim_sec=edge_trim_sec
+    )
+    return rms, ptp
 
 
 def compute_fft_spectrum(

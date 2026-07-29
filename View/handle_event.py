@@ -40,6 +40,7 @@ from power_cal import (  ## 节律滤波与频段定义
 from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     RealtimeAlphaThresholdRejector,
     RealtimeQualityGate,
+    build_raw_remove_mask,
     build_threshold_rejection,
     clean_raw_signal,
 )
@@ -1385,11 +1386,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raw, fs, title, time_offset_s = self._load_offline_selected_slice(
                 path, minute_range
             )
+            remove_mask = None
+            if self._want_reject_mask_power() and self._is_offline_full_csv(path):
+                quality = build_threshold_rejection(
+                    raw.astype(np.float64), float(fs)
+                )
+                remove_mask = build_raw_remove_mask(
+                    quality, int(raw.size), remove_suspicious=True
+                )
+                n_bad = int(np.count_nonzero(remove_mask))
+                title = f"{title} · 坏段标红({n_bad}点)"
             n, fs = self._offline_view.load_raw(
                 raw,
                 fs,
                 source_name=title,
                 time_offset_s=time_offset_s,
+                remove_mask=remove_mask,
             )
         except Exception as exc:
             self._log(f"离线加载失败 ({path.name}): {exc}")
@@ -1416,9 +1428,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             if minute_range is not None
             else ""
         )
+        mark_tip = "；红带标注坏段" if remove_mask is not None else ""
         self._log(
             f"离线查看已加载: {title}（{n} 点 @ {fs:.0f} Hz"
-            f"{range_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
+            f"{range_tip}{mark_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
         )
         self._update_status_bar()
 
@@ -1639,27 +1652,93 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "用当前填写的段时间，在左侧显示区绘制单段功率或分段对比图"
         )
 
-        if not hasattr(self.ui, "checkBox_minute_abs"):
-            self.ui.checkBox_minute_abs = QtWidgets.QCheckBox(
-                "绝对功率", self.ui.groupBox_compare
-            )
-            self.ui.checkBox_minute_abs.setObjectName("checkBox_minute_abs")
-            self.ui.checkBox_minute_abs.setToolTip(
-                "勾选后在左侧显示每分钟五节律绝对功率曲线；"
-                "长时多 chunk 会先按序号拼接再计算"
-            )
-            self.ui.gridLayout_compare.addWidget(self.ui.checkBox_minute_abs, 3, 0, 1, 2)
-            self.ui.checkBox_minute_rel = QtWidgets.QCheckBox(
-                "相对功率", self.ui.groupBox_compare
-            )
-            self.ui.checkBox_minute_rel.setObjectName("checkBox_minute_rel")
-            self.ui.checkBox_minute_rel.setToolTip(
-                "勾选后在左侧显示每分钟五节律相对功率曲线；"
-                "可与「绝对功率」同时勾选（上下两图）"
-            )
-            self.ui.gridLayout_compare.addWidget(self.ui.checkBox_minute_rel, 3, 2, 1, 3)
-            self.ui.checkBox_minute_abs.toggled.connect(self._on_minute_power_toggled)
-            self.ui.checkBox_minute_rel.toggled.connect(self._on_minute_power_toggled)
+        self.ui.checkBox_minute_abs.setToolTip(
+            "勾选后在左侧显示按「窗长」切片的五节律绝对功率曲线；"
+            "长时多 chunk 会先按序号拼接再计算"
+        )
+        self.ui.checkBox_minute_rel.setToolTip(
+            "勾选后在左侧显示按「窗长」切片的五节律相对功率曲线；"
+            "可与「绝对功率」同时勾选（上下两图）"
+        )
+        if not self.ui.lineEdit_power_window_sec.text().strip():
+            self.ui.lineEdit_power_window_sec.setText("60")
+        self.ui.lineEdit_power_window_sec.setPlaceholderText("默认60")
+        self.ui.lineEdit_power_window_sec.setToolTip(
+            "绝对/相对功率按此时长切片：填 30 → 每 30 秒一窗；"
+            "填 60 → 每 60 秒一窗。留空同 60。"
+        )
+        self.ui.checkBox_reject_mask_power.setToolTip(
+            "勾选后：离线查看 *_full 时用红色标出坏段；"
+            "绝对/相对功率在连续好段内按窗长计算，不跨坏段硬拼接。"
+        )
+        try:
+            self.ui.checkBox_minute_abs.toggled.disconnect()
+        except TypeError:
+            pass
+        try:
+            self.ui.checkBox_minute_rel.toggled.disconnect()
+        except TypeError:
+            pass
+        try:
+            self.ui.lineEdit_power_window_sec.editingFinished.disconnect()
+        except TypeError:
+            pass
+        try:
+            self.ui.checkBox_reject_mask_power.toggled.disconnect()
+        except TypeError:
+            pass
+        self.ui.checkBox_minute_abs.toggled.connect(self._on_minute_power_toggled)
+        self.ui.checkBox_minute_rel.toggled.connect(self._on_minute_power_toggled)
+        self.ui.lineEdit_power_window_sec.editingFinished.connect(
+            self._on_power_window_sec_edited
+        )
+        self.ui.checkBox_reject_mask_power.toggled.connect(
+            self._on_reject_mask_power_toggled
+        )
+
+    def _want_reject_mask_power(self) -> bool:
+        return bool(self.ui.checkBox_reject_mask_power.isChecked())
+
+    @QtCore.pyqtSlot(bool)
+    def _on_reject_mask_power_toggled(self, _checked: bool = False) -> None:
+        """标红/不拼接开关：刷新离线红带；若已勾功率则重算。"""
+        if self._offline_view_active and self._offline_csv_path is not None:
+            self._load_offline_eeg_csv()
+        if (
+            self.ui.checkBox_minute_abs.isChecked()
+            or self.ui.checkBox_minute_rel.isChecked()
+        ):
+            self._on_minute_power_toggled()
+
+    def _read_power_window_sec(self) -> float:
+        """读取功率切片窗长（秒）；非法或空 → 60。"""
+        text = self.ui.lineEdit_power_window_sec.text().strip()
+        if not text:
+            return 60.0
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError("窗长须为数字，例如 30 或 60") from exc
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("窗长须为正数（秒）")
+        if value < 2.0:
+            raise ValueError("窗长过短（建议 ≥ 2 秒，以便 Welch 估计）")
+        return float(value)
+
+    @QtCore.pyqtSlot()
+    def _on_power_window_sec_edited(self) -> None:
+        """窗长改完后，若已勾选绝对/相对功率则按新窗长重算。"""
+        try:
+            self._read_power_window_sec()
+        except ValueError as exc:
+            self._log(f"窗长无效: {exc}")
+            return
+        want = bool(
+            self.ui.checkBox_minute_abs.isChecked()
+            or self.ui.checkBox_minute_rel.isChecked()
+        )
+        if want:
+            self._on_minute_power_toggled()
 
     def _compare_segment_edit_pairs(self) -> List[Tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]]:
         return [
@@ -1913,54 +1992,67 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(bool)
     def _on_minute_power_toggled(self, _checked: bool = False) -> None:
-        want_abs = bool(
-            getattr(self.ui, "checkBox_minute_abs", None)
-            and self.ui.checkBox_minute_abs.isChecked()
-        )
-        want_rel = bool(
-            getattr(self.ui, "checkBox_minute_rel", None)
-            and self.ui.checkBox_minute_rel.isChecked()
-        )
+        want_abs = bool(self.ui.checkBox_minute_abs.isChecked())
+        want_rel = bool(self.ui.checkBox_minute_rel.isChecked())
         if not want_abs and not want_rel:
             if self._analysis_plot_active:
                 self._analysis_plot.clear()
-                self._log("已取消每分钟功率图显示（未勾选绝对/相对功率）")
+                self._log("已取消功率窗图显示（未勾选绝对/相对功率）")
             return
 
         source = self._resolve_minute_power_source()
         if source is None:
-            self._log("未选择数据，无法绘制每分钟功率图")
+            self._log("未选择数据，无法绘制功率窗图")
             # 取消勾选，避免反复弹窗
-            for name in ("checkBox_minute_abs", "checkBox_minute_rel"):
-                cb = getattr(self.ui, name, None)
-                if cb is not None:
-                    cb.blockSignals(True)
-                    cb.setChecked(False)
-                    cb.blockSignals(False)
+            for cb in (self.ui.checkBox_minute_abs, self.ui.checkBox_minute_rel):
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.blockSignals(False)
             return
 
+        try:
+            window_sec = self._read_power_window_sec()
+        except ValueError as exc:
+            self._log(f"窗长无效: {exc}")
+            return
+
+        no_splice = self._want_reject_mask_power()
         try:
             from LongRecordMinuteBandPower import (
                 plot_minute_band_powers,
                 prepare_cleaned_minute_powers,
             )
 
-            minutes, absolute, relative, meta = prepare_cleaned_minute_powers(source)
+            minutes, absolute, relative, meta = prepare_cleaned_minute_powers(
+                source, window_sec=window_sec, no_splice=no_splice
+            )
         except Exception as exc:
-            self._log(f"每分钟功率计算失败: {exc}")
+            self._log(f"功率窗计算失败: {exc}")
             return
 
         if meta["n_minutes"] <= 0:
-            self._log("有效数据不足 1 分钟，无法绘制每分钟功率图")
-            return
+            has_regions = bool(
+                no_splice
+                and (
+                    meta.get("bad_spans")
+                    or meta.get("short_good_spans")
+                    or meta.get("gated_spans")
+                )
+            )
+            if not has_regions:
+                self._log(f"有效数据不足 {window_sec:g} s，无法绘制功率图")
+                return
 
         kinds = []
         if want_abs:
             kinds.append("绝对")
         if want_rel:
             kinds.append("相对")
+        win = float(meta.get("window_sec", window_sec))
+        x_as_time = bool(meta.get("x_as_time_s", False))
+        mode = "不拼接·好段内窗" if no_splice else "剔坏拼接后"
         title = (
-            f"每分钟节律{'/'.join(kinds)}功率（坏段剔除后，N={meta['n_minutes']}）"
+            f"每 {win:g} s 节律{'/'.join(kinds)}功率（{mode}，N={meta['n_minutes']}）"
             f" · {meta['source_desc']}"
         )
         try:
@@ -1970,17 +2062,31 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 relative=relative if want_rel else None,
                 title=title,
                 figure=self._analysis_plot.figure,
+                window_sec=win,
+                x_as_time_s=x_as_time,
+                bad_spans=meta.get("bad_spans") if no_splice else None,
+                short_good_spans=meta.get("short_good_spans") if no_splice else None,
+                gated_spans=meta.get("gated_spans") if no_splice else None,
+                total_duration_s=meta.get("total_duration_s") if no_splice else None,
             )
         except Exception as exc:
-            self._log(f"每分钟功率绘图失败: {exc}")
+            self._log(f"功率窗绘图失败: {exc}")
             return
 
         self._show_analysis_plot_view()
         self._analysis_plot.refresh()
+        n_bad = len(meta.get("bad_spans") or [])
+        n_short = len(meta.get("short_good_spans") or [])
+        n_gated = int(meta.get("n_gated") or 0)
+        region_tip = (
+            f"；坏段 {n_bad} 段，过短 {n_short} 段，门控丢弃 {n_gated} 窗"
+            if no_splice
+            else ""
+        )
         self._log(
-            f"已显示每分钟{'/'.join(kinds)}功率："
-            f"{meta['source_desc']}，N={meta['n_minutes']} 分钟"
-            f"（剔除 {meta['n_removed']} 点）"
+            f"已显示每 {win:g} s {'/'.join(kinds)}功率（{mode}）："
+            f"{meta['source_desc']}，N={meta['n_minutes']} 窗"
+            f"（坏点 {meta['n_removed']}）{region_tip}"
         )
 
     def _show_analysis_plot_view(self) -> None:
@@ -2445,17 +2551,27 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"正常段报告生成失败: {exc}")
 
     def _run_long_record_minute_band_power(self, session_dir: Path) -> None:
-        """长时记录结束：坏段剔除后按分钟算五节律绝对功率，只画一张折线图。"""
+        """长时记录结束：坏段剔除后按窗长算五节律绝对功率，只画一张折线图。"""
         try:
             from LongRecordMinuteBandPower import run_minute_band_power_analysis
 
-            result = run_minute_band_power_analysis(session_dir, save_outputs=True)
+            try:
+                window_sec = self._read_power_window_sec()
+            except ValueError:
+                window_sec = 60.0
+            no_splice = self._want_reject_mask_power()
+            result = run_minute_band_power_analysis(
+                session_dir,
+                save_outputs=True,
+                window_sec=window_sec,
+                no_splice=no_splice,
+            )
             for line in result.report_text.splitlines():
                 self._log(line)
             if result.plot_path is not None:
-                self._log(f"每分钟绝对功率图已保存: {result.plot_path}")
+                self._log(f"功率窗图已保存: {result.plot_path}")
         except Exception as exc:
-            self._log(f"每分钟节律绝对功率分析失败: {exc}")
+            self._log(f"节律功率窗分析失败: {exc}")
 
     def _run_long_record_postprocess(self, session_dir: Path) -> None:
         """长时记录结束后：路径B删减CSV + 正常段报告 + 每分钟绝对功率图。"""
