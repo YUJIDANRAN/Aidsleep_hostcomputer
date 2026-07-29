@@ -11,6 +11,7 @@ import pandas as pd
 from PyQt5 import QtWidgets
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.ticker import MultipleLocator
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -34,6 +35,40 @@ CHANNEL_COLORS = {
     **BAND_COLORS,
 }
 MAX_PLOT_POINTS = 25000
+# 短区间提高上限：约 5 分钟 @500Hz 可接近全分辨率
+MAX_PLOT_POINTS_SHORT = 200000
+
+
+def _adaptive_max_plot_points(n_samples: int, sample_rate: float) -> int:
+    """显示越短，允许的绘图点数越多，短窗尽量少抽点。"""
+    n = max(0, int(n_samples))
+    fs = float(sample_rate) if sample_rate and sample_rate > 0 else float(DEFAULT_SAMPLE_RATE)
+    duration_s = n / fs if fs > 0 else 0.0
+    if duration_s <= 0:
+        return MAX_PLOT_POINTS
+    if duration_s <= 60:  # ≤1 分钟：尽量全点
+        return max(MAX_PLOT_POINTS_SHORT, n)
+    if duration_s <= 180:  # ≤3 分钟（如 12–15）：高分辨率
+        return MAX_PLOT_POINTS_SHORT
+    if duration_s <= 600:  # ≤10 分钟
+        return 80000
+    return MAX_PLOT_POINTS
+
+
+def _time_tick_step_seconds(span_s: float) -> float:
+    """按可见时间跨度选刻度间隔；宽窗用 60 s，放大后加密以保证仍有刻度。"""
+    span = abs(float(span_s))
+    if span <= 0:
+        return 60.0
+    if span > 120:
+        return 60.0
+    if span > 40:
+        return 10.0
+    if span > 15:
+        return 5.0
+    if span > 5:
+        return 1.0
+    return 0.5
 
 
 def load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
@@ -61,11 +96,27 @@ def load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
 def _downsample_pair(
     time_s: np.ndarray, values: np.ndarray, max_points: int = MAX_PLOT_POINTS
 ) -> tuple[np.ndarray, np.ndarray]:
+    """过长时按桶保留 min/max，避免等间隔抽点造成假尖峰/形貌失真。"""
     n = int(values.size)
     if n <= max_points:
         return time_s, values
-    step = int(np.ceil(n / max_points))
-    return time_s[::step], values[::step]
+    n_bins = max(1, max_points // 2)
+    bin_size = int(np.ceil(n / n_bins))
+    out_t: List[float] = []
+    out_y: List[float] = []
+    for start in range(0, n, bin_size):
+        end = min(n, start + bin_size)
+        segment = values[start:end]
+        t_seg = time_s[start:end]
+        i_min = int(np.argmin(segment))
+        i_max = int(np.argmax(segment))
+        if i_min <= i_max:
+            out_t.extend((float(t_seg[i_min]), float(t_seg[i_max])))
+            out_y.extend((float(segment[i_min]), float(segment[i_max])))
+        else:
+            out_t.extend((float(t_seg[i_max]), float(t_seg[i_min])))
+            out_y.extend((float(segment[i_max]), float(segment[i_min])))
+    return np.asarray(out_t, dtype=np.float64), np.asarray(out_y, dtype=np.float64)
 
 
 class _MatplotlibHostView(QtWidgets.QWidget):
@@ -134,6 +185,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._visible: List[str] = list(CHANNEL_ORDER)
         self._source_name = ""
         self._axes: List = []
+        self._remove_mask: Optional[np.ndarray] = None
         super().__init__(parent, empty_message="选择 CSV 并点击「加载」")
 
     @property
@@ -153,21 +205,50 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._channels.clear()
         self._source_name = ""
         self._axes = []
+        self._remove_mask = None
         self._draw_empty("选择 CSV 并点击「加载」")
 
-    def load_file(self, path: Path) -> tuple[int, float]:
-        raw, sample_rate = load_eeg_csv_with_rate(path)
-        bands = extract_band_waveforms(raw, sample_rate)
-        n = int(raw.size)
-        time_s = np.arange(n, dtype=np.float64) / float(sample_rate)
-        self._sample_rate = float(sample_rate)
+    def load_raw(
+        self,
+        raw: np.ndarray,
+        sample_rate: float,
+        *,
+        source_name: str = "",
+        time_offset_s: float = 0.0,
+        remove_mask: Optional[np.ndarray] = None,
+    ) -> tuple[int, float]:
+        """用已截取/拼接的 raw 填充视图；横轴 = time_offset_s + 局部时间。
+
+        remove_mask: 与 raw 等长的布尔数组，True=坏段；在 raw 轴画红色高亮。
+        """
+        raw_arr = np.asarray(raw, dtype=np.float64)
+        if raw_arr.size < 8:
+            raise ValueError(f"有效样本过少 ({raw_arr.size})")
+        fs = float(sample_rate)
+        bands = extract_band_waveforms(raw_arr, fs)
+        n = int(raw_arr.size)
+        time_s = float(time_offset_s) + np.arange(n, dtype=np.float64) / fs
+        self._sample_rate = fs
         self._time_s = time_s
-        self._channels = {"raw": raw.astype(np.float64, copy=False), **bands}
-        self._source_name = path.name
+        self._channels = {"raw": raw_arr, **bands}
+        self._source_name = source_name or "offline"
         self._visible = ["raw"]
+        if remove_mask is None:
+            self._remove_mask = None
+        else:
+            mask = np.asarray(remove_mask, dtype=bool).reshape(-1)
+            if mask.size != n:
+                raise ValueError(
+                    f"remove_mask 长度 {mask.size} 与 raw {n} 不一致"
+                )
+            self._remove_mask = mask
         self.redraw()
         self._enable_pan()
         return n, self._sample_rate
+
+    def load_file(self, path: Path) -> tuple[int, float]:
+        raw, sample_rate = load_eeg_csv_with_rate(path)
+        return self.load_raw(raw, sample_rate, source_name=path.name)
 
     def set_visible_channels(self, names: Sequence[str]) -> None:
         # raw 始终保留在最前
@@ -185,6 +266,23 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         else:
             self._draw_empty("请先加载 CSV")
 
+    @staticmethod
+    def _mask_true_spans(mask: np.ndarray) -> List[tuple]:
+        """返回 mask 中连续 True 的 [start, end) 下标列表。"""
+        spans: List[tuple] = []
+        n = int(mask.size)
+        i = 0
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and mask[j]:
+                j += 1
+            spans.append((i, j))
+            i = j
+        return spans
+
     def redraw(self) -> None:
         self._figure.clear()
         self._axes = []
@@ -196,21 +294,61 @@ class OfflineRhythmStackView(_MatplotlibHostView):
             return
 
         n = len(visible)
+        max_pts = _adaptive_max_plot_points(int(self._time_s.size), self._sample_rate)
         axes = self._figure.subplots(n, 1, sharex=True, squeeze=False)
+        reject_spans = (
+            self._mask_true_spans(self._remove_mask)
+            if self._remove_mask is not None and self._remove_mask.size
+            else []
+        )
+        dt = (
+            float(self._time_s[1] - self._time_s[0])
+            if self._time_s.size >= 2
+            else (1.0 / max(self._sample_rate, 1.0))
+        )
         for i, name in enumerate(visible):
             ax = axes[i, 0]
-            t, y = _downsample_pair(self._time_s, self._channels[name])
+            t, y = _downsample_pair(
+                self._time_s, self._channels[name], max_points=max_pts
+            )
             color = CHANNEL_COLORS.get(name, "#1976D2")
             ax.plot(t, y, color=color, linewidth=0.8)
+            if name == "raw" and reject_spans:
+                t_full = self._time_s
+                for i0, i1 in reject_spans:
+                    t0 = float(t_full[i0])
+                    t1 = float(t_full[i1 - 1]) + dt
+                    ax.axvspan(t0, t1, color="#E53935", alpha=0.28, lw=0)
             ax.set_ylabel(CHANNEL_LABELS.get(name, name), fontsize=9)
-            ax.grid(True, alpha=0.25)
+            ax.grid(True, which="major", alpha=0.25)
             ax.tick_params(labelsize=8)
             self._axes.append(ax)
         axes[-1, 0].set_xlabel("Time (s)", fontsize=9)
+        self._bind_time_axis_ticks(self._axes)
         title = self._source_name or "offline"
+        mark_tip = "  |  红带=坏段" if reject_spans else ""
         self._figure.suptitle(
-            f"{title}  |  {self._sample_rate:.0f} Hz  |  raw 必显，勾选叠加节律",
+            f"{title}  |  {self._sample_rate:.0f} Hz  |  raw 必显，勾选叠加节律"
+            f"{mark_tip}",
             fontsize=10,
         )
         self._figure.tight_layout()
         self._canvas.draw_idle()
+
+    def _bind_time_axis_ticks(self, axes: Sequence) -> None:
+        """缩放/平移后仍保持横轴刻度可见（宽窗 60 s，缩放过细则加密）。"""
+        if not axes:
+            return
+
+        def _apply(_ax=None) -> None:
+            ref = axes[-1]
+            x0, x1 = ref.get_xlim()
+            step = _time_tick_step_seconds(x1 - x0)
+            locator = MultipleLocator(step)
+            for ax in axes:
+                ax.xaxis.set_major_locator(locator)
+                ax.grid(True, which="major", alpha=0.25)
+
+        _apply()
+        # sharex：挂在任一轴即可，缩放工具栏会触发 xlim_changed
+        axes[-1].callbacks.connect("xlim_changed", _apply)
