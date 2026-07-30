@@ -37,6 +37,7 @@ SAMPLES_PER_SYNC_GROUP = SYNC_CNT_WRAP // SYNC_CNT_STEP  ## 16 点/组
 CH1_BYTES_ON_WIRE = 2
 CH2_BYTES_ON_WIRE = 0  ## 仅 CH1=0；若固件仍发 CH2 则改为 2
 WIRE_BYTES_PER_TICK = CH1_BYTES_ON_WIRE + CH2_BYTES_ON_WIRE
+DUAL_CHANNEL_COUNT = 2
 MULTI_CHANNEL_COUNT = 6
 MULTI_BYTES_PER_TICK = MULTI_CHANNEL_COUNT * 2
 MCU_SAMPLE_RATE = 500
@@ -111,8 +112,13 @@ class AdcStreamParser:
         self._channel_count = getattr(self, "_channel_count", 1)
 
     def set_channel_count(self, channel_count: int) -> None:
-        """Switch between single-channel and six-channel wire protocols."""
-        self._channel_count = MULTI_CHANNEL_COUNT if channel_count > 1 else 1
+        """Switch between single-channel, two-channel and six-channel wire protocols."""
+        if channel_count >= MULTI_CHANNEL_COUNT:
+            self._channel_count = MULTI_CHANNEL_COUNT
+        elif channel_count >= DUAL_CHANNEL_COUNT:
+            self._channel_count = DUAL_CHANNEL_COUNT
+        else:
+            self._channel_count = 1
         self._buf.clear()
         self._ticks_in_group = 0
 
@@ -149,16 +155,23 @@ class AdcStreamParser:
     def _parse_all(self) -> List[AdcSample]:
         out: List[AdcSample] = []
         while self._buf:
+            bytes_per_tick = (
+                self._channel_count * 2
+                if self._channel_count > 1
+                else CH1_BYTES_ON_WIRE + CH2_BYTES_ON_WIRE
+            )
             if self._ticks_in_group == 0:
                 if self._buf[0] != SYNC_BYTE:
                     del self._buf[0]
                     continue
+                if len(self._buf) < 1 + bytes_per_tick:
+                    break
                 del self._buf[0]
             if self._channel_count > 1:
-                if len(self._buf) < MULTI_BYTES_PER_TICK:
+                if len(self._buf) < bytes_per_tick:
                     break
-                payload = bytes(self._buf[:MULTI_BYTES_PER_TICK])
-                del self._buf[:MULTI_BYTES_PER_TICK]
+                payload = bytes(self._buf[:bytes_per_tick])
+                del self._buf[:bytes_per_tick]
                 out.append(AdcSample.from_channel_bytes(payload, self._channel_count))
             else:
                 if len(self._buf) < CH1_BYTES_ON_WIRE:

@@ -120,6 +120,7 @@ RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
 RAW_PLOT_MAX_POINTS = int(RAW_DISPLAY_RATE * RAW_PLOT_WINDOW_SECONDS)  ## 缓冲约 200 点
 SERIAL_POLL_INTERVAL_MS = max(2, int(1000 / MCU_SAMPLE_RATE))  ## 串口轮询 2 ms
 MAX_SAMPLES_PER_POLL = 80  ## 单次 poll 最多处理的原始样本数，防止恢复后积压卡顿
+EEG_DUAL_CHANNEL_COUNT = 2  ## two-channel EEG protocol: CH1~CH2
 EEG_MULTI_CHANNEL_COUNT = 6  ## six-channel EEG protocol: CH1~CH6
 MIN_PLOT_WIDTH = 200  ## 绘图区最小宽度
 MIN_PLOT_HEIGHT = 120  ## 绘图区最小高度
@@ -951,7 +952,7 @@ class MultiChannelEegView(QtWidgets.QWidget):
                     per_channel[index].append(value)
         for index, values in enumerate(per_channel):
             if values:
-                self._views[index].append_alphas_plain(values)
+                self._views[index].append_alphas(values)
 
 
 class Ks1082MainWindow(QtWidgets.QMainWindow):
@@ -1040,7 +1041,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_no_data_ticks = 0  ## 振子无数据 poll 计数
         self._last_status_update = 0.0  ## 上次刷新状态栏时刻
         self._display_mode = ""  ## 当前 EEG 显示模式
-        self._eeg_channel_mode = "single"  ## single | multi
+        self._eeg_channel_mode = "single"  ## single | dual | multi
         self._osc_display_mode = ""  ## 当前振子显示模式
         self._osc_display_kind = "band"  ## band | axis
         self._osc_axis_display_key: tuple[str, ...] = ()
@@ -1111,8 +1112,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.graphicsView.hide()  ## 用自定义波形控件替代占位 QGraphicsView
 
         self.ui.pushButton.pressed.connect(self.on_toggle_capture)  ## 启动/停止按钮
-        self.ui.pushButton_2.pressed.connect(self._switch_to_eeg_view)  ## 节律图页
-        self.ui.pushButton_6.pressed.connect(self._switch_to_osc_view)  ## 振子页
+        self.ui.tabWidget_wave_display.currentChanged.connect(self._on_wave_display_tab_changed)
         self.ui.pushButton_7.pressed.connect(self.on_toggle_audio)  ## 音频开始/停止
         self.ui.pushButton_8.pressed.connect(self.on_toggle_sleep_aid)  ## 助眠闭环 burst
         self._poll_timer = QtCore.QTimer(self)  ## 串口轮询定时器
@@ -1130,7 +1130,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             checkbox.toggled.connect(
                 lambda checked, ch=channel: self._on_eeg_channel_checkbox_toggled(ch, checked)
             )
-        self._set_eeg_channel_checkboxes_enabled(False)
+        self._set_eeg_channel_checkboxes_for_mode()
         for mode, checkbox in self._osc_display_checkboxes.items():
             checkbox.toggled.connect(
                 lambda checked, m=mode: self._on_osc_checkbox_toggled(m, checked)
@@ -1203,11 +1203,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.functionScrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.ui.functionScrollArea.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
 
-        self.ui.pushButton_2.setFixedHeight(34)
-        self.ui.pushButton_6.setFixedHeight(34)
         self.ui.groupBox_eeg_display.setMinimumHeight(210)
         self.ui.groupBox_osc_display.setMinimumHeight(210)
-        self.ui.groupBox_2.setMinimumHeight(285)
+        self.ui.groupBox_2.setMinimumHeight(360)
         self.ui.pushButton_7.setMinimumSize(92, 42)
         self.ui.pushButton_8.setMinimumSize(180, 42)
         self.ui.pushButton_8.setStyleSheet(
@@ -1222,16 +1220,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.lineEdit_13.setMaximumHeight(34)
         self.ui.lineEdit_3.setMaximumHeight(34)
         self.ui.lineEdit_sleep_aid_end.setMaximumHeight(34)
-        self.ui.groupBox_save.setTitle("助眠时段")
-        self.ui.groupBox_save.setToolTip(
+        sleep_window_tip = (
             "仅定时记录生效：时间为记录阶段内秒数（不含 10 s 预热）；"
             f"助眠暖机 {SLEEP_AID_WARMUP_SEC:g}s 会提前启动"
         )
-        self.ui.groupBox_session_name.setTitle("保存命名")
-        self.ui.groupBox_session_name.setToolTip(
+        for widget in (
+            getattr(self.ui, "label_sleep_aid_start", None),
+            self.ui.lineEdit_3,
+            getattr(self.ui, "label_sleep_aid_end", None),
+            self.ui.lineEdit_sleep_aid_end,
+        ):
+            if widget is not None:
+                widget.setToolTip(sleep_window_tip)
+        session_tip = (
             "填写 XXX 时子目录为 时间戳_XXX/；留空则为 时间戳/。"
             "点「保存位置...」选根目录，取消则仍用默认 Result。"
         )
+        for widget in (
+            getattr(self.ui, "label_session_name", None),
+            self.ui.lineEdit_session_name,
+            self.ui.pushButton_save_location,
+        ):
+            if widget is not None:
+                widget.setToolTip(session_tip)
         self.ui.pushButton_save_location.setToolTip(
             "选择保存根目录；取消则默认工程下 Result/"
         )
@@ -1241,12 +1252,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             pass
         self.ui.pushButton_save_location.clicked.connect(self._on_choose_save_location)
 
-        self.ui.pushButton_serial_toggle.setMinimumSize(96, 32)
-        self.ui.pushButton_serial_toggle.setText("打开串口")
-        self.ui.pushButton_serial_toggle.setStyleSheet(
-            "QPushButton { background:#2563EB; color:white; font-weight:bold; border:none; border-radius:6px; }"
-            "QPushButton:hover { background:#1D4ED8; }"
-        )
+        for btn in self._serial_toggle_buttons():
+            btn.setMinimumSize(96, 32)
+            btn.setText("打开串口")
+            btn.setStyleSheet(
+                "QPushButton { background:#2563EB; color:white; font-weight:bold; border:none; border-radius:6px; }"
+                "QPushButton:hover { background:#1D4ED8; }"
+            )
         for edit in (self.ui.lineEdit_5, self.ui.lineEdit_4):
             edit.setMinimumWidth(92)
         self.ui.lineEdit_session_name.setMinimumWidth(120)
@@ -1271,11 +1283,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         except TypeError:
             pass
         self.ui.pushButton_5.clicked.connect(self._on_power_compare_clicked)
-        try:
-            self.ui.pushButton_serial_toggle.clicked.disconnect()
-        except TypeError:
-            pass
-        self.ui.pushButton_serial_toggle.clicked.connect(self._toggle_serial_connection)
+        for btn in self._serial_toggle_buttons():
+            try:
+                btn.clicked.disconnect()
+            except TypeError:
+                pass
+            btn.clicked.connect(self._toggle_serial_connection)
 
         self.ui.pushButton.setMinimumSize(130, 78)
         self.ui.bottomPanel.raise_()
@@ -1672,11 +1685,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         tag = self._read_session_name_tag()
         tag_tip = f"时间戳_{tag}" if tag else "时间戳"
         self._log(f"保存根目录: {root_desc}；子目录命名: {tag_tip}")
-        self.ui.groupBox_session_name.setToolTip(
+        tip = (
             f"当前根目录: {root_desc}\n"
             f"子目录: {tag_tip}/\n"
-            "点「保存位置...」可改目录；命名用上方输入框。"
+            "点「保存位置...」可改目录；命名用同一行输入框。"
         )
+        for widget in (
+            getattr(self.ui, "label_session_name", None),
+            self.ui.lineEdit_session_name,
+            self.ui.pushButton_save_location,
+        ):
+            if widget is not None:
+                widget.setToolTip(tip)
 
     @staticmethod
     def _sanitize_session_name_tag(raw: str) -> str:
@@ -3102,6 +3122,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def _switch_to_eeg_view(self) -> None:
         """切换到 EEG 波形页（stackedWidget page）。"""
+        tabs = getattr(self.ui, "tabWidget_wave_display", None)
+        if tabs is not None and tabs.currentIndex() != 0:
+            tabs.blockSignals(True)
+            tabs.setCurrentIndex(0)
+            tabs.blockSignals(False)
         self.ui.stackedWidget.setCurrentIndex(0)
         self._active_view = "eeg"
         if self._analysis_plot_active:
@@ -3132,23 +3157,34 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._apply_display_mode(self._current_display_mode())
 
     def _is_multi_eeg_mode(self) -> bool:
-        return self._eeg_channel_mode == "multi"
+        return self._eeg_channel_mode in ("dual", "multi")
+
+    def _eeg_protocol_channel_count(self) -> int:
+        if self._eeg_channel_mode == "multi":
+            return EEG_MULTI_CHANNEL_COUNT
+        if self._eeg_channel_mode == "dual":
+            return EEG_DUAL_CHANNEL_COUNT
+        return 1
 
     def _selected_eeg_channels(self) -> tuple[int, ...]:
         if not self._is_multi_eeg_mode():
             return (0,)
+        max_channel = self._eeg_protocol_channel_count()
         selected = tuple(
             channel
             for channel, checkbox in self._eeg_channel_checkboxes.items()
-            if checkbox.isChecked()
+            if channel < max_channel and checkbox.isChecked()
         )
         return selected or (0,)
 
-    def _set_eeg_channel_checkboxes_enabled(self, enabled: bool) -> None:
+    def _set_eeg_channel_checkboxes_for_mode(self) -> None:
+        enabled = self._is_multi_eeg_mode()
+        max_channel = self._eeg_protocol_channel_count()
         for channel, checkbox in self._eeg_channel_checkboxes.items():
+            selectable = enabled and channel < max_channel
             checkbox.blockSignals(True)
-            checkbox.setEnabled(enabled)
-            checkbox.setChecked(enabled or channel == 0)
+            checkbox.setEnabled(selectable)
+            checkbox.setChecked(channel < max_channel if enabled else channel == 0)
             checkbox.blockSignals(False)
 
     def _show_current_eeg_waveform(self) -> None:
@@ -3165,15 +3201,25 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(int)
     def _on_eeg_channel_mode_changed(self, index: int) -> None:
-        mode = "multi" if index == 1 else "single"
+        if index == 2:
+            mode = "multi"
+        elif index == 1:
+            mode = "dual"
+        else:
+            mode = "single"
         if mode == self._eeg_channel_mode:
             return
         self._eeg_channel_mode = mode
-        self._set_eeg_channel_checkboxes_enabled(mode == "multi")
+        self._set_eeg_channel_checkboxes_for_mode()
         self._reset_eeg_display_after_channel_change()
         if self._link is not None:
-            self._link.set_channel_count(EEG_MULTI_CHANNEL_COUNT if mode == "multi" else 1)
-        self._log("EEG serial protocol switched to six-channel" if mode == "multi" else "EEG serial protocol switched to single-channel")
+            self._link.set_channel_count(self._eeg_protocol_channel_count())
+        mode_text = {
+            "single": "single-channel",
+            "dual": "two-channel",
+            "multi": "six-channel",
+        }[mode]
+        self._log(f"EEG serial protocol switched to {mode_text}")
 
     @QtCore.pyqtSlot(int, bool)
     def _on_eeg_channel_checkbox_toggled(self, channel: int, checked: bool) -> None:
@@ -3201,9 +3247,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def _switch_to_osc_view(self) -> None:
         """切换到振子波形页（stackedWidget page_2）。"""
+        tabs = getattr(self.ui, "tabWidget_wave_display", None)
+        if tabs is not None and tabs.currentIndex() != 1:
+            tabs.blockSignals(True)
+            tabs.setCurrentIndex(1)
+            tabs.blockSignals(False)
         self.ui.stackedWidget.setCurrentIndex(1)
         self._active_view = "osc"
         self._refresh_osc_display()
+
+    @QtCore.pyqtSlot(int)
+    def _on_wave_display_tab_changed(self, index: int) -> None:
+        if index == 1:
+            self._switch_to_osc_view()
+        else:
+            self._switch_to_eeg_view()
 
     def _uncheck_osc_axis_checkboxes(self) -> None:
         for checkbox in self._osc_axis_checkboxes.values():
@@ -3532,24 +3590,37 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             f"{settings['bytesize']}{settings['parity']}{settings['stopbits']}"
         )
 
+    def _serial_toggle_buttons(self) -> List[QtWidgets.QPushButton]:
+        return [
+            btn
+            for btn in (
+                getattr(self.ui, "pushButton_serial_toggle", None),
+                getattr(self.ui, "pushButton_osc_serial_toggle", None),
+            )
+            if btn is not None
+        ]
+
     def _refresh_serial_button(self) -> None:
-        btn = getattr(self.ui, "pushButton_serial_toggle", None)
-        if btn is None:
+        buttons = self._serial_toggle_buttons()
+        if not buttons:
             return
         eeg_open = isinstance(self._link, Ks1082Serial) and self._link.is_open
         osc_open = self._osc_link is not None and self._osc_link.is_open
         if eeg_open or osc_open:
-            btn.setText("关闭串口")
-            btn.setStyleSheet(
+            text = "关闭串口"
+            style = (
                 "QPushButton { background:#B91C1C; color:white; font-weight:bold; border:none; border-radius:6px; }"
                 "QPushButton:hover { background:#991B1B; }"
             )
         else:
-            btn.setText("打开串口")
-            btn.setStyleSheet(
+            text = "打开串口"
+            style = (
                 "QPushButton { background:#2563EB; color:white; font-weight:bold; border:none; border-radius:6px; }"
                 "QPushButton:hover { background:#1D4ED8; }"
             )
+        for btn in buttons:
+            btn.setText(text)
+            btn.setStyleSheet(style)
 
     def _toggle_serial_connection(self) -> None:
         eeg_open = isinstance(self._link, Ks1082Serial) and self._link.is_open
@@ -3604,6 +3675,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._link.close()
             self._link = Ks1082Serial(port, timeout=0.05, **serial_settings)
             self._link.open()
+            self._link.set_channel_count(self._eeg_protocol_channel_count())
             self._port = port
             self._log(f"EEG 串口已连接: {self._port} @ {self._format_serial_settings(serial_settings)}")
             self._log(f"EEG 采样率 {self._rhythm.sample_rate:.0f} Hz，显示 {RAW_DISPLAY_RATE} Hz")
@@ -3806,10 +3878,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 mode = self._current_display_mode()
                 self._apply_display_mode(mode)
                 band = None if mode == "raw" else mode
+                expected_channels = self._eeg_protocol_channel_count()
                 plot_batches: list[list[float]] = []
                 for sample in samples:
-                    channels = sample.channels[:EEG_MULTI_CHANNEL_COUNT]
-                    if len(channels) < EEG_MULTI_CHANNEL_COUNT:
+                    channels = sample.channels[:expected_channels]
+                    if len(channels) < expected_channels:
                         continue
                     if self._is_test_recording_phase():
                         self._eeg_raw_record.append(sample.channel1)

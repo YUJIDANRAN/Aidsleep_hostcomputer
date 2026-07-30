@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='UTF-8'?>
 <ui version="4.0">
  <class>MainWindow</class>
  <widget class="QMainWindow" name="MainWindow">
@@ -43,7 +43,7 @@
       </property>
      </widget>
     </widget>
-    <widget class="QWidget" name="page_2"/>
+    <widget class="QWidget" name="page_2" />
    </widget>
    <widget class="QGroupBox" name="groupBox">
     <property name="geometry">
@@ -61,7 +61,7 @@
     margin-top: 14px;
     padding: 8px;
     background: #F8F9FB;
-    font: 10pt &quot;Microsoft YaHei UI&quot;;
+    font: 10pt "Microsoft YaHei UI";
 }
 QGroupBox::title {
     subcontrol-origin: margin;
@@ -76,7 +76,7 @@ QLineEdit, QComboBox, QTimeEdit {
     border: 1px solid #C7CED8;
     border-radius: 4px;
     background: #FFFFFF;
-    font: 9pt &quot;Microsoft YaHei UI&quot;;
+    font: 9pt "Microsoft YaHei UI";
 }
 QPushButton {
     min-height: 30px;
@@ -84,15 +84,18 @@ QPushButton {
     border: 1px solid #B9C1CC;
     border-radius: 5px;
     background: #FFFFFF;
-    font: 9pt &quot;Microsoft YaHei UI&quot;;
+    font: 9pt "Microsoft YaHei UI";
 }
 QPushButton:hover { background: #EDF2F7; }
-QCheckBox { min-height: 24px; font: 9pt &quot;Microsoft YaHei UI&quot;; }</string>
+QCheckBox { min-height: 24px; font: 9pt "Microsoft YaHei UI"; }</string>
     </property>
     <property name="title">
      <string>功能控制</string>
     </property>
     <layout class="QVBoxLayout" name="verticalLayout_groupBox">
+     <property name="spacing">
+      <number>0</number>
+     </property>
      <property name="leftMargin">
       <number>10</number>
      </property>
@@ -105,9 +108,6 @@ QCheckBox { min-height: 24px; font: 9pt &quot;Microsoft YaHei UI&quot;; }</strin
      <property name="bottomMargin">
       <number>10</number>
      </property>
-     <property name="spacing">
-      <number>0</number>
-     </property>
      <item>
       <widget class="QScrollArea" name="functionScrollArea">
        <property name="styleSheet">
@@ -117,11 +117,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
        <property name="frameShape">
         <enum>QFrame::NoFrame</enum>
        </property>
-       <property name="horizontalScrollBarPolicy">
-        <enum>Qt::ScrollBarAlwaysOff</enum>
-       </property>
        <property name="verticalScrollBarPolicy">
         <enum>Qt::ScrollBarAsNeeded</enum>
+       </property>
+       <property name="horizontalScrollBarPolicy">
+        <enum>Qt::ScrollBarAlwaysOff</enum>
        </property>
        <property name="widgetResizable">
         <bool>true</bool>
@@ -131,11 +131,14 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
          <rect>
           <x>0</x>
           <y>0</y>
-          <width>704</width>
-          <height>900</height>
+          <width>695</width>
+          <height>1045</height>
          </rect>
         </property>
         <layout class="QVBoxLayout" name="verticalLayout_functionScrollContent">
+         <property name="spacing">
+          <number>8</number>
+         </property>
          <property name="leftMargin">
           <number>4</number>
          </property>
@@ -148,310 +151,495 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
          <property name="bottomMargin">
           <number>4</number>
          </property>
-         <property name="spacing">
-          <number>8</number>
-         </property>
          <item>
-          <layout class="QHBoxLayout" name="horizontalLayout_displayRow">
-           <property name="spacing">
-            <number>12</number>
+          <widget class="QTabWidget" name="tabWidget_wave_display">
+           <property name="currentIndex">
+            <number>0</number>
            </property>
-           <item>
-            <widget class="QGroupBox" name="groupBox_eeg_display">
-             <property name="minimumSize">
-              <size>
-               <width>0</width>
-               <height>210</height>
-              </size>
+           <property name="minimumSize">
+            <size>
+             <width>0</width>
+             <height>260</height>
+            </size>
+           </property>
+           <widget class="QWidget" name="tab_wave_eeg">
+            <attribute name="title">
+             <string>EEG</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="verticalLayout_tab_wave_eeg">
+             <property name="leftMargin">
+              <number>6</number>
              </property>
-             <property name="title">
-              <string>EEG 显示</string>
+             <property name="topMargin">
+              <number>6</number>
              </property>
-             <layout class="QVBoxLayout" name="verticalLayout_eeg_display">
-              <property name="leftMargin">
-               <number>10</number>
-              </property>
-              <property name="topMargin">
-               <number>22</number>
-              </property>
-              <property name="rightMargin">
-               <number>10</number>
-              </property>
-              <property name="bottomMargin">
-               <number>12</number>
-              </property>
-              <property name="spacing">
-               <number>12</number>
-              </property>
-              <item>
-               <widget class="QPushButton" name="pushButton_2">
-                <property name="minimumSize">
-                 <size>
-                  <width>0</width>
-                  <height>34</height>
-                 </size>
-                </property>
-                <property name="maximumSize">
-                 <size>
-                  <width>16777215</width>
-                  <height>34</height>
-                 </size>
-                </property>
-                <property name="text">
-                 <string>节律图</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <layout class="QHBoxLayout" name="horizontalLayout_eeg_options">
+             <property name="rightMargin">
+              <number>6</number>
+             </property>
+             <property name="bottomMargin">
+              <number>6</number>
+             </property>
+             <item>
+              <widget class="QGroupBox" name="groupBox_eeg_display">
+               <property name="minimumSize">
+                <size>
+                 <width>0</width>
+                 <height>190</height>
+                </size>
+               </property>
+               <property name="title">
+                <string>EEG 显示</string>
+               </property>
+               <layout class="QVBoxLayout" name="verticalLayout_eeg_display">
                 <property name="spacing">
-                 <number>8</number>
+                 <number>12</number>
+                </property>
+                <property name="leftMargin">
+                 <number>10</number>
+                </property>
+                <property name="topMargin">
+                 <number>22</number>
+                </property>
+                <property name="rightMargin">
+                 <number>10</number>
+                </property>
+                <property name="bottomMargin">
+                 <number>12</number>
                 </property>
                 <item>
-                 <layout class="QGridLayout" name="gridLayout_eeg_channel_select">
+                 <layout class="QHBoxLayout" name="horizontalLayout_eeg_serial">
+                  <property name="spacing">
+                   <number>8</number>
+                  </property>
+                  <item>
+                   <widget class="QLabel" name="label_eeg_port">
+                    <property name="text">
+                     <string>EEG</string>
+                    </property>
+                    <property name="alignment">
+                     <set>Qt::AlignCenter</set>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QLineEdit" name="lineEdit_5">
+                    <property name="minimumSize">
+                     <size>
+                      <width>92</width>
+                      <height>34</height>
+                     </size>
+                    </property>
+                    <property name="placeholderText">
+                     <string>COM6</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QPushButton" name="pushButton_serial_toggle">
+                    <property name="minimumSize">
+                     <size>
+                      <width>96</width>
+                      <height>40</height>
+                     </size>
+                    </property>
+                    <property name="text">
+                     <string>打开串口</string>
+                    </property>
+                   </widget>
+                  </item>
+                 </layout>
+                </item>
+                <item>
+                 <layout class="QHBoxLayout" name="horizontalLayout_eeg_options">
+                  <property name="spacing">
+                   <number>8</number>
+                  </property>
+                  <item>
+                   <layout class="QGridLayout" name="gridLayout_eeg_channel_select">
+                    <property name="spacing">
+                     <number>4</number>
+                    </property>
+                    <item row="0" column="0">
+                     <widget class="QLabel" name="label_eeg_channel_mode">
+                      <property name="minimumSize">
+                       <size>
+                        <width>0</width>
+                        <height>24</height>
+                       </size>
+                      </property>
+                      <property name="text">
+                       <string>通道</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="0" column="1">
+                     <widget class="QComboBox" name="comboBox_eeg_channel_mode">
+                      <property name="sizePolicy">
+                       <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+                        <horstretch>0</horstretch>
+                        <verstretch>0</verstretch>
+                       </sizepolicy>
+                      </property>
+                      <property name="minimumSize">
+                       <size>
+                        <width>0</width>
+                        <height>22</height>
+                       </size>
+                      </property>
+                      <property name="maximumSize">
+                       <size>
+                        <width>16777215</width>
+                        <height>26</height>
+                       </size>
+                      </property>
+                      <property name="styleSheet">
+                       <string notr="true">QComboBox#comboBox_eeg_channel_mode { min-height: 20px; max-height: 24px; padding: 0px 4px; }</string>
+                      </property>
+                      <item>
+                       <property name="text">
+                        <string>单通道</string>
+                       </property>
+                      </item>
+                      <item>
+                       <property name="text">
+                        <string>双通道</string>
+                       </property>
+                      </item>
+                      <item>
+                       <property name="text">
+                        <string>六通道</string>
+                       </property>
+                      </item>
+                     </widget>
+                    </item>
+                    <item row="1" column="0">
+                     <widget class="QCheckBox" name="checkBox_eeg_ch1">
+                      <property name="text">
+                       <string>通道1</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="1" column="1">
+                     <widget class="QCheckBox" name="checkBox_eeg_ch2">
+                      <property name="text">
+                       <string>通道2</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="0">
+                     <widget class="QCheckBox" name="checkBox_eeg_ch3">
+                      <property name="text">
+                       <string>通道3</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="1">
+                     <widget class="QCheckBox" name="checkBox_eeg_ch4">
+                      <property name="text">
+                       <string>通道4</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="0">
+                     <widget class="QCheckBox" name="checkBox_eeg_ch5">
+                      <property name="text">
+                       <string>通道5</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="1">
+                     <widget class="QCheckBox" name="checkBox_eeg_ch6">
+                      <property name="text">
+                       <string>通道6</string>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                  <item>
+                   <widget class="Line" name="line_eeg_options_split">
+                    <property name="orientation">
+                     <enum>Qt::Vertical</enum>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <layout class="QGridLayout" name="gridLayout_eeg_checks">
+                    <property name="spacing">
+                     <number>4</number>
+                    </property>
+                    <item row="0" column="0">
+                     <widget class="QLabel" name="label_eeg_rhythm_waveform">
+                      <property name="minimumSize">
+                       <size>
+                        <width>0</width>
+                        <height>24</height>
+                       </size>
+                      </property>
+                      <property name="text">
+                       <string>节律波形</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="1" column="0">
+                     <widget class="QCheckBox" name="checkBox_4">
+                      <property name="text">
+                       <string>theta</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="1" column="1">
+                     <widget class="QCheckBox" name="checkBox_2">
+                      <property name="text">
+                       <string>Beta</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="0">
+                     <widget class="QCheckBox" name="checkBox_3">
+                      <property name="text">
+                       <string>Delta</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="1">
+                     <widget class="QCheckBox" name="checkBox_5">
+                      <property name="text">
+                       <string>gamma</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="0">
+                     <widget class="QCheckBox" name="checkBox">
+                      <property name="text">
+                       <string>Alpha</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="1">
+                     <widget class="QCheckBox" name="checkBox_6">
+                      <property name="text">
+                       <string>raw data</string>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                 </layout>
+                </item>
+                <item>
+                 <spacer name="verticalSpacer_eeg_display">
+                  <property name="orientation">
+                   <enum>Qt::Vertical</enum>
+                  </property>
+                  <property name="sizeHint" stdset="0">
+                   <size>
+                    <width>20</width>
+                    <height>40</height>
+                   </size>
+                  </property>
+                 </spacer>
+                </item>
+               </layout>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+           <widget class="QWidget" name="tab_wave_osc">
+            <attribute name="title">
+             <string>振子</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="verticalLayout_tab_wave_osc">
+             <property name="leftMargin">
+              <number>6</number>
+             </property>
+             <property name="topMargin">
+              <number>6</number>
+             </property>
+             <property name="rightMargin">
+              <number>6</number>
+             </property>
+             <property name="bottomMargin">
+              <number>6</number>
+             </property>
+             <item>
+              <widget class="QGroupBox" name="groupBox_osc_display">
+               <property name="minimumSize">
+                <size>
+                 <width>0</width>
+                 <height>210</height>
+                </size>
+               </property>
+               <property name="title">
+                <string>振子显示</string>
+               </property>
+               <layout class="QVBoxLayout" name="verticalLayout_osc_display">
+                <property name="spacing">
+                 <number>12</number>
+                </property>
+                <property name="leftMargin">
+                 <number>10</number>
+                </property>
+                <property name="topMargin">
+                 <number>22</number>
+                </property>
+                <property name="rightMargin">
+                 <number>10</number>
+                </property>
+                <property name="bottomMargin">
+                 <number>12</number>
+                </property>
+                <item>
+                 <layout class="QHBoxLayout" name="horizontalLayout_osc_serial">
+                  <property name="spacing">
+                   <number>8</number>
+                  </property>
+                  <item>
+                   <widget class="QLabel" name="label_osc_port">
+                    <property name="text">
+                     <string>振子</string>
+                    </property>
+                    <property name="alignment">
+                     <set>Qt::AlignCenter</set>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QLineEdit" name="lineEdit_4">
+                    <property name="minimumSize">
+                     <size>
+                      <width>92</width>
+                      <height>34</height>
+                     </size>
+                    </property>
+                    <property name="placeholderText">
+                     <string>COM7</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QPushButton" name="pushButton_osc_serial_toggle">
+                    <property name="minimumSize">
+                     <size>
+                      <width>96</width>
+                      <height>40</height>
+                     </size>
+                    </property>
+                    <property name="text">
+                     <string>打开串口</string>
+                    </property>
+                   </widget>
+                  </item>
+                 </layout>
+                </item>
+                <item>
+                 <spacer name="verticalSpacer_osc_buttonGap">
+                  <property name="orientation">
+                   <enum>Qt::Vertical</enum>
+                  </property>
+                  <property name="sizeType">
+                   <enum>QSizePolicy::Fixed</enum>
+                  </property>
+                  <property name="sizeHint" stdset="0">
+                   <size>
+                    <width>20</width>
+                    <height>8</height>
+                   </size>
+                  </property>
+                 </spacer>
+                </item>
+                <item>
+                 <layout class="QGridLayout" name="gridLayout_osc_checks">
                   <property name="horizontalSpacing">
-                   <number>4</number>
+                   <number>16</number>
                   </property>
                   <property name="verticalSpacing">
-                   <number>4</number>
+                   <number>8</number>
                   </property>
                   <item row="0" column="0">
-                   <widget class="QLabel" name="label_eeg_channel_mode">
-                    <property name="minimumSize"><size><width>36</width><height>24</height></size></property>
-                    <property name="text"><string>通道</string></property>
+                   <widget class="QCheckBox" name="checkBox_8">
+                    <property name="text">
+                     <string>theta</string>
+                    </property>
                    </widget>
                   </item>
                   <item row="0" column="1">
-                   <widget class="QComboBox" name="comboBox_eeg_channel_mode">
-                    <property name="minimumSize"><size><width>74</width><height>26</height></size></property>
-                    <item><property name="text"><string>单通道</string></property></item>
-                    <item><property name="text"><string>六通道</string></property></item>
+                   <widget class="QCheckBox" name="checkBox_7">
+                    <property name="text">
+                     <string>Blta</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item row="0" column="2">
+                   <widget class="QCheckBox" name="checkBox_9">
+                    <property name="text">
+                     <string>gamma</string>
+                    </property>
                    </widget>
                   </item>
                   <item row="1" column="0">
-                   <widget class="QCheckBox" name="checkBox_eeg_ch1"><property name="text"><string>通道1</string></property></widget>
+                   <widget class="QCheckBox" name="checkBox_12">
+                    <property name="text">
+                     <string>Delta</string>
+                    </property>
+                   </widget>
                   </item>
                   <item row="1" column="1">
-                   <widget class="QCheckBox" name="checkBox_eeg_ch2"><property name="text"><string>通道2</string></property></widget>
+                   <widget class="QCheckBox" name="checkBox_10">
+                    <property name="text">
+                     <string>Alpha</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item row="1" column="2">
+                   <widget class="QCheckBox" name="checkBox_11">
+                    <property name="text">
+                     <string>M_Fre</string>
+                    </property>
+                   </widget>
                   </item>
                   <item row="2" column="0">
-                   <widget class="QCheckBox" name="checkBox_eeg_ch3"><property name="text"><string>通道3</string></property></widget>
+                   <widget class="QCheckBox" name="checkBox_13">
+                    <property name="text">
+                     <string>x</string>
+                    </property>
+                   </widget>
                   </item>
                   <item row="2" column="1">
-                   <widget class="QCheckBox" name="checkBox_eeg_ch4"><property name="text"><string>通道4</string></property></widget>
+                   <widget class="QCheckBox" name="checkBox_14">
+                    <property name="text">
+                     <string>y</string>
+                    </property>
+                   </widget>
                   </item>
-                  <item row="3" column="0">
-                   <widget class="QCheckBox" name="checkBox_eeg_ch5"><property name="text"><string>通道5</string></property></widget>
-                  </item>
-                  <item row="3" column="1">
-                   <widget class="QCheckBox" name="checkBox_eeg_ch6"><property name="text"><string>通道6</string></property></widget>
+                  <item row="2" column="2">
+                   <widget class="QCheckBox" name="checkBox_15">
+                    <property name="text">
+                     <string>z</string>
+                    </property>
+                   </widget>
                   </item>
                  </layout>
                 </item>
                 <item>
-                 <widget class="Line" name="line_eeg_options_split">
-                  <property name="orientation"><enum>Qt::Vertical</enum></property>
-                 </widget>
-                </item>
-                <item>
-                 <layout class="QGridLayout" name="gridLayout_eeg_checks">
-                  <property name="horizontalSpacing"><number>14</number></property>
-                  <property name="verticalSpacing"><number>6</number></property>
-                  <item row="0" column="0" colspan="2">
-                   <widget class="QLabel" name="label_eeg_rhythm_waveform">
-                    <property name="text"><string>节律波形</string></property>
-                   </widget>
-                  </item>
-                  <item row="1" column="0">
-                   <widget class="QCheckBox" name="checkBox_4"><property name="text"><string>theta</string></property></widget>
-                  </item>
-                  <item row="1" column="1">
-                   <widget class="QCheckBox" name="checkBox_2"><property name="text"><string>Beta</string></property></widget>
-                  </item>
-                  <item row="2" column="0">
-                   <widget class="QCheckBox" name="checkBox_3"><property name="text"><string>Delta</string></property></widget>
-                  </item>
-                  <item row="2" column="1">
-                   <widget class="QCheckBox" name="checkBox_5"><property name="text"><string>gamma</string></property></widget>
-                  </item>
-                  <item row="3" column="0">
-                   <widget class="QCheckBox" name="checkBox"><property name="text"><string>Alpha</string></property></widget>
-                  </item>
-                  <item row="3" column="1">
-                   <widget class="QCheckBox" name="checkBox_6"><property name="text"><string>raw data</string></property></widget>
-                  </item>
-                 </layout>
+                 <spacer name="verticalSpacer_osc_display">
+                  <property name="orientation">
+                   <enum>Qt::Vertical</enum>
+                  </property>
+                  <property name="sizeHint" stdset="0">
+                   <size>
+                    <width>20</width>
+                    <height>40</height>
+                   </size>
+                  </property>
+                 </spacer>
                 </item>
                </layout>
-              </item>
-              <item>
-               <spacer name="verticalSpacer_eeg_display">
-                <property name="orientation">
-                 <enum>Qt::Vertical</enum>
-                </property>
-                <property name="sizeHint" stdset="0">
-                 <size>
-                  <width>20</width>
-                  <height>40</height>
-                 </size>
-                </property>
-               </spacer>
-              </item>
-             </layout>
-            </widget>
-           </item>
-           <item>
-            <widget class="QGroupBox" name="groupBox_osc_display">
-             <property name="minimumSize">
-              <size>
-               <width>0</width>
-               <height>210</height>
-              </size>
-             </property>
-             <property name="title">
-              <string>振子显示</string>
-             </property>
-             <layout class="QVBoxLayout" name="verticalLayout_osc_display">
-              <property name="leftMargin">
-               <number>10</number>
-              </property>
-              <property name="topMargin">
-               <number>22</number>
-              </property>
-              <property name="rightMargin">
-               <number>10</number>
-              </property>
-              <property name="bottomMargin">
-               <number>12</number>
-              </property>
-              <property name="spacing">
-               <number>12</number>
-              </property>
-              <item>
-               <widget class="QPushButton" name="pushButton_6">
-                <property name="minimumSize">
-                 <size>
-                  <width>0</width>
-                  <height>34</height>
-                 </size>
-                </property>
-                <property name="maximumSize">
-                 <size>
-                  <width>16777215</width>
-                  <height>34</height>
-                 </size>
-                </property>
-                <property name="text">
-                 <string>振子</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <spacer name="verticalSpacer_osc_buttonGap">
-                <property name="orientation">
-                 <enum>Qt::Vertical</enum>
-                </property>
-                <property name="sizeType">
-                 <enum>QSizePolicy::Fixed</enum>
-                </property>
-                <property name="sizeHint" stdset="0">
-                 <size>
-                  <width>20</width>
-                  <height>8</height>
-                 </size>
-                </property>
-               </spacer>
-              </item>
-              <item>
-               <layout class="QGridLayout" name="gridLayout_osc_checks">
-                <property name="horizontalSpacing">
-                 <number>16</number>
-                </property>
-                <property name="verticalSpacing">
-                 <number>8</number>
-                </property>
-                <item row="0" column="0">
-                 <widget class="QCheckBox" name="checkBox_8">
-                  <property name="text">
-                   <string>theta</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="0" column="1">
-                 <widget class="QCheckBox" name="checkBox_7">
-                  <property name="text">
-                   <string>Blta</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="0" column="2">
-                 <widget class="QCheckBox" name="checkBox_9">
-                  <property name="text">
-                   <string>gamma</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="1" column="0">
-                 <widget class="QCheckBox" name="checkBox_12">
-                  <property name="text">
-                   <string>Delta</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="1" column="1">
-                 <widget class="QCheckBox" name="checkBox_10">
-                  <property name="text">
-                   <string>Alpha</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="1" column="2">
-                 <widget class="QCheckBox" name="checkBox_11">
-                  <property name="text">
-                   <string>M_Fre</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="2" column="0">
-                 <widget class="QCheckBox" name="checkBox_13">
-                  <property name="text">
-                   <string>x</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="2" column="1">
-                 <widget class="QCheckBox" name="checkBox_14">
-                  <property name="text">
-                   <string>y</string>
-                  </property>
-                 </widget>
-                </item>
-                <item row="2" column="2">
-                 <widget class="QCheckBox" name="checkBox_15">
-                  <property name="text">
-                   <string>z</string>
-                  </property>
-                 </widget>
-                </item>
-               </layout>
-              </item>
-              <item>
-               <spacer name="verticalSpacer_osc_display">
-                <property name="orientation">
-                 <enum>Qt::Vertical</enum>
-                </property>
-                <property name="sizeHint" stdset="0">
-                 <size>
-                  <width>20</width>
-                  <height>40</height>
-                 </size>
-                </property>
-               </spacer>
-              </item>
-             </layout>
-            </widget>
-           </item>
-          </layout>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </widget>
          </item>
          <item>
           <widget class="QGroupBox" name="groupBox_offline">
@@ -482,11 +670,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                 <height>28</height>
                </size>
               </property>
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>文件</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
@@ -512,11 +700,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                 <height>28</height>
                </size>
               </property>
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>分钟</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
@@ -545,6 +733,48 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
              <widget class="QPushButton" name="pushButton_clear_offline">
               <property name="text">
                <string>退出查看</string>
+              </property>
+             </widget>
+            </item>
+            <item row="3" column="0">
+             <widget class="QLabel" name="label_session_name">
+              <property name="minimumSize">
+               <size>
+                <width>0</width>
+                <height>28</height>
+               </size>
+              </property>
+              <property name="text">
+               <string>保存命名</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="3" column="1">
+             <widget class="QLineEdit" name="lineEdit_session_name">
+              <property name="minimumSize">
+               <size>
+                <width>100</width>
+                <height>34</height>
+               </size>
+              </property>
+              <property name="placeholderText">
+               <string>留空→仅时间戳</string>
+              </property>
+             </widget>
+            </item>
+            <item row="3" column="2">
+             <widget class="QPushButton" name="pushButton_save_location">
+              <property name="minimumSize">
+               <size>
+                <width>120</width>
+                <height>34</height>
+               </size>
+              </property>
+              <property name="text">
+               <string>保存位置...</string>
               </property>
              </widget>
             </item>
@@ -580,11 +810,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
               <property name="visible">
                <bool>false</bool>
               </property>
+              <property name="text">
+               <string />
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
-              </property>
-              <property name="text">
-               <string/>
               </property>
              </widget>
             </item>
@@ -593,11 +823,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
               <property name="visible">
                <bool>false</bool>
               </property>
+              <property name="text">
+               <string />
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
-              </property>
-              <property name="text">
-               <string/>
               </property>
              </widget>
             </item>
@@ -606,11 +836,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
               <property name="visible">
                <bool>false</bool>
               </property>
+              <property name="text">
+               <string />
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
-              </property>
-              <property name="text">
-               <string/>
               </property>
              </widget>
             </item>
@@ -619,11 +849,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
               <property name="visible">
                <bool>false</bool>
               </property>
+              <property name="text">
+               <string />
+              </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
-              </property>
-              <property name="text">
-               <string/>
               </property>
              </widget>
             </item>
@@ -712,11 +942,11 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
             </item>
             <item row="4" column="0">
              <widget class="QLabel" name="label_power_window">
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>窗长(秒)</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
@@ -751,7 +981,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
            <property name="minimumSize">
             <size>
              <width>0</width>
-             <height>285</height>
+             <height>360</height>
             </size>
            </property>
            <property name="title">
@@ -778,70 +1008,70 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
             </property>
             <item row="0" column="1">
              <widget class="QLabel" name="label_left_channel">
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>左声道</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
             <item row="0" column="2">
              <widget class="QLabel" name="label_right_channel">
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>右声道</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
             <item row="1" column="0">
              <widget class="QLabel" name="label_frequency">
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>频率</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
             <item row="1" column="1">
-             <widget class="QLineEdit" name="lineEdit_7"/>
+             <widget class="QLineEdit" name="lineEdit_7" />
             </item>
             <item row="1" column="2">
-             <widget class="QLineEdit" name="lineEdit_6"/>
+             <widget class="QLineEdit" name="lineEdit_6" />
             </item>
             <item row="2" column="0">
              <widget class="QLabel" name="label_time">
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>time</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
             <item row="2" column="1" colspan="2">
-             <widget class="QLineEdit" name="lineEdit_8"/>
+             <widget class="QLineEdit" name="lineEdit_8" />
             </item>
             <item row="3" column="0">
              <widget class="QLabel" name="label_phase">
-              <property name="alignment">
-               <set>Qt::AlignCenter</set>
-              </property>
               <property name="text">
                <string>phase</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
             <item row="3" column="1">
-             <widget class="QLineEdit" name="lineEdit_9"/>
+             <widget class="QLineEdit" name="lineEdit_9" />
             </item>
             <item row="3" column="2">
-             <widget class="QLineEdit" name="lineEdit_10"/>
+             <widget class="QLineEdit" name="lineEdit_10" />
             </item>
-            <item row="4" column="0" colspan="3">
+            <item row="6" column="0" colspan="3">
              <layout class="QHBoxLayout" name="horizontalLayout_audioButtons">
               <property name="spacing">
                <number>12</number>
@@ -864,7 +1094,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                 <property name="minimumSize">
                  <size>
                   <width>92</width>
-                  <height>42</height>
+                  <height>40</height>
                  </size>
                 </property>
                 <property name="text">
@@ -877,7 +1107,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                 <property name="minimumSize">
                  <size>
                   <width>180</width>
-                  <height>42</height>
+                  <height>38</height>
                  </size>
                 </property>
                 <property name="styleSheet">
@@ -903,6 +1133,52 @@ QPushButton:hover { background:#256A31; }</string>
                </spacer>
               </item>
              </layout>
+            </item>
+            <item row="4" column="0">
+             <widget class="QLabel" name="label_sleep_aid_start">
+              <property name="text">
+               <string>起始(s)</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="4" column="1" colspan="2">
+             <widget class="QLineEdit" name="lineEdit_3">
+              <property name="placeholderText">
+               <string>记录内</string>
+              </property>
+              <property name="minimumSize">
+               <size>
+                <width>72</width>
+                <height>34</height>
+               </size>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="0">
+             <widget class="QLabel" name="label_sleep_aid_end">
+              <property name="text">
+               <string>结束(s)</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="1" colspan="2">
+             <widget class="QLineEdit" name="lineEdit_sleep_aid_end">
+              <property name="placeholderText">
+               <string>记录内</string>
+              </property>
+              <property name="minimumSize">
+               <size>
+                <width>72</width>
+                <height>34</height>
+               </size>
+              </property>
+             </widget>
             </item>
            </layout>
           </widget>
@@ -942,7 +1218,7 @@ QPushButton:hover { background:#256A31; }</string>
     margin-top: 14px;
     padding: 8px;
     background: #F8F9FB;
-    font: 10pt &quot;Microsoft YaHei UI&quot;;
+    font: 10pt "Microsoft YaHei UI";
 }
 QGroupBox::title {
     subcontrol-origin: margin;
@@ -957,7 +1233,7 @@ QLineEdit, QComboBox, QTimeEdit {
     border: 1px solid #C7CED8;
     border-radius: 4px;
     background: #FFFFFF;
-    font: 9pt &quot;Microsoft YaHei UI&quot;;
+    font: 9pt "Microsoft YaHei UI";
 }
 QPushButton {
     min-height: 30px;
@@ -965,7 +1241,7 @@ QPushButton {
     border: 1px solid #B9C1CC;
     border-radius: 5px;
     background: #FFFFFF;
-    font: 9pt &quot;Microsoft YaHei UI&quot;;
+    font: 9pt "Microsoft YaHei UI";
 }
 QPushButton:hover { background: #EDF2F7; }</string>
     </property>
@@ -973,6 +1249,9 @@ QPushButton:hover { background: #EDF2F7; }</string>
      <string>采集、保存与串口</string>
     </property>
     <layout class="QHBoxLayout" name="horizontalLayout_bottomPanel">
+     <property name="spacing">
+      <number>12</number>
+     </property>
      <property name="leftMargin">
       <number>12</number>
      </property>
@@ -983,9 +1262,6 @@ QPushButton:hover { background: #EDF2F7; }</string>
       <number>12</number>
      </property>
      <property name="bottomMargin">
-      <number>12</number>
-     </property>
-     <property name="spacing">
       <number>12</number>
      </property>
      <item>
@@ -1033,6 +1309,12 @@ QPushButton:hover { background: #EDF2F7; }</string>
        <property name="title">
         <string>定时记录</string>
        </property>
+       <property name="minimumSize">
+        <size>
+         <width>0</width>
+         <height>170</height>
+        </size>
+       </property>
        <layout class="QGridLayout" name="gridLayout_record">
         <property name="leftMargin">
          <number>10</number>
@@ -1046,19 +1328,16 @@ QPushButton:hover { background: #EDF2F7; }</string>
         <property name="bottomMargin">
          <number>10</number>
         </property>
-        <property name="horizontalSpacing">
-         <number>8</number>
-        </property>
-        <property name="verticalSpacing">
+        <property name="spacing">
          <number>8</number>
         </property>
         <item row="0" column="0">
          <widget class="QLabel" name="label_record_duration">
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
           <property name="text">
            <string>时长</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
           </property>
          </widget>
         </item>
@@ -1074,11 +1353,11 @@ QPushButton:hover { background: #EDF2F7; }</string>
         </item>
         <item row="1" column="0">
          <widget class="QLabel" name="label_record_seconds">
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
           <property name="text">
            <string>秒</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
           </property>
          </widget>
         </item>
@@ -1105,14 +1384,20 @@ QPushButton:hover { background: #EDF2F7; }</string>
           </property>
          </widget>
         </item>
-        <item row="2" column="0" colspan="2">
+        <item row="3" column="0" colspan="2">
          <widget class="QCheckBox" name="checkBox_long_record">
           <property name="text">
            <string>长时记录</string>
           </property>
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>28</height>
+           </size>
+          </property>
          </widget>
         </item>
-        <item row="2" column="2">
+        <item row="3" column="2">
          <widget class="QPushButton" name="pushButton_wave_wake">
           <property name="maximumSize">
            <size>
@@ -1125,224 +1410,33 @@ QPushButton:hover { background: #EDF2F7; }</string>
           </property>
          </widget>
         </item>
-       </layout>
-      </widget>
-     </item>
-     <item>
-      <widget class="QGroupBox" name="groupBox_save">
-       <property name="title">
-        <string>助眠时段</string>
-       </property>
-       <layout class="QGridLayout" name="gridLayout_sleep_aid_window">
-        <property name="leftMargin">
-         <number>10</number>
-        </property>
-        <property name="topMargin">
-         <number>20</number>
-        </property>
-        <property name="rightMargin">
-         <number>10</number>
-        </property>
-        <property name="bottomMargin">
-         <number>10</number>
-        </property>
-        <property name="horizontalSpacing">
-         <number>8</number>
-        </property>
-        <property name="verticalSpacing">
-         <number>6</number>
-        </property>
-        <item row="0" column="0">
-         <widget class="QLabel" name="label_sleep_aid_start">
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
-          </property>
+        <item row="0" column="3" rowspan="4">
+         <widget class="QPushButton" name="pushButton">
           <property name="text">
-           <string>起始(s)</string>
+           <string>已停止 · 启动</string>
           </property>
-         </widget>
-        </item>
-        <item row="0" column="1">
-         <widget class="QLineEdit" name="lineEdit_3">
           <property name="minimumSize">
            <size>
-            <width>72</width>
-            <height>0</height>
+            <width>130</width>
+            <height>78</height>
            </size>
           </property>
-          <property name="placeholderText">
-           <string>记录内</string>
-          </property>
          </widget>
         </item>
-        <item row="1" column="0">
-         <widget class="QLabel" name="label_sleep_aid_end">
-          <property name="alignment">
-           <set>Qt::AlignCenter</set>
+        <item row="2" column="0" colspan="3">
+         <spacer name="verticalSpacer_record_checkbox_gap">
+          <property name="orientation">
+           <enum>Qt::Vertical</enum>
           </property>
-          <property name="text">
-           <string>结束(s)</string>
-          </property>
-         </widget>
-        </item>
-        <item row="1" column="1">
-         <widget class="QLineEdit" name="lineEdit_sleep_aid_end">
-          <property name="minimumSize">
+          <property name="sizeHint" stdset="0">
            <size>
-            <width>72</width>
-            <height>0</height>
+            <width>20</width>
+            <height>8</height>
            </size>
           </property>
-          <property name="placeholderText">
-           <string>记录内</string>
-          </property>
-         </widget>
+         </spacer>
         </item>
        </layout>
-      </widget>
-     </item>
-     <item>
-      <widget class="QGroupBox" name="groupBox_session_name">
-       <property name="title">
-        <string>保存命名</string>
-       </property>
-       <layout class="QVBoxLayout" name="verticalLayout_session_name">
-        <property name="leftMargin">
-         <number>10</number>
-        </property>
-        <property name="topMargin">
-         <number>20</number>
-        </property>
-        <property name="rightMargin">
-         <number>10</number>
-        </property>
-        <property name="bottomMargin">
-         <number>10</number>
-        </property>
-        <item>
-         <widget class="QLineEdit" name="lineEdit_session_name">
-          <property name="minimumSize">
-           <size>
-            <width>100</width>
-            <height>0</height>
-           </size>
-          </property>
-          <property name="placeholderText">
-           <string>留空→仅时间戳</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="pushButton_save_location">
-          <property name="text">
-           <string>保存位置...</string>
-          </property>
-         </widget>
-        </item>
-       </layout>
-      </widget>
-     </item>
-     <item>
-      <widget class="QGroupBox" name="groupBox_serial">
-       <property name="title">
-        <string>串口设置</string>
-       </property>
-       <layout class="QVBoxLayout" name="verticalLayout_serial">
-        <property name="leftMargin">
-         <number>10</number>
-        </property>
-        <property name="topMargin">
-         <number>18</number>
-        </property>
-        <property name="rightMargin">
-         <number>10</number>
-        </property>
-        <property name="bottomMargin">
-         <number>10</number>
-        </property>
-        <property name="spacing">
-         <number>8</number>
-        </property>
-        <item>
-         <layout class="QHBoxLayout" name="horizontalLayout_serialPorts">
-          <property name="spacing">
-           <number>8</number>
-          </property>
-          <item>
-           <widget class="QLabel" name="label_eeg_port">
-            <property name="alignment">
-             <set>Qt::AlignCenter</set>
-            </property>
-            <property name="text">
-             <string>EEG</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLineEdit" name="lineEdit_5">
-            <property name="minimumSize">
-             <size>
-              <width>92</width>
-              <height>0</height>
-             </size>
-            </property>
-            <property name="placeholderText">
-             <string>COM6</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLabel" name="label_osc_port">
-            <property name="alignment">
-             <set>Qt::AlignCenter</set>
-            </property>
-            <property name="text">
-             <string>振子</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QLineEdit" name="lineEdit_4">
-            <property name="minimumSize">
-             <size>
-              <width>92</width>
-              <height>0</height>
-             </size>
-            </property>
-            <property name="placeholderText">
-             <string>COM7</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QPushButton" name="pushButton_serial_toggle">
-            <property name="minimumSize">
-             <size>
-              <width>96</width>
-              <height>32</height>
-             </size>
-            </property>
-            <property name="text">
-             <string>打开串口</string>
-            </property>
-           </widget>
-          </item>
-         </layout>
-        </item>
-       </layout>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="pushButton">
-       <property name="minimumSize">
-        <size>
-         <width>130</width>
-         <height>78</height>
-        </size>
-       </property>
-       <property name="text">
-        <string>已停止 · 启动</string>
-       </property>
       </widget>
      </item>
     </layout>
@@ -1354,12 +1448,12 @@ QPushButton:hover { background: #EDF2F7; }</string>
      <x>0</x>
      <y>0</y>
      <width>2000</width>
-     <height>26</height>
+     <height>23</height>
     </rect>
    </property>
   </widget>
-  <widget class="QStatusBar" name="statusbar"/>
+  <widget class="QStatusBar" name="statusbar" />
  </widget>
- <resources/>
- <connections/>
+ <resources />
+ <connections />
 </ui>
