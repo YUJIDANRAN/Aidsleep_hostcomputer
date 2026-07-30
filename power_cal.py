@@ -420,7 +420,21 @@ def read_eeg_signal(data_path: str | Path, column: int = 0) -> np.ndarray:
         if "ch1_raw" in frame.columns:
             series = frame["ch1_raw"]
         else:
-            series = frame.iloc[:, column]
+            raw_columns = [
+                col
+                for col in frame.columns
+                if str(col).lower().endswith("_raw")
+            ]
+            if raw_columns:
+                series = frame[raw_columns[0]]
+            else:
+                skip_names = {"index", "time_s", "time", "timestamp"}
+                data_columns = [
+                    col
+                    for col in frame.columns
+                    if str(col).lower() not in skip_names
+                ]
+                series = frame[data_columns[column] if data_columns else frame.columns[column]]
         values = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=np.float64)
     else:
         values = read_eeg_column(path, column=column)

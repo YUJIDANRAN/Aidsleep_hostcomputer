@@ -18,8 +18,8 @@ EEG_REJECT_SEGMENT_SEC = 1
 
 # ADC 贴边饱和坏段阈值：原始值 <= 50 或 >= 4045 时标红。
 # 适合 12 bit ADC (0-4095)。如果硬件有效范围变窄/变宽，再同步调整。
-EEG_RAW_MIN_VALID = 400
-EEG_RAW_MAX_VALID = 2000
+EEG_RAW_MIN_VALID = 50
+EEG_RAW_MAX_VALID = 4045
 
 # 原始 1 秒片段峰峰值坏段阈值：max(segment)-min(segment) 超过该值标红。
 # 主要抓大幅运动伪迹、严重电极扰动、接触不良；调小会更严格。

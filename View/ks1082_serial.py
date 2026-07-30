@@ -52,7 +52,7 @@ BYTES_PER_SECOND = int(
 POLL_READ_MAX_BYTES = 512
 MAX_PARSER_BUF = 8192
 LOW_BYTE_ESCAPE = 0xFE
-ADC_12BIT_MASK = 0x0FFF  ## 数值有效范围 0~4095
+UINT16_MASK = 0xFFFF  ## 下位机按 uint16_t 传输，可能是 ADC count，也可能是滤波/缩放后的协议值
 RAW_TYPICAL_MID = 2000.0  ## raw 显示默认中心（0~4096 量程中部）
 RAW_TYPICAL_AMP = 2200.0  ## raw 显示默认半幅
 
@@ -76,7 +76,7 @@ class AdcSample:
         if low == LOW_BYTE_ESCAPE:
             low = 0xFF
         high = data_high & 0xFF
-        return ((high << 8) | low) & ADC_12BIT_MASK
+        return ((high << 8) | low) & UINT16_MASK
 
     @staticmethod
     def decode_ch1_le(data_low: int, data_high: int) -> int:

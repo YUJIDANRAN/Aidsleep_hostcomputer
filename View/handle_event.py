@@ -694,7 +694,7 @@ class AlphaWaveformView(QtWidgets.QGraphicsView):
 
         y_title = self._scene.addText(self._y_axis_label)  ## Y 轴标题
         y_title.setDefaultTextColor(QtGui.QColor("#333333"))
-        y_title.setPos(8, top + self._plot_height * 0.45)
+        y_title.setPos(left + 10, top + 28)
         self._add_axis_item(y_title)
 
     def _update_axes_if_needed(self, count: int, *, force: bool = False) -> None:
@@ -1030,6 +1030,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
         self._eeg_raw_record: List[int] = []  ## 定时测试期间记录的 CH1 raw
+        self._eeg_multi_raw_records: List[List[int]] = [
+            [] for _ in range(EEG_MULTI_CHANNEL_COUNT)
+        ]  ## multi-channel timed-test raw buffers
         self._long_record_active = False  ## 本次测试是否启用长时记录模式
         self._long_session_dir: Optional[Path] = None  ## 长时记录固定会话目录
         self._long_chunks_saved = 0  ## 已自动保存的完整 5 分钟段数
@@ -1152,8 +1155,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._alpha_rejector.reset()
             self._reset_alpha_display_stats()
             self._decim_counter = 0
-            self._waveform.clear()
-            self._multi_waveform.clear()
+            self._clear_eeg_waveforms()
         if self._osc_link is not None and self._osc_link.is_open:
             self._running = True
             self._osc_proc.reset()
@@ -1350,8 +1352,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         else:
             self._offline_view.hide()
             self._analysis_plot.hide()
-            self._waveform.show()
-            self._waveform.raise_()
+            self._show_current_eeg_waveform()
         self._osc_waveform.show()
         self._osc_waveform.raise_()
         self._waveform.refresh_layout()
@@ -1524,6 +1525,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._refresh_offline_visible_channels()
         self._switch_to_eeg_view()
         self._waveform.hide()
+        self._multi_waveform.hide()
         self._sync_offline_geometry()
         self._offline_view.show()
         self._offline_view.raise_()
@@ -1548,8 +1550,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view.clear()
         self._offline_view.hide()
         if not self._analysis_plot_active:
-            self._waveform.show()
-            self._waveform.raise_()
+            self._show_current_eeg_waveform()
             # 恢复实时互斥：仅 raw
             for mode, checkbox in self._display_checkboxes.items():
                 checkbox.blockSignals(True)
@@ -1623,7 +1624,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._waveform_display_until = time.monotonic() + float(duration_sec)
         self._waveform_sleep_logged = False
         if clear:
-            self._waveform.clear()
+            self._clear_eeg_waveforms()
             self._osc_waveform.clear()
 
     def _is_waveform_display_active(self) -> bool:
@@ -1636,7 +1637,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return True
         if not self._waveform_sleep_logged:
             self._waveform_sleep_logged = True
-            self._waveform.clear()
+            self._clear_eeg_waveforms()
             self._osc_waveform.clear()
             self._log("波形显示已休眠（可点「波形唤醒」再开 5 分钟）")
         return False
@@ -2021,6 +2022,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             for name in (
                 "eeg_raw_full.csv",
                 "eeg_raw.csv",
+                "ch1/eeg_raw_full.csv",
+                "ch1/eeg_raw.csv",
             ):
                 candidate = self._last_eeg_session_dir / name
                 if candidate.is_file():
@@ -2217,6 +2220,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view_active = False
         self._offline_view.hide()
         self._waveform.hide()
+        self._multi_waveform.hide()
         self._sync_analysis_plot_geometry()
         self._analysis_plot.show()
         self._analysis_plot.raise_()
@@ -2231,8 +2235,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._analysis_plot.hide()
         self._analysis_plot.clear()
         if not self._offline_view_active:
-            self._waveform.show()
-            self._waveform.raise_()
+            self._show_current_eeg_waveform()
             self._display_mode = ""
             self._apply_display_mode(self._current_display_mode())
         self._update_status_bar()
@@ -2252,6 +2255,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     f"（路径B分段删减 eeg_chunk_XXX.csv + 正常段报告 + 每分钟绝对功率图；"
                     f"跳过 FFT/波形等其它图）"
                 )
+            return
+
+        if self._is_multi_eeg_mode():
+            saved_channels = self._save_multi_channel_timed_records()
+            self._reset_timed_test_state()
+            if saved_channels:
+                for channel, cleaned_path, full_path, sample_rate, reject_rate in saved_channels:
+                    self._log(f"Start CH{channel} post-test power/PSD analysis")
+                    self._run_post_test_power_analysis(
+                        full_path,
+                        cleaned_path,
+                        sample_rate,
+                        reject_rate,
+                    )
             return
 
         saved = self._save_eeg_raw_csv()
@@ -2420,7 +2437,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_duration_sec = duration
         self._test_started_at = time.monotonic() if duration is not None else None
         self._sleep_aid_timed_auto = False
-        self._eeg_raw_record.clear()
+        self._clear_eeg_raw_records()
         self._long_record_active = False
         self._long_session_dir = None
         self._long_chunks_saved = 0
@@ -2475,13 +2492,28 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_duration_sec = None
         self._test_started_at = None
         self._sleep_aid_timed_auto = False
-        self._eeg_raw_record.clear()
+        self._clear_eeg_raw_records()
         self._long_record_active = False
         self._long_session_dir = None
         self._long_chunks_saved = 0
         self._waveform_display_until = None
         self._waveform_sleep_logged = False
         self.ui.lcdNumber.display(0)
+
+    def _clear_eeg_raw_records(self) -> None:
+        self._eeg_raw_record.clear()
+        for record in self._eeg_multi_raw_records:
+            record.clear()
+
+    def _record_eeg_sample_for_timed_test(self, sample) -> None:
+        if not self._is_test_recording_phase():
+            return
+        self._eeg_raw_record.append(sample.channel1)
+        expected_channels = self._eeg_protocol_channel_count()
+        channels = sample.channels[:expected_channels]
+        for index, value in enumerate(channels):
+            if index < len(self._eeg_multi_raw_records):
+                self._eeg_multi_raw_records[index].append(int(value))
 
     def _update_test_countdown_lcd(self) -> None:
         if self._test_duration_sec is None or self._test_started_at is None:
@@ -2521,6 +2553,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         *,
         session_dir: Optional[Path] = None,
         name_stem: str = "eeg_raw",
+        raw_values: Optional[Iterable[int]] = None,
+        channel_column: str = "ch1_raw",
         save_bursts: bool = True,
         quiet_empty: bool = False,
         save_cleaned: bool = True,
@@ -2530,7 +2564,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         save_cleaned=True：同时写 {stem}.csv（本段当场剔坏，仅适合单段短时测试）。
         长时 chunk 应 save_cleaned=False，只写 *_full.csv；剔坏文件改由路径B在结束后统一生成。
         """
-        if not self._eeg_raw_record:
+        record = list(self._eeg_raw_record if raw_values is None else raw_values)
+        if not record:
             if not quiet_empty:
                 self._log("定时测试结束，但没有 EEG raw 数据可保存")
             return None
@@ -2542,14 +2577,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         cleaned_path = session_dir / f"{name_stem}.csv"
         full_path = session_dir / f"{name_stem}_full.csv"
         sample_rate = self._measured_eeg_sample_rate()
-        raw = np.asarray(self._eeg_raw_record, dtype=np.int64)
+        raw = np.asarray(record, dtype=np.int64)
         quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
         reject_rate = quality.reject_rate
         suspicious_rate = quality.suspicious_rate
         try:
             with full_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(["index", "time_s", "ch1_raw"])
+                writer.writerow(["index", "time_s", channel_column])
                 for index, value in enumerate(raw):
                     writer.writerow([index, index / sample_rate, int(value)])
             self._log(
@@ -2561,7 +2596,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 cleaned_raw, _, removed_points = clean_raw_signal(raw, quality)
                 with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
-                    writer.writerow(["index", "time_s", "ch1_raw"])
+                    writer.writerow(["index", "time_s", channel_column])
                     for index, value in enumerate(cleaned_raw):
                         writer.writerow([index, index / sample_rate, int(value)])
                 out_cleaned = cleaned_path
@@ -2580,6 +2615,38 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         except OSError as exc:
             self._log(f"保存 EEG raw CSV 失败: {exc}")
             return None
+
+    def _save_multi_channel_timed_records(
+        self,
+    ) -> List[Tuple[int, Optional[Path], Path, float, float]]:
+        channel_count = min(self._eeg_protocol_channel_count(), EEG_MULTI_CHANNEL_COUNT)
+        session_dir = self._resolve_session_dir()
+        saved: List[Tuple[int, Optional[Path], Path, float, float]] = []
+        for index in range(channel_count):
+            record = self._eeg_multi_raw_records[index]
+            if index == 0 and not record:
+                record = self._eeg_raw_record
+            if not record:
+                self._log(f"CH{index + 1} timed record has no data, skipped")
+                continue
+            channel_dir = session_dir / f"ch{index + 1}"
+            result = self._save_eeg_raw_csv(
+                session_dir=channel_dir,
+                name_stem="eeg_raw",
+                raw_values=record,
+                channel_column=f"ch{index + 1}_raw",
+                save_bursts=False,
+                save_cleaned=True,
+            )
+            if result is None:
+                continue
+            cleaned_path, full_path, sample_rate, reject_rate = result
+            saved.append((index + 1, cleaned_path, full_path, sample_rate, reject_rate))
+        if saved:
+            self._save_sleep_aid_bursts_csv(session_dir, saved[0][3])
+            self._last_eeg_session_dir = session_dir
+            self._log(f"Multi-channel timed record saved under: {session_dir}")
+        return saved
 
     def _save_path_b_cleaned_csv(self, session_dir: Path) -> Optional[List[Path]]:
         """路径B：拼所有 *_full → 统一剔坏 → 按各 full 原始区间拆成对应分段 clean 文件。
@@ -3199,6 +3266,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._waveform.show()
             self._waveform.raise_()
 
+    def _clear_eeg_waveforms(self) -> None:
+        self._waveform.clear()
+        self._multi_waveform.clear()
+
     @QtCore.pyqtSlot(int)
     def _on_eeg_channel_mode_changed(self, index: int) -> None:
         if index == 2:
@@ -3239,8 +3310,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._rhythm.reset()
         for processor in self._multi_rhythm:
             processor.reset()
-        self._waveform.clear()
-        self._multi_waveform.clear()
+        self._clear_eeg_waveforms()
         self._apply_display_mode(self._current_display_mode())
         if self._active_view == "eeg" and not (self._offline_view_active or self._analysis_plot_active):
             self._show_current_eeg_waveform()
@@ -3804,7 +3874,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._rhythm.reset()
                 self._alpha_rejector.reset()
                 self._reset_alpha_display_stats()
-                self._waveform.clear()
+                self._clear_eeg_waveforms()
                 if flushed:
                     self._log(f"EEG 已丢弃暂停期间积压的 {flushed} 字节")
             else:
@@ -3848,7 +3918,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     else:
                         self._log("手动停止长时记录：无数据可保存")
                 else:
-                    self._eeg_raw_record.clear()
+                    self._clear_eeg_raw_records()
                     self._sleep_aid_burst_record.clear()
                     self._reset_timed_test_state()
                     self._log("手动停止测试：未保存任何记录")
@@ -3884,8 +3954,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     channels = sample.channels[:expected_channels]
                     if len(channels) < expected_channels:
                         continue
-                    if self._is_test_recording_phase():
-                        self._eeg_raw_record.append(sample.channel1)
+                    self._record_eeg_sample_for_timed_test(sample)
                     self._sample_count += 1
                     self._decim_counter += 1
                     if band is None:
@@ -3919,8 +3988,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 band = "alpha"
 
             for sample in samples:
-                if self._is_test_recording_phase():
-                    self._eeg_raw_record.append(sample.channel1)
+                self._record_eeg_sample_for_timed_test(sample)
                 self._sample_count += 1
                 self._decim_counter += 1
                 value = self._rhythm.push(sample.channel1, band)
