@@ -40,6 +40,7 @@ from power_cal import (  ## 节律滤波与频段定义
 from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     RealtimeAlphaThresholdRejector,
     RealtimeQualityGate,
+    build_raw_remove_mask,
     build_threshold_rejection,
     clean_raw_signal,
 )
@@ -1360,23 +1361,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_waveform.refresh_layout()
 
     def _setup_offline_viewer_ui(self) -> None:
-        """离线波形与分钟功率同一套路径B：拼 full → 统一剔坏段 → 可选按分钟截取。"""
+        """离线波形：选 *_full 显示完整 raw；选无 _full 显示已剔坏文件。"""
         edit = self.ui.lineEdit_offline_path
         if not edit.text().strip():
-            edit.setPlaceholderText("选会话内任一 CSV（路径B：full拼接→剔坏）")
+            edit.setPlaceholderText("选 CSV：*_full=完整，无full=剔坏后")
         edit.setToolTip(
-            "选会话目录中任一 EEG CSV 即可。"
-            "加载与分钟功率相同（路径B）：拼接 eeg_chunk_*_full → 统一剔坏段 → 显示；"
-            "填写分钟则在剔坏后时间轴上截取。"
+            "选 eeg_chunk_XXX_full.csv → 完整原始；选 eeg_chunk_XXX.csv → 剔坏后。"
+            "分钟从所选文件起点计；跨度超过该文件时，自动向后拼接同类型 chunk。"
         )
         self.ui.lineEdit_offline_min_start.setToolTip(
-            "起始分钟（含）。在 full拼接并统一剔坏后的时间轴上截取，与功率图分钟对齐。"
+            "起始分钟（含）。从所选文件起点计；超出单文件则向后拼接。"
         )
         self.ui.lineEdit_offline_min_end.setToolTip(
-            "结束分钟（含）。例如 3 与 9 → 显示剔坏后第 3～9 分钟。"
+            "结束分钟（含）。例如 1 与 25 → 从所选文件起共 25 分钟（不足则拼接后续 chunk）。"
         )
         self.ui.pushButton_load_offline.setToolTip(
-            "路径B：拼 full → 剔坏段 →（可选）截取分钟后显示"
+            "*_full → 完整；无 _full → 剔坏后；分钟超出单文件则自动拼接"
         )
         self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
 
@@ -1387,7 +1387,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not start_text and not end_text:
             return None
         if not start_text or not end_text:
-            raise ValueError("请同时填写起始分钟与结束分钟，或都留空显示剔坏后全部")
+            raise ValueError("请同时填写起始分钟与结束分钟，或都留空显示全部")
         try:
             start_m = int(float(start_text))
             end_m = int(float(end_text))
@@ -1399,65 +1399,101 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raise ValueError(f"结束分钟 {end_m} 不能小于起始分钟 {start_m}")
         return start_m, end_m
 
-    def _offline_path_b_source(self, path: Path) -> Path:
-        """路径B数据源：会话有 chunk full 则用目录；否则用对应 full 或所选文件。"""
+    @staticmethod
+    def _is_offline_full_csv(path: Path) -> bool:
+        """文件名以 _full.csv 结尾 → 完整原始；否则视为剔坏后文件。"""
+        return path.name.lower().endswith("_full.csv")
+
+    def _list_offline_sibling_chunks(self, path: Path) -> List[Path]:
+        """同会话、同类型（full / 剔坏）的 eeg_chunk_* 按序号排列。"""
         import re
 
-        from LongRecordNormalReport import list_chunk_full_csvs
+        from LongRecordNormalReport import _chunk_sort_key
 
         parent = path.parent
-        if list_chunk_full_csvs(parent):
-            return parent
-
-        if re.fullmatch(r"eeg_chunk_\d+\.csv", path.name, flags=re.IGNORECASE):
-            full = parent / path.name.replace(".csv", "_full.csv")
-            if full.is_file():
-                return full
-        if path.name.lower() == "eeg_raw.csv":
-            full = parent / "eeg_raw_full.csv"
-            if full.is_file():
-                return full
-        return path
+        if self._is_offline_full_csv(path):
+            return sorted(parent.glob("eeg_chunk_*_full.csv"), key=_chunk_sort_key)
+        cleaned: List[Path] = []
+        for p in parent.glob("eeg_chunk_*.csv"):
+            name = p.name
+            if name.lower().endswith("_full.csv"):
+                continue
+            if re.fullmatch(r"eeg_chunk_\d+\.csv", name, flags=re.IGNORECASE):
+                cleaned.append(p)
+        return sorted(cleaned, key=_chunk_sort_key)
 
     def _load_offline_selected_slice(
         self,
         path: Path,
         minute_range: Optional[Tuple[int, int]],
     ) -> tuple[np.ndarray, float, str, float]:
-        """路径B：与分钟功率一致——full（可多chunk拼接）→ 统一剔坏段 → 可选截取分钟。"""
-        from LongRecordMinuteBandPower import load_raw_for_minute_analysis
-
-        source = self._offline_path_b_source(path)
-        raw, fs, source_desc = load_raw_for_minute_analysis(source)
-        quality = build_threshold_rejection(raw.astype(np.float64), float(fs))
-        cleaned, _, n_removed = clean_raw_signal(raw.astype(np.int64), quality)
-        cleaned = cleaned.astype(np.float64)
-        cleaned_min = cleaned.size / float(fs) / 60.0 if fs > 0 else 0.0
-        base_title = (
-            f"路径B·{source_desc}·剔坏后"
-            f"（删{n_removed}点，约{cleaned_min:.1f}分钟）"
-        )
+        """按所选文件类型加载；分钟跨度超出单文件时向后拼接同类型 chunk。"""
+        raw, fs = load_eeg_csv_with_rate(path)
+        data = np.asarray(raw, dtype=np.float64)
+        fs = float(fs)
+        is_full = self._is_offline_full_csv(path)
+        kind = "完整" if is_full else "剔坏后"
+        used_names = [path.name]
 
         if minute_range is None:
-            if cleaned.size < 8:
-                raise ValueError("剔坏后有效样本过少")
-            return cleaned, float(fs), base_title, 0.0
+            if data.size < 8:
+                raise ValueError(f"{kind}数据有效样本过少")
+            base_title = f"{kind}·{path.name}"
+            return data, fs, base_title, 0.0
 
         start_m, end_m = minute_range
-        n_per_min = max(1, int(round(float(fs) * 60.0)))
+        n_per_min = max(1, int(round(fs * 60.0)))
         i0 = (start_m - 1) * n_per_min
         i1 = end_m * n_per_min
-        if i0 >= cleaned.size:
+
+        siblings = self._list_offline_sibling_chunks(path)
+        need_concat = i1 > data.size or i0 >= data.size
+        path_res = path.resolve()
+        sibling_res = [p.resolve() for p in siblings]
+        if need_concat and path_res in sibling_res:
+            # 从所选 chunk 起向后拼，直到覆盖结束分钟（或拼完）
+            start_idx = sibling_res.index(path_res)
+            parts: List[np.ndarray] = []
+            used_names = []
+            total = 0
+            rates: List[float] = []
+            for p in siblings[start_idx:]:
+                raw_i, fs_i = load_eeg_csv_with_rate(p)
+                parts.append(np.asarray(raw_i, dtype=np.float64))
+                rates.append(float(fs_i))
+                used_names.append(p.name)
+                total += int(parts[-1].size)
+                if total >= i1:
+                    break
+            data = np.concatenate(parts) if parts else data
+            if rates:
+                fs = float(np.median(np.asarray(rates, dtype=np.float64)))
+                n_per_min = max(1, int(round(fs * 60.0)))
+                i0 = (start_m - 1) * n_per_min
+                i1 = end_m * n_per_min
+
+        total_min = data.size / fs / 60.0 if fs > 0 else 0.0
+        if i0 >= data.size:
             raise ValueError(
-                f"起始分钟 {start_m} 超出剔坏后长度（约 {cleaned_min:.1f} 分钟）；"
-                f"与功率图同一时间轴"
+                f"起始分钟 {start_m} 超出{kind}可用长度（约 {total_min:.1f} 分钟；"
+                f"已用 {', '.join(used_names[:3])}"
+                f"{'…' if len(used_names) > 3 else ''}）"
             )
-        segment = cleaned[i0 : min(i1, int(cleaned.size))]
+        segment = data[i0 : min(i1, int(data.size))]
         if segment.size < 8:
             raise ValueError(f"截取后样本过少（{segment.size} 点）")
         time_offset_s = float((start_m - 1) * 60)
+        if len(used_names) == 1:
+            base_title = f"{kind}·{used_names[0]}"
+        else:
+            base_title = (
+                f"{kind}·拼接{len(used_names)}个"
+                f"（{used_names[0]}…{used_names[-1]}）"
+            )
         title = f"{base_title} · 分钟{start_m}–{end_m}"
-        return segment, float(fs), title, time_offset_s
+        if segment.size < (i1 - i0):
+            title += f"（实际约 {segment.size / fs / 60.0:.1f} 分钟，后续 chunk 不足）"
+        return segment, fs, title, time_offset_s
 
     def _browse_offline_eeg_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1504,11 +1540,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raw, fs, title, time_offset_s = self._load_offline_selected_slice(
                 path, minute_range
             )
+            remove_mask = None
+            if self._want_reject_mask_power() and self._is_offline_full_csv(path):
+                quality = build_threshold_rejection(
+                    raw.astype(np.float64), float(fs)
+                )
+                remove_mask = build_raw_remove_mask(
+                    quality, int(raw.size), remove_suspicious=True
+                )
+                n_bad = int(np.count_nonzero(remove_mask))
+                title = f"{title} · 坏段标红({n_bad}点)"
             n, fs = self._offline_view.load_raw(
                 raw,
                 fs,
                 source_name=title,
                 time_offset_s=time_offset_s,
+                remove_mask=remove_mask,
             )
         except Exception as exc:
             self._log(f"离线加载失败 ({path.name}): {exc}")
@@ -1536,9 +1583,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             if minute_range is not None
             else ""
         )
+        mark_tip = "；红带标注坏段" if remove_mask is not None else ""
         self._log(
             f"离线查看已加载: {title}（{n} 点 @ {fs:.0f} Hz"
-            f"{range_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
+            f"{range_tip}{mark_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
         )
         self._update_status_bar()
 
@@ -1765,28 +1813,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "用当前填写的段时间，在左侧显示区绘制单段功率或分段对比图"
         )
 
-        if not hasattr(self.ui, "checkBox_minute_abs"):
-            self.ui.checkBox_minute_abs = QtWidgets.QCheckBox(
-                "绝对功率", self.ui.groupBox_compare
-            )
-            self.ui.checkBox_minute_abs.setObjectName("checkBox_minute_abs")
-            self.ui.checkBox_minute_abs.setToolTip(
-                "勾选后在左侧显示每分钟五节律绝对功率曲线；"
-                "长时多 chunk 会先按序号拼接再计算"
-            )
-            self.ui.gridLayout_compare.addWidget(self.ui.checkBox_minute_abs, 3, 0, 1, 2)
-            self.ui.checkBox_minute_rel = QtWidgets.QCheckBox(
-                "相对功率", self.ui.groupBox_compare
-            )
-            self.ui.checkBox_minute_rel.setObjectName("checkBox_minute_rel")
-            self.ui.checkBox_minute_rel.setToolTip(
-                "勾选后在左侧显示每分钟五节律相对功率曲线；"
-                "可与「绝对功率」同时勾选（上下两图）"
-            )
-            self.ui.gridLayout_compare.addWidget(self.ui.checkBox_minute_rel, 3, 2, 1, 3)
-            self.ui.checkBox_minute_abs.toggled.connect(self._on_minute_power_toggled)
-            self.ui.checkBox_minute_rel.toggled.connect(self._on_minute_power_toggled)
-
         self.ui.checkBox_minute_abs.setToolTip(
             "勾选后在左侧显示按「窗长」切片的五节律绝对功率曲线；"
             "长时多 chunk 会先按序号拼接再计算"
@@ -1799,8 +1825,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self.ui.lineEdit_power_window_sec.setText("60")
         self.ui.lineEdit_power_window_sec.setPlaceholderText("默认60")
         self.ui.lineEdit_power_window_sec.setToolTip(
-            "绝对/相对功率按此时长切片。"
-            "填 30 → 每 30 秒一窗；"
+            "绝对/相对功率按此时长切片：填 30 → 每 30 秒一窗；"
             "填 60 → 每 60 秒一窗。留空同 60。"
         )
         self.ui.checkBox_reject_mask_power.setToolTip(
@@ -1837,6 +1862,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(bool)
     def _on_reject_mask_power_toggled(self, _checked: bool = False) -> None:
+        """标红/不拼接开关：刷新离线红带；若已勾功率则重算。"""
         if self._offline_view_active and self._offline_csv_path is not None:
             self._load_offline_eeg_csv()
         if (
@@ -2129,30 +2155,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(bool)
     def _on_minute_power_toggled(self, _checked: bool = False) -> None:
-        want_abs = bool(
-            getattr(self.ui, "checkBox_minute_abs", None)
-            and self.ui.checkBox_minute_abs.isChecked()
-        )
-        want_rel = bool(
-            getattr(self.ui, "checkBox_minute_rel", None)
-            and self.ui.checkBox_minute_rel.isChecked()
-        )
+        want_abs = bool(self.ui.checkBox_minute_abs.isChecked())
+        want_rel = bool(self.ui.checkBox_minute_rel.isChecked())
         if not want_abs and not want_rel:
             if self._analysis_plot_active:
                 self._analysis_plot.clear()
-                self._log("已取消每分钟功率图显示（未勾选绝对/相对功率）")
+                self._log("已取消功率窗图显示（未勾选绝对/相对功率）")
             return
 
         source = self._resolve_minute_power_source()
         if source is None:
-            self._log("未选择数据，无法绘制每分钟功率图")
+            self._log("未选择数据，无法绘制功率窗图")
             # 取消勾选，避免反复弹窗
-            for name in ("checkBox_minute_abs", "checkBox_minute_rel"):
-                cb = getattr(self.ui, name, None)
-                if cb is not None:
-                    cb.blockSignals(True)
-                    cb.setChecked(False)
-                    cb.blockSignals(False)
+            for cb in (self.ui.checkBox_minute_abs, self.ui.checkBox_minute_rel):
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.blockSignals(False)
             return
 
         try:
@@ -2173,20 +2191,32 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 source, window_sec=window_sec, no_splice=no_splice
             )
         except Exception as exc:
-            self._log(f"每分钟功率计算失败: {exc}")
+            self._log(f"功率窗计算失败: {exc}")
             return
 
         if meta["n_minutes"] <= 0:
-            self._log("有效数据不足 1 分钟，无法绘制每分钟功率图")
-            return
+            has_regions = bool(
+                no_splice
+                and (
+                    meta.get("bad_spans")
+                    or meta.get("short_good_spans")
+                    or meta.get("gated_spans")
+                )
+            )
+            if not has_regions:
+                self._log(f"有效数据不足 {window_sec:g} s，无法绘制功率图")
+                return
 
         kinds = []
         if want_abs:
             kinds.append("绝对")
         if want_rel:
             kinds.append("相对")
+        win = float(meta.get("window_sec", window_sec))
+        x_as_time = bool(meta.get("x_as_time_s", False))
+        mode = "不拼接·好段内窗" if no_splice else "剔坏拼接后"
         title = (
-            f"每分钟节律{'/'.join(kinds)}功率（坏段剔除后，N={meta['n_minutes']}）"
+            f"每 {win:g} s 节律{'/'.join(kinds)}功率（{mode}，N={meta['n_minutes']}）"
             f" · {meta['source_desc']}"
         )
         try:
@@ -2195,24 +2225,32 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 absolute=absolute if want_abs else None,
                 relative=relative if want_rel else None,
                 title=title,
-                window_sec=float(meta.get("window_sec", window_sec)),
-                x_as_time_s=bool(meta.get("x_as_time_s", False)),
+                figure=self._analysis_plot.figure,
+                window_sec=win,
+                x_as_time_s=x_as_time,
                 bad_spans=meta.get("bad_spans") if no_splice else None,
                 short_good_spans=meta.get("short_good_spans") if no_splice else None,
                 gated_spans=meta.get("gated_spans") if no_splice else None,
                 total_duration_s=meta.get("total_duration_s") if no_splice else None,
-                figure=self._analysis_plot.figure,
             )
         except Exception as exc:
-            self._log(f"每分钟功率绘图失败: {exc}")
+            self._log(f"功率窗绘图失败: {exc}")
             return
 
         self._show_analysis_plot_view()
         self._analysis_plot.refresh()
+        n_bad = len(meta.get("bad_spans") or [])
+        n_short = len(meta.get("short_good_spans") or [])
+        n_gated = int(meta.get("n_gated") or 0)
+        region_tip = (
+            f"；坏段 {n_bad} 段，过短 {n_short} 段，门控丢弃 {n_gated} 窗"
+            if no_splice
+            else ""
+        )
         self._log(
-            f"已显示每分钟{'/'.join(kinds)}功率："
-            f"{meta['source_desc']}，N={meta['n_minutes']} 分钟"
-            f"（剔除 {meta['n_removed']} 点）"
+            f"已显示每 {win:g} s {'/'.join(kinds)}功率（{mode}）："
+            f"{meta['source_desc']}，N={meta['n_minutes']} 窗"
+            f"（坏点 {meta['n_removed']}）{region_tip}"
         )
 
     def _show_analysis_plot_view(self) -> None:
@@ -2593,7 +2631,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
             out_cleaned: Optional[Path] = None
             if save_cleaned:
-                cleaned_raw, _, removed_points = clean_raw_signal(raw, quality)
+                cleaned_raw, _, removed_points = clean_raw_signal(
+                    raw, quality, sample_rate=sample_rate
+                )
                 with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(["index", "time_s", channel_column])
@@ -2680,7 +2720,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             sample_rate = float(np.median(np.asarray(rates, dtype=np.float64)))
             quality = build_threshold_rejection(raw, sample_rate)
             cleaned, kept_index, n_removed = clean_raw_signal(
-                raw.astype(np.int64), quality
+                raw.astype(np.int64), quality, sample_rate=sample_rate
             )
             cleaned = np.asarray(cleaned)
             kept_index = np.asarray(kept_index, dtype=np.int64)
@@ -2739,7 +2779,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"正常段报告生成失败: {exc}")
 
     def _run_long_record_minute_band_power(self, session_dir: Path) -> None:
-        """长时记录结束：坏段剔除后按分钟算五节律绝对功率，只画一张折线图。"""
+        """长时记录结束：坏段剔除后按窗长算五节律绝对功率，只画一张折线图。"""
         try:
             from LongRecordMinuteBandPower import run_minute_band_power_analysis
 
@@ -2757,9 +2797,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             for line in result.report_text.splitlines():
                 self._log(line)
             if result.plot_path is not None:
-                self._log(f"每分钟绝对功率图已保存: {result.plot_path}")
+                self._log(f"功率窗图已保存: {result.plot_path}")
         except Exception as exc:
-            self._log(f"每分钟节律绝对功率分析失败: {exc}")
+            self._log(f"节律功率窗分析失败: {exc}")
 
     def _run_long_record_postprocess(self, session_dir: Path) -> None:
         """长时记录结束后：路径B删减CSV + 正常段报告 + 每分钟绝对功率图。"""
