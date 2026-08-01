@@ -1475,7 +1475,7 @@ def main() -> None:
     show_waveform = True    # 是否弹出各节律波形图窗口
     save_waveform = True   # 是否保存波形图 (*_band_waveform.png)
     waveform_seconds = 0  # 从 0 秒起显示 N 秒；None 则显示整段（time_range 未设置时）
-    waveform_time_range = (0, 60)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
+    waveform_time_range = (0, 61)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
     show_fft = True
     save_fft = True
     fft_time_range = None  # None=整段 FFT；(10, 20) 仅对 10–20 s 画 FFT
