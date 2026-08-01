@@ -1468,14 +1468,14 @@ def run_analysis(
 
 def main() -> None:
     # ========== 在此修改输入文件 ==========
-    xlsx_file = r"Result/20260710_195055_前60秒双耳节拍200和210/eeg_raw_full.csv"
+    xlsx_file = r"C:\Users\liudi\Desktop\Host_computer_6\Result\20260731_012606\eeg_chunk_010.csv"
     sample_rate = DEFAULT_SAMPLE_RATE  # EEG 采样率 (Hz)，一般为 500
     show_plot = True        # 是否弹出功率图窗口
     save_plot = True       # 是否保存功率图 (*_band_power.png)
     show_waveform = True    # 是否弹出各节律波形图窗口
     save_waveform = True   # 是否保存波形图 (*_band_waveform.png)
     waveform_seconds = 0  # 从 0 秒起显示 N 秒；None 则显示整段（time_range 未设置时）
-    waveform_time_range = (0, 360)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
+    waveform_time_range = (0, 60)  # 指定时间段 (起始秒, 结束秒)，如 (10, 20)
     show_fft = True
     save_fft = True
     fft_time_range = None  # None=整段 FFT；(10, 20) 仅对 10–20 s 画 FFT
