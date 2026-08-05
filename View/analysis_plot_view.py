@@ -1,17 +1,27 @@
-"""主显示区嵌入的 matplotlib 视图：离线分层波形 + 功率分析图。"""
+"""Embedded matplotlib views for offline EEG waveform and power plots."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
+import matplotlib
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
+
+matplotlib.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",
+    "SimHei",
+    "SimSun",
+    "Arial Unicode MS",
+    "DejaVu Sans",
+]
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -35,28 +45,37 @@ CHANNEL_COLORS = {
     **BAND_COLORS,
 }
 MAX_PLOT_POINTS = 25000
-# 短区间提高上限：约 5 分钟 @500Hz 可接近全分辨率
+
+class OfflineEegFileInfo(NamedTuple):
+    channel_labels: List[str]
+    channel_rates: List[float]
+    channel_samples: List[int]
+    channel_units: List[str]
+
+
+# Higher cap for short windows so local EDF browsing keeps detail.
 MAX_PLOT_POINTS_SHORT = 200000
 
 
 def _adaptive_max_plot_points(n_samples: int, sample_rate: float) -> int:
-    """显示越短，允许的绘图点数越多，短窗尽量少抽点。"""
+    """Choose a plot-point budget based on visible duration."""
     n = max(0, int(n_samples))
     fs = float(sample_rate) if sample_rate and sample_rate > 0 else float(DEFAULT_SAMPLE_RATE)
     duration_s = n / fs if fs > 0 else 0.0
     if duration_s <= 0:
         return MAX_PLOT_POINTS
-    if duration_s <= 60:  # ≤1 分钟：尽量全点
+    if duration_s <= 60:
         return max(MAX_PLOT_POINTS_SHORT, n)
-    if duration_s <= 180:  # ≤3 分钟（如 12–15）：高分辨率
+    if duration_s <= 180:
         return MAX_PLOT_POINTS_SHORT
-    if duration_s <= 600:  # ≤10 分钟
+    if duration_s <= 600:
         return 80000
     return MAX_PLOT_POINTS
 
 
+
 def _time_tick_step_seconds(span_s: float) -> float:
-    """按可见时间跨度选刻度间隔；宽窗用 60 s，放大后加密以保证仍有刻度。"""
+    """Choose a readable x-axis major tick spacing."""
     span = abs(float(span_s))
     if span <= 0:
         return 60.0
@@ -71,8 +90,8 @@ def _time_tick_step_seconds(span_s: float) -> float:
     return 0.5
 
 
-def load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
-    """读取 EEG CSV，返回 (raw, sample_rate)。优先 ch1_raw，可用 time_s 估采样率。"""
+def _load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
+    """Read EEG CSV/TXT and return (raw, sample_rate)."""
     frame = pd.read_csv(path)
     if "ch1_raw" in frame.columns:
         series = frame["ch1_raw"]
@@ -93,10 +112,149 @@ def load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
     return raw, sample_rate
 
 
+def _load_eeg_edf_with_rate(path: Path) -> tuple[np.ndarray, float]:
+    """Read the first signal channel from EDF/BDF and return (raw, sample_rate)."""
+    try:
+        import pyedflib  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "缂哄皯 pyedflib锛屾棤娉曡鍙?EDF/BDF銆傝鍏堟墽琛? pip install pyedflib"
+        ) from exc
+
+    reader = pyedflib.EdfReader(str(path))
+    try:
+        n_signals = int(reader.signals_in_file)
+        if n_signals <= 0:
+            raise ValueError(f"EDF/BDF 涓病鏈変俊鍙烽€氶亾: {path.name}")
+        raw = reader.readSignal(0).astype(np.float64, copy=False)
+        try:
+            sample_rate = float(reader.getSampleFrequency(0))
+        except AttributeError:
+            sample_rate = float(reader.samplefrequency(0))
+    finally:
+        close = getattr(reader, "close", None) or getattr(reader, "_close", None)
+        if close is not None:
+            close()
+
+    if raw.size < 8:
+        raise ValueError(f"鏈夋晥鏍锋湰杩囧皯 ({raw.size}): {path.name}")
+    if sample_rate <= 0:
+        raise ValueError(f"EDF/BDF 閲囨牱鐜囨棤鏁?({sample_rate:g}): {path.name}")
+    return raw, sample_rate
+
+
+def _open_pyedflib_reader(path: Path):
+    try:
+        import pyedflib  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "缂哄皯 pyedflib锛屾棤娉曡鍙?EDF/BDF銆傝鍏堟墽琛? pip install pyedflib"
+        ) from exc
+    return pyedflib.EdfReader(str(path))
+
+
+def _close_edf_reader(reader) -> None:
+    close = getattr(reader, "close", None) or getattr(reader, "_close", None)
+    if close is not None:
+        close()
+
+
+def _edf_physical_dimension(reader, channel_index: int) -> str:
+    try:
+        unit = str(reader.getPhysicalDimension(channel_index)).strip()
+    except Exception:
+        unit = ""
+    if unit in {"uV", "uv", "UV", "microV"}:
+        return "uV"
+    return unit or "uV"
+
+
+def load_eeg_file_info(path: Path) -> OfflineEegFileInfo:
+    """Return channel labels/rates/sample counts for CSV/TXT/EDF/BDF."""
+    suffix = path.suffix.lower()
+    if suffix not in {".edf", ".bdf"}:
+        raw, sample_rate = _load_eeg_csv_with_rate(path)
+        return OfflineEegFileInfo(["CH1"], [float(sample_rate)], [int(raw.size)], ["raw"])
+
+    reader = _open_pyedflib_reader(path)
+    try:
+        n_signals = int(reader.signals_in_file)
+        if n_signals <= 0:
+            raise ValueError(f"EDF/BDF 涓病鏈変俊鍙烽€氶亾: {path.name}")
+        try:
+            labels = list(reader.getSignalLabels())
+        except Exception:
+            labels = []
+        try:
+            samples = [int(v) for v in reader.getNSamples()]
+        except Exception:
+            samples = [0 for _ in range(n_signals)]
+        rates: List[float] = []
+        clean_labels: List[str] = []
+        units: List[str] = []
+        for index in range(n_signals):
+            try:
+                rate = float(reader.getSampleFrequency(index))
+            except AttributeError:
+                rate = float(reader.samplefrequency(index))
+            rates.append(rate)
+            label = labels[index].strip() if index < len(labels) else ""
+            clean_labels.append(label or f"CH{index + 1}")
+            units.append(_edf_physical_dimension(reader, index))
+    finally:
+        _close_edf_reader(reader)
+
+    return OfflineEegFileInfo(clean_labels, rates, samples, units)
+
+
+def load_eeg_file_channel(path: Path, channel_index: int = 0) -> tuple[np.ndarray, float, str, str]:
+    """Read one EEG channel and return (values, sample_rate, label, y_unit)."""
+    suffix = path.suffix.lower()
+    if suffix not in {".edf", ".bdf"}:
+        raw, sample_rate = _load_eeg_csv_with_rate(path)
+        return raw, sample_rate, "CH1", "raw"
+
+    reader = _open_pyedflib_reader(path)
+    try:
+        n_signals = int(reader.signals_in_file)
+        if n_signals <= 0:
+            raise ValueError(f"EDF/BDF 涓病鏈変俊鍙烽€氶亾: {path.name}")
+        index = max(0, min(int(channel_index), n_signals - 1))
+        try:
+            labels = list(reader.getSignalLabels())
+        except Exception:
+            labels = []
+        label = labels[index].strip() if index < len(labels) else ""
+        label = label or f"CH{index + 1}"
+        unit = _edf_physical_dimension(reader, index)
+        raw = reader.readSignal(index).astype(np.float64, copy=False)
+        try:
+            sample_rate = float(reader.getSampleFrequency(index))
+        except AttributeError:
+            sample_rate = float(reader.samplefrequency(index))
+    finally:
+        _close_edf_reader(reader)
+
+    if raw.size < 8:
+        raise ValueError(f"鏈夋晥鏍锋湰杩囧皯 ({raw.size}): {path.name}")
+    if sample_rate <= 0:
+        raise ValueError(f"EDF/BDF 閲囨牱鐜囨棤鏁?({sample_rate:g}): {path.name}")
+    return raw, sample_rate, label, unit
+
+
+def load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
+    """Read an offline EEG file (CSV/TXT/EDF/BDF) and return (raw, sample_rate)."""
+    suffix = path.suffix.lower()
+    if suffix in {".edf", ".bdf"}:
+        raw, sample_rate, _label, _unit = load_eeg_file_channel(path, 0)
+        return raw, sample_rate
+    return _load_eeg_csv_with_rate(path)
+
+
 def _downsample_pair(
     time_s: np.ndarray, values: np.ndarray, max_points: int = MAX_PLOT_POINTS
 ) -> tuple[np.ndarray, np.ndarray]:
-    """过长时按桶保留 min/max，避免等间隔抽点造成假尖峰/形貌失真。"""
+    """Downsample long signals while preserving min/max envelope."""
     n = int(values.size)
     if n <= max_points:
         return time_s, values
@@ -120,7 +278,7 @@ def _downsample_pair(
 
 
 class _MatplotlibHostView(QtWidgets.QWidget):
-    """工具栏 + FigureCanvas 公共底座。"""
+    """Shared matplotlib toolbar and canvas host."""
 
     def __init__(
         self,
@@ -129,17 +287,37 @@ class _MatplotlibHostView(QtWidgets.QWidget):
         empty_message: str = "",
     ) -> None:
         super().__init__(parent)
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        self._layout = QtWidgets.QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
 
         self._figure = Figure(tight_layout=True)
         self._canvas = FigureCanvasQTAgg(self._figure)
         self._toolbar = NavigationToolbar2QT(self._canvas, self)
-        layout.addWidget(self._toolbar)
-        layout.addWidget(self._canvas, stretch=1)
+        self._layout.addWidget(self._toolbar)
+        self._layout.addWidget(self._canvas, stretch=1)
         if empty_message:
             self._draw_empty(empty_message)
+
+        self.scroll_panel = QtWidgets.QWidget(self)
+        scroll_layout = QtWidgets.QHBoxLayout(self.scroll_panel)
+        scroll_layout.setContentsMargins(6, 2, 6, 2)
+        scroll_layout.setSpacing(6)
+        self.prev_button = QtWidgets.QPushButton("<", self.scroll_panel)
+        self.next_button = QtWidgets.QPushButton(">", self.scroll_panel)
+        self.time_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, self.scroll_panel)
+        self.time_slider.setRange(0, 0)
+        self.time_slider.setEnabled(False)
+        self.time_status = QtWidgets.QLabel("0.0-0.0 s", self.scroll_panel)
+        self.time_status.setMinimumWidth(170)
+        self.time_status.setAlignment(QtCore.Qt.AlignCenter)
+        scroll_layout.addWidget(QtWidgets.QLabel("时间", self.scroll_panel))
+        scroll_layout.addWidget(self.prev_button)
+        scroll_layout.addWidget(self.time_slider, stretch=1)
+        scroll_layout.addWidget(self.next_button)
+        scroll_layout.addWidget(self.time_status)
+        self._layout.addWidget(self.scroll_panel)
+        self.scroll_panel.hide()
 
     @property
     def figure(self) -> Figure:
@@ -166,17 +344,17 @@ class _MatplotlibHostView(QtWidgets.QWidget):
 
 
 class AnalysisPlotView(_MatplotlibHostView):
-    """单段 band_power / 多段功率对比图。"""
+    """Single/multi-segment band-power plot view."""
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent, empty_message="填写段时间后点击「功率对比」")
+        super().__init__(parent, empty_message="填写时间段后点击功率对比")
 
     def clear(self) -> None:
-        self._draw_empty("填写段时间后点击「功率对比」")
+        self._draw_empty("填写时间段后点击功率对比")
 
 
 class OfflineRhythmStackView(_MatplotlibHostView):
-    """分层波形：勾选通道显示；工具栏可拖拽平移/缩放横纵轴。"""
+    """Stacked offline EEG waveform view."""
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         self._sample_rate = float(DEFAULT_SAMPLE_RATE)
@@ -186,7 +364,9 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._source_name = ""
         self._axes: List = []
         self._remove_mask: Optional[np.ndarray] = None
-        super().__init__(parent, empty_message="选择 CSV 并点击「加载」")
+        self._y_limits: Optional[tuple[float, float]] = None
+        self._raw_y_label = "raw"
+        super().__init__(parent, empty_message="选择 CSV/EDF 后点击加载")
 
     @property
     def has_data(self) -> bool:
@@ -206,7 +386,19 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._source_name = ""
         self._axes = []
         self._remove_mask = None
-        self._draw_empty("选择 CSV 并点击「加载」")
+        self._y_limits = None
+        self._raw_y_label = "raw"
+        self._draw_empty("选择 CSV/EDF 后点击加载")
+
+    def set_y_limits(self, y_min: Optional[float], y_max: Optional[float]) -> None:
+        if y_min is None or y_max is None:
+            self._y_limits = None
+        elif y_max <= y_min:
+            raise ValueError("Y轴上限必须大于下限")
+        else:
+            self._y_limits = (float(y_min), float(y_max))
+        if self.has_data:
+            self.redraw()
 
     def load_raw(
         self,
@@ -216,14 +408,12 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         source_name: str = "",
         time_offset_s: float = 0.0,
         remove_mask: Optional[np.ndarray] = None,
+        y_label: str = "raw",
     ) -> tuple[int, float]:
-        """用已截取/拼接的 raw 填充视图；横轴 = time_offset_s + 局部时间。
-
-        remove_mask: 与 raw 等长的布尔数组，True=坏段；在 raw 轴画红色高亮。
-        """
+        """Load a raw segment into the waveform view."""
         raw_arr = np.asarray(raw, dtype=np.float64)
         if raw_arr.size < 8:
-            raise ValueError(f"有效样本过少 ({raw_arr.size})")
+            raise ValueError(f"鏈夋晥鏍锋湰杩囧皯 ({raw_arr.size})")
         fs = float(sample_rate)
         bands = extract_band_waveforms(raw_arr, fs)
         n = int(raw_arr.size)
@@ -232,6 +422,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._time_s = time_s
         self._channels = {"raw": raw_arr, **bands}
         self._source_name = source_name or "offline"
+        self._raw_y_label = y_label or "raw"
         self._visible = ["raw"]
         if remove_mask is None:
             self._remove_mask = None
@@ -239,7 +430,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
             mask = np.asarray(remove_mask, dtype=bool).reshape(-1)
             if mask.size != n:
                 raise ValueError(
-                    f"remove_mask 长度 {mask.size} 与 raw {n} 不一致"
+                    f"remove_mask length {mask.size} does not match raw length {n}"
                 )
             self._remove_mask = mask
         self.redraw()
@@ -251,7 +442,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         return self.load_raw(raw, sample_rate, source_name=path.name)
 
     def set_visible_channels(self, names: Sequence[str]) -> None:
-        # raw 始终保留在最前
+        # Keep raw in front whenever it exists.
         ordered = ["raw"] if "raw" in self._channels else []
         for name in CHANNEL_ORDER:
             if name == "raw":
@@ -264,11 +455,11 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         if self.has_data:
             self.redraw()
         else:
-            self._draw_empty("请先加载 CSV")
+            self._draw_empty("璇峰厛鍔犺浇 CSV/EDF")
 
     @staticmethod
     def _mask_true_spans(mask: np.ndarray) -> List[tuple]:
-        """返回 mask 中连续 True 的 [start, end) 下标列表。"""
+        """Return contiguous True spans as [start, end) index pairs."""
         spans: List[tuple] = []
         n = int(mask.size)
         i = 0
@@ -290,7 +481,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         if "raw" in self._channels and "raw" not in visible:
             visible = ["raw"] + visible
         if not visible or self._time_s.size == 0:
-            self._draw_empty("请先加载 CSV")
+            self._draw_empty("璇峰厛鍔犺浇 CSV/EDF")
             return
 
         n = len(visible)
@@ -319,27 +510,28 @@ class OfflineRhythmStackView(_MatplotlibHostView):
                     t0 = float(t_full[i0])
                     t1 = float(t_full[i1 - 1]) + dt
                     ax.axvspan(t0, t1, color="#E53935", alpha=0.28, lw=0)
-            ax.set_ylabel(CHANNEL_LABELS.get(name, name), fontsize=9)
+            y_label = self._raw_y_label if name == "raw" else CHANNEL_LABELS.get(name, name)
+            ax.set_ylabel(y_label, fontsize=9)
+            if self._y_limits is not None:
+                ax.set_ylim(*self._y_limits)
             ax.grid(True, which="major", alpha=0.25)
             ax.tick_params(labelsize=8)
             self._axes.append(ax)
         axes[-1, 0].set_xlabel("Time (s)", fontsize=9)
         self._bind_time_axis_ticks(self._axes)
         title = self._source_name or "offline"
-        mark_tip = "  |  红带=坏段" if reject_spans else ""
+        mark_tip = " | bad segments marked" if reject_spans else ""
         self._figure.suptitle(
-            f"{title}  |  {self._sample_rate:.0f} Hz  |  raw 必显，勾选叠加节律"
-            f"{mark_tip}",
+            f"{title} | {self._sample_rate:.0f} Hz | waveform always shown{mark_tip}",
             fontsize=10,
         )
         self._figure.tight_layout()
         self._canvas.draw_idle()
 
     def _bind_time_axis_ticks(self, axes: Sequence) -> None:
-        """缩放/平移后仍保持横轴刻度可见（宽窗 60 s，缩放过细则加密）。"""
+        """Keep x-axis tick spacing readable after pan/zoom."""
         if not axes:
             return
-
         def _apply(_ax=None) -> None:
             ref = axes[-1]
             x0, x1 = ref.get_xlim()
@@ -350,5 +542,6 @@ class OfflineRhythmStackView(_MatplotlibHostView):
                 ax.grid(True, which="major", alpha=0.25)
 
         _apply()
-        # sharex：挂在任一轴即可，缩放工具栏会触发 xlim_changed
+        # sharex锛氭寕鍦ㄤ换涓€杞村嵆鍙紝缂╂斁宸ュ叿鏍忎細瑙﹀彂 xlim_changed
         axes[-1].callbacks.connect("xlim_changed", _apply)
+

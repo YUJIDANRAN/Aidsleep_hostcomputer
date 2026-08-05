@@ -1,0 +1,371 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>PsdAnalysisDialog</class>
+ <widget class="QDialog" name="PsdAnalysisDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>680</width>
+    <height>520</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>PSD/功率谱分析</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_dialog">
+   <property name="leftMargin">
+    <number>8</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
+   <item>
+    <widget class="QTabWidget" name="tabWidget_psd_analysis">
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="tab_custom_psd">
+      <attribute name="title">
+       <string>自定义PSD</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_custom_psd">
+       <item>
+        <layout class="QGridLayout" name="gridLayout_custom_psd">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_custom_psd_source">
+           <property name="text">
+            <string>数据来源</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1" colspan="3">
+          <widget class="QComboBox" name="comboBox_custom_psd_source">
+           <item>
+            <property name="text">
+             <string>当前离线显示窗口</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>当前完整文件/当前通道</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="label_custom_psd_start">
+           <property name="text">
+            <string>起始秒</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QLineEdit" name="lineEdit_custom_psd_start"/>
+         </item>
+         <item row="1" column="2">
+          <widget class="QLabel" name="label_custom_psd_end">
+           <property name="text">
+            <string>结束秒</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="3">
+          <widget class="QLineEdit" name="lineEdit_custom_psd_end"/>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="label_custom_psd_welch">
+           <property name="text">
+            <string>Welch窗长(s)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QLineEdit" name="lineEdit_custom_psd_welch">
+           <property name="text">
+            <string>2</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="2">
+          <widget class="QLabel" name="label_custom_psd_fmin">
+           <property name="text">
+            <string>频率下限(Hz)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="3">
+          <widget class="QLineEdit" name="lineEdit_custom_psd_fmin">
+           <property name="text">
+            <string>0.5</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="label_custom_psd_fmax">
+           <property name="text">
+            <string>频率上限(Hz)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1">
+          <widget class="QLineEdit" name="lineEdit_custom_psd_fmax">
+           <property name="text">
+            <string>40</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="0" colspan="4">
+          <widget class="QCheckBox" name="checkBox_custom_psd_exclude_bad">
+           <property name="text">
+            <string>排除会话红带坏段</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_custom_psd_plot">
+         <property name="text">
+          <string>绘制自定义PSD</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_custom_psd">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_mne_psd">
+      <attribute name="title">
+       <string>MNE PSD</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_mne_psd">
+       <item>
+        <layout class="QGridLayout" name="gridLayout_mne_psd">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_mne_psd_source">
+           <property name="text">
+            <string>数据来源</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1" colspan="3">
+          <widget class="QComboBox" name="comboBox_mne_psd_source">
+           <item>
+            <property name="text">
+             <string>当前离线显示窗口</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>当前完整文件/当前通道</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="label_mne_psd_method">
+           <property name="text">
+            <string>计算方法</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QComboBox" name="comboBox_mne_psd_method">
+           <item>
+            <property name="text">
+             <string>welch</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>multitaper</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="1" column="2">
+          <widget class="QLabel" name="label_mne_psd_fmin">
+           <property name="text">
+            <string>频率下限(Hz)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="3">
+          <widget class="QLineEdit" name="lineEdit_mne_psd_fmin">
+           <property name="text">
+            <string>0.5</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="label_mne_psd_fmax">
+           <property name="text">
+            <string>频率上限(Hz)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QLineEdit" name="lineEdit_mne_psd_fmax">
+           <property name="text">
+            <string>40</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="2">
+          <widget class="QLabel" name="label_mne_psd_tmin">
+           <property name="text">
+            <string>起始秒</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="3">
+          <widget class="QLineEdit" name="lineEdit_mne_psd_tmin"/>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="label_mne_psd_tmax">
+           <property name="text">
+            <string>结束秒</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1">
+          <widget class="QLineEdit" name="lineEdit_mne_psd_tmax"/>
+         </item>
+         <item row="3" column="2">
+          <widget class="QLabel" name="label_mne_psd_nfft">
+           <property name="text">
+            <string>FFT窗长(s)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="3">
+          <widget class="QLineEdit" name="lineEdit_mne_psd_nfft_sec">
+           <property name="text">
+            <string>2</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="0">
+          <widget class="QLabel" name="label_mne_psd_overlap">
+           <property name="text">
+            <string>重叠比例(%)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="1">
+          <widget class="QLineEdit" name="lineEdit_mne_psd_overlap">
+           <property name="text">
+            <string>50</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="2">
+          <widget class="QLabel" name="label_mne_psd_average">
+           <property name="text">
+            <string>平均方式</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="3">
+          <widget class="QComboBox" name="comboBox_mne_psd_average">
+           <item>
+            <property name="text">
+             <string>mean</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>median</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="5" column="0">
+          <widget class="QCheckBox" name="checkBox_mne_psd_db">
+           <property name="text">
+            <string>以dB显示</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="1">
+          <widget class="QCheckBox" name="checkBox_mne_psd_reject_annotation">
+           <property name="text">
+            <string>排除坏段标记</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="2">
+          <widget class="QCheckBox" name="checkBox_mne_psd_remove_dc">
+           <property name="text">
+            <string>去除直流分量</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="6" column="0" colspan="4">
+          <widget class="QCheckBox" name="checkBox_mne_psd_filter">
+           <property name="text">
+            <string>计算前带通滤波 0.5-40 Hz</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_mne_psd_plot">
+         <property name="text">
+          <string>绘制MNE PSD</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_mne_psd">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

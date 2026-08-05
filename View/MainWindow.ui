@@ -681,7 +681,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
             <item row="0" column="1">
              <widget class="QLineEdit" name="lineEdit_offline_path">
               <property name="placeholderText">
-               <string>选择 eeg_raw.csv / eeg_chunk_*.csv</string>
+               <string>选择 CSV / EDF / BDF 文件</string>
               </property>
              </widget>
             </item>
@@ -777,6 +777,93 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                <string>保存位置...</string>
               </property>
              </widget>
+            </item>
+            <item row="4" column="0">
+             <widget class="QLabel" name="label_offline_channel">
+              <property name="text">
+               <string>通道</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="4" column="1" colspan="2">
+             <widget class="QComboBox" name="comboBox_offline_channel">
+              <property name="enabled">
+               <bool>false</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="0">
+             <widget class="QLabel" name="label_offline_y_axis">
+              <property name="text">
+               <string>Y轴</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignCenter</set>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="1">
+             <widget class="QLineEdit" name="lineEdit_offline_y_min">
+              <property name="placeholderText">
+               <string>下限</string>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="2">
+             <widget class="QLineEdit" name="lineEdit_offline_y_max">
+              <property name="placeholderText">
+               <string>上限</string>
+              </property>
+             </widget>
+            </item>
+            <item row="6" column="0" colspan="3">
+             <layout class="QHBoxLayout" name="horizontalLayout_offline_tools">
+              <property name="spacing">
+               <number>6</number>
+              </property>
+              <item>
+               <widget class="QPushButton" name="pushButton_reject_processing">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>28</height>
+                 </size>
+                </property>
+                <property name="text">
+                 <string>坏段标记...</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pushButton_psd_analysis">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>28</height>
+                 </size>
+                </property>
+                <property name="text">
+                 <string>PSD...</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pushButton_sleep_feature_analysis">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>28</height>
+                 </size>
+                </property>
+                <property name="text">
+                 <string>睡眠特征...</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
             </item>
            </layout>
           </widget>

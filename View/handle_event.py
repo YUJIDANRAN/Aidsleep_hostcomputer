@@ -14,6 +14,7 @@ from pathlib import Path  ## 项目根路径
 from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
 import numpy as np
+from scipy.signal import welch
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
 
 _ROOT = Path(__file__).resolve().parent.parent  ## 项目根目录
@@ -37,6 +38,7 @@ from power_cal import (  ## 节律滤波与频段定义
     run_analysis,
     slice_signal,
 )
+import MovementArtifact as movement_artifact
 from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     RealtimeAlphaThresholdRejector,
     RealtimeQualityGate,
@@ -66,8 +68,13 @@ from analysis_plot_view import (
     CHANNEL_ORDER,
     AnalysisPlotView,
     OfflineRhythmStackView,
+    load_eeg_file_channel,
+    load_eeg_file_info,
     load_eeg_csv_with_rate,
 )
+from RejectionProcessingDialog import Ui_RejectionProcessingDialog
+from PsdAnalysisDialog import Ui_PsdAnalysisDialog
+from SleepFeatureAnalysisDialog import Ui_SleepFeatureAnalysisDialog
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from controller import (
     AlphaPhaseSnapshot,
@@ -106,6 +113,7 @@ AUDIO_DEFAULT_DURATION_SEC = "5"
 AUDIO_DEFAULT_LEFT_PHASE_DEG = "0"
 AUDIO_DEFAULT_RIGHT_PHASE_DEG = "90"
 DEFAULT_EEG_CSV_DIR = _ROOT / "Result"  ## timeEdit 定时测试默认 CSV 目录
+OFFLINE_EDF_WINDOW_SEC = 30.0
 TEST_WARMUP_SEC = 10.0  ## 有定时测试时，开始后前 10 s 不保存数据
 LONG_RECORD_CHUNK_SEC = 300.0  ## 长时记录：每 5 分钟自动存一份
 WAVEFORM_WAKE_SEC = 300.0  ## 长时记录：波形显示窗口 5 分钟
@@ -1018,9 +1026,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_session_name_ui()
         self._eeg_save_root: Optional[Path] = None  ## None → 默认 Result
         self._setup_compare_segments_ui()
-        self._setup_offline_viewer_ui()
         self._last_eeg_session_dir: Optional[Path] = None
         self._offline_csv_path: Optional[Path] = None
+        self._offline_file_info = None
+        self._offline_loaded_path: Optional[Path] = None
+        self._offline_loaded_channel = -1
+        self._offline_full_raw = np.zeros(0, dtype=np.float64)
+        self._offline_full_fs = float(DEFAULT_SAMPLE_RATE)
+        self._offline_full_label = "CH1"
+        self._offline_full_unit = "raw"
+        self._offline_window_sec = float(OFFLINE_EDF_WINDOW_SEC)
+        self._offline_current_raw = np.zeros(0, dtype=np.float64)
+        self._offline_current_fs = float(DEFAULT_SAMPLE_RATE)
+        self._offline_current_time_offset_s = 0.0
+        self._offline_current_title = ""
+        self._offline_current_y_label = "raw"
+        self._offline_bad_segments: Dict[Tuple[str, int], List[Tuple[float, float, str]]] = {}
         self._offline_view_active = False  ## 离线分层波形查看中
         self._analysis_plot_active = False  ## 功率对比图显示中
         self._sleep_aid_last_warm_sec = -1
@@ -1092,6 +1113,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
         self._offline_view = OfflineRhythmStackView(parent=self.ui.page)
         self._offline_view.hide()
+        self._setup_offline_viewer_ui()
+        self._setup_rejection_processing_ui()
+        self._setup_psd_analysis_ui()
+        self._setup_sleep_feature_analysis_ui()
         self._multi_waveform = MultiChannelEegView(
             sample_rate=sample_rate,
             parent=self.ui.page,
@@ -1360,25 +1385,1880 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._multi_waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
 
+
+
+    @QtCore.pyqtSlot()
+
+
+    @QtCore.pyqtSlot()
+
+    @QtCore.pyqtSlot()
+
     def _setup_offline_viewer_ui(self) -> None:
-        """离线波形：选 *_full 显示完整 raw；选无 _full 显示已剔坏文件。"""
+        """Bind Designer-defined offline viewer controls."""
         edit = self.ui.lineEdit_offline_path
         if not edit.text().strip():
-            edit.setPlaceholderText("选 CSV：*_full=完整，无full=剔坏后")
+            edit.setPlaceholderText("选 CSV/EDF：CSV *_full=完整，无full=剔坏后；EDF 默认读第1通道")
         edit.setToolTip(
-            "选 eeg_chunk_XXX_full.csv → 完整原始；选 eeg_chunk_XXX.csv → 剔坏后。"
-            "分钟从所选文件起点计；跨度超过该文件时，自动向后拼接同类型 chunk。"
+            "选 eeg_chunk_XXX_full.csv -> 完整原始；选 eeg_chunk_XXX.csv -> 剔坏后；"
+            "EDF/BDF 默认读取第1个信号通道。"
         )
         self.ui.lineEdit_offline_min_start.setToolTip(
-            "起始分钟（含）。从所选文件起点计；超出单文件则向后拼接。"
+            "CSV 按第 1 分钟起计；EDF/BDF 按 0.0 分钟起计。"
         )
         self.ui.lineEdit_offline_min_end.setToolTip(
-            "结束分钟（含）。例如 1 与 25 → 从所选文件起共 25 分钟（不足则拼接后续 chunk）。"
+            "CSV 例如 1 与 25；EDF/BDF 支持一位小数，例如 0.0 与 0.5。"
         )
         self.ui.pushButton_load_offline.setToolTip(
-            "*_full → 完整；无 _full → 剔坏后；分钟超出单文件则自动拼接"
+            "*_full -> 完整；无 _full -> 剔坏后；EDF/BDF 支持通道和窗口浏览"
         )
         self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
+
+        self._offline_channel_label = self.ui.label_offline_channel
+        self._offline_channel_combo = self.ui.comboBox_offline_channel
+        self._offline_y_label = self.ui.label_offline_y_axis
+        self._offline_y_min_edit = self.ui.lineEdit_offline_y_min
+        self._offline_y_max_edit = self.ui.lineEdit_offline_y_max
+
+        self._offline_prev_button = self._offline_view.prev_button
+        self._offline_next_button = self._offline_view.next_button
+        self._offline_time_slider = self._offline_view.time_slider
+        self._offline_time_status = self._offline_view.time_status
+
+        self._offline_channel_combo.currentIndexChanged.connect(
+            self._on_offline_channel_changed
+        )
+        self._offline_time_slider.valueChanged.connect(self._on_offline_scroll_changed)
+        self._offline_prev_button.clicked.connect(lambda: self._step_offline_window(-1))
+        self._offline_next_button.clicked.connect(lambda: self._step_offline_window(1))
+        self._offline_y_min_edit.editingFinished.connect(self._on_offline_y_limits_changed)
+        self._offline_y_max_edit.editingFinished.connect(self._on_offline_y_limits_changed)
+
+    def _setup_rejection_processing_ui(self) -> None:
+        """Bind Designer-defined rejection dialog controls."""
+        self._reject_button = self.ui.pushButton_reject_processing
+        self._reject_button.setToolTip("打开自定义阈值拒绝参数与 MNE 坏段标记页")
+        self._reject_button.clicked.connect(self._show_rejection_processing_dialog)
+
+        self._reject_dialog = QtWidgets.QDialog(self)
+        self._reject_ui = Ui_RejectionProcessingDialog()
+        self._reject_ui.setupUi(self._reject_dialog)
+        self._reject_tab = self._reject_ui.tabWidget_reject_processing
+
+        self._custom_reject_override = self._reject_ui.checkBox_custom_reject_override
+        self._custom_reject_override.setToolTip(
+            "未勾选时完全沿用 MovementArtifact.py 里的默认阈值；"
+            "勾选后仅影响离线查看中的坏段标红预览。"
+        )
+        self._custom_reject_override.toggled.connect(
+            self._refresh_offline_rejection_preview
+        )
+
+        self._custom_reject_show_mask = self._reject_ui.checkBox_custom_reject_show_mask
+        self._custom_reject_show_mask.setChecked(self._want_reject_mask_power())
+        self._custom_reject_show_mask.setToolTip("与原有功率对比区域的坏段标记开关同步。")
+        self._custom_reject_show_mask.toggled.connect(
+            self.ui.checkBox_reject_mask_power.setChecked
+        )
+        self.ui.checkBox_reject_mask_power.toggled.connect(
+            self._custom_reject_show_mask.setChecked
+        )
+
+        table = self._reject_ui.tableWidget_custom_reject_params
+        table.blockSignals(True)
+        table.setRowCount(0)
+        table.setColumnWidth(0, 190)
+        table.setColumnWidth(1, 90)
+        table.horizontalHeader().setStretchLastSection(True)
+        self._custom_reject_param_edits: Dict[str, QtWidgets.QTableWidgetItem] = {}
+        self._custom_reject_param_types: Dict[str, type] = {}
+        for row, (name, label, tip) in enumerate(self._custom_reject_param_specs()):
+            value = getattr(movement_artifact, name)
+            table.insertRow(row)
+            label_item = QtWidgets.QTableWidgetItem(label)
+            label_item.setFlags(label_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            label_item.setToolTip(name)
+            value_item = QtWidgets.QTableWidgetItem(self._format_reject_param_value(value))
+            value_item.setToolTip(f"{name}\n{tip}")
+            tip_item = QtWidgets.QTableWidgetItem(tip)
+            tip_item.setFlags(tip_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, label_item)
+            table.setItem(row, 1, value_item)
+            table.setItem(row, 2, tip_item)
+            self._custom_reject_param_edits[name] = value_item
+            self._custom_reject_param_types[name] = int if isinstance(value, int) else float
+        table.blockSignals(False)
+        table.itemChanged.connect(self._on_custom_reject_param_item_changed)
+
+        self._reject_ui.pushButton_custom_reject_reset.clicked.connect(
+            self._reset_custom_reject_params
+        )
+        self._reject_ui.pushButton_custom_reject_refresh.clicked.connect(
+            self._refresh_offline_rejection_preview
+        )
+
+        self._mne_amp_peak_edit = self._reject_ui.lineEdit_mne_amp_peak
+        self._mne_amp_flat_edit = self._reject_ui.lineEdit_mne_amp_flat
+        self._mne_amp_min_duration_edit = self._reject_ui.lineEdit_mne_amp_min_duration
+        self._mne_amp_bad_percent_edit = self._reject_ui.lineEdit_mne_amp_bad_percent
+        self._mne_epoch_window_edit = self._reject_ui.lineEdit_mne_epoch_window
+        self._mne_epoch_reject_edit = self._reject_ui.lineEdit_mne_epoch_reject
+        self._mne_epoch_flat_edit = self._reject_ui.lineEdit_mne_epoch_flat
+        self._mne_manual_ranges_edit = self._reject_ui.plainTextEdit_mne_manual_ranges
+
+        self._reject_ui.pushButton_mne_amp_run.clicked.connect(
+            self._run_mne_annotate_amplitude_preview
+        )
+        self._reject_ui.pushButton_mne_epoch_run.clicked.connect(
+            self._run_mne_epoch_reject_preview
+        )
+        self._reject_ui.pushButton_mne_manual_run.clicked.connect(
+            self._run_mne_manual_annotation_preview
+        )
+        self._reject_ui.pushButton_mne_nan_run.clicked.connect(
+            self._run_mne_annotate_nan_preview
+        )
+        self._reject_ui.pushButton_mne_clear_preview.clicked.connect(
+            self._clear_mne_preview_mask
+        )
+        self._session_bad_table = self._reject_ui.tableWidget_session_bad_segments
+        self._session_bad_table.setColumnWidth(0, 60)
+        self._session_bad_table.setColumnWidth(1, 110)
+        self._session_bad_table.setColumnWidth(2, 110)
+        self._session_bad_table.setColumnWidth(3, 100)
+        self._session_bad_table.verticalHeader().setVisible(False)
+        self._session_bad_table.horizontalHeader().setStretchLastSection(True)
+        self._reject_ui.pushButton_session_bad_refresh.clicked.connect(
+            self._refresh_session_bad_segments_table
+        )
+        self._reject_ui.pushButton_session_bad_remove_selected.clicked.connect(
+            self._remove_selected_session_bad_segments
+        )
+        self._reject_ui.pushButton_session_bad_clear_current.clicked.connect(
+            self._clear_current_session_bad_segments
+        )
+
+    @QtCore.pyqtSlot(QtWidgets.QTableWidgetItem)
+    def _on_custom_reject_param_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if item.column() == 1:
+            self._refresh_offline_rejection_preview()
+
+    @QtCore.pyqtSlot()
+    def _show_rejection_processing_dialog(self) -> None:
+        self._refresh_session_bad_segments_table()
+        self._reject_dialog.show()
+        self._reject_dialog.raise_()
+        self._reject_dialog.activateWindow()
+
+    def _setup_psd_analysis_ui(self) -> None:
+        """Bind Designer-defined PSD analysis dialog controls."""
+        self._psd_button = self.ui.pushButton_psd_analysis
+        self._psd_button.setToolTip("打开自定义 PSD 与 MNE PSD 分析参数")
+        self._psd_button.clicked.connect(self._show_psd_analysis_dialog)
+
+        self._psd_dialog = QtWidgets.QDialog(self)
+        self._psd_ui = Ui_PsdAnalysisDialog()
+        self._psd_ui.setupUi(self._psd_dialog)
+        self._psd_tab = self._psd_ui.tabWidget_psd_analysis
+
+        self._custom_psd_source_combo = self._psd_ui.comboBox_custom_psd_source
+        self._custom_psd_start_edit = self._psd_ui.lineEdit_custom_psd_start
+        self._custom_psd_end_edit = self._psd_ui.lineEdit_custom_psd_end
+        self._custom_psd_welch_edit = self._psd_ui.lineEdit_custom_psd_welch
+        self._custom_psd_fmin_edit = self._psd_ui.lineEdit_custom_psd_fmin
+        self._custom_psd_fmax_edit = self._psd_ui.lineEdit_custom_psd_fmax
+        self._custom_psd_exclude_bad_check = self._psd_ui.checkBox_custom_psd_exclude_bad
+        self._psd_ui.pushButton_custom_psd_plot.clicked.connect(
+            self._plot_custom_psd_from_dialog
+        )
+
+        self._mne_psd_source_combo = self._psd_ui.comboBox_mne_psd_source
+        self._mne_psd_method_combo = self._psd_ui.comboBox_mne_psd_method
+        self._mne_psd_fmin_edit = self._psd_ui.lineEdit_mne_psd_fmin
+        self._mne_psd_fmax_edit = self._psd_ui.lineEdit_mne_psd_fmax
+        self._mne_psd_tmin_edit = self._psd_ui.lineEdit_mne_psd_tmin
+        self._mne_psd_tmax_edit = self._psd_ui.lineEdit_mne_psd_tmax
+        self._mne_psd_nfft_sec_edit = self._psd_ui.lineEdit_mne_psd_nfft_sec
+        self._mne_psd_overlap_edit = self._psd_ui.lineEdit_mne_psd_overlap
+        self._mne_psd_average_combo = self._psd_ui.comboBox_mne_psd_average
+        self._mne_psd_db_check = self._psd_ui.checkBox_mne_psd_db
+        self._mne_psd_reject_annot_check = self._psd_ui.checkBox_mne_psd_reject_annotation
+        self._mne_psd_remove_dc_check = self._psd_ui.checkBox_mne_psd_remove_dc
+        self._mne_psd_filter_check = self._psd_ui.checkBox_mne_psd_filter
+        self._mne_psd_source_combo.currentIndexChanged.connect(
+            self._refresh_psd_dialog_placeholders
+        )
+        self._psd_ui.pushButton_mne_psd_plot.clicked.connect(
+            self._plot_mne_psd_from_dialog
+        )
+
+    @QtCore.pyqtSlot()
+    def _show_psd_analysis_dialog(self) -> None:
+        self._refresh_psd_dialog_placeholders()
+        self._psd_dialog.show()
+        self._psd_dialog.raise_()
+        self._psd_dialog.activateWindow()
+
+    @QtCore.pyqtSlot()
+    def _refresh_psd_dialog_placeholders(self, *_args) -> None:
+        current = self._current_psd_data(self._mne_psd_source_combo.currentIndex())
+        if current is not None:
+            raw, fs, start_s, _title, _unit = current
+            end_s = start_s + raw.size / fs
+            fmax = min(40.0, fs * 0.5 - 0.5)
+            self._custom_psd_start_edit.setPlaceholderText(f"{start_s:.1f}")
+            self._custom_psd_end_edit.setPlaceholderText(f"{end_s:.1f}")
+            self._mne_psd_tmin_edit.setPlaceholderText(f"{start_s:.1f}")
+            self._mne_psd_tmax_edit.setPlaceholderText(f"{end_s:.1f}")
+            self._custom_psd_fmax_edit.setText(f"{fmax:g}")
+            self._mne_psd_fmax_edit.setText(f"{fmax:g}")
+
+    def _setup_sleep_feature_analysis_ui(self) -> None:
+        self._sleep_feature_button = self.ui.pushButton_sleep_feature_analysis
+        self._sleep_feature_button.setToolTip("打开睡眠特征分析参数")
+        self._sleep_feature_button.clicked.connect(self._show_sleep_feature_analysis_dialog)
+
+        self._sleep_feature_dialog = QtWidgets.QDialog(self)
+        self._sleep_feature_ui = Ui_SleepFeatureAnalysisDialog()
+        self._sleep_feature_ui.setupUi(self._sleep_feature_dialog)
+
+        self._sleep_channel_combo = self._sleep_feature_ui.comboBox_sleep_channel
+        self._sleep_epoch_sec_edit = self._sleep_feature_ui.lineEdit_sleep_epoch_sec
+        self._sleep_hop_sec_combo = self._sleep_feature_ui.comboBox_sleep_hop_sec
+        self._sleep_start_sec_edit = self._sleep_feature_ui.lineEdit_sleep_start_sec
+        self._sleep_end_sec_edit = self._sleep_feature_ui.lineEdit_sleep_end_sec
+        self._sleep_band_checks = {
+            "delta": self._sleep_feature_ui.checkBox_sleep_delta,
+            "theta": self._sleep_feature_ui.checkBox_sleep_theta,
+            "alpha": self._sleep_feature_ui.checkBox_sleep_alpha,
+            "sigma": self._sleep_feature_ui.checkBox_sleep_sigma,
+            "beta": self._sleep_feature_ui.checkBox_sleep_beta,
+        }
+        self._sleep_abs_power_check = self._sleep_feature_ui.checkBox_sleep_absolute_power
+        self._sleep_rel_power_check = self._sleep_feature_ui.checkBox_sleep_relative_power
+        self._sleep_exclude_bad_check = self._sleep_feature_ui.checkBox_sleep_exclude_bad
+        self._sleep_epoch_feature_tabs = self._sleep_feature_ui.tabWidget_sleep_epoch_feature_tables
+        self._sleep_epoch_feature_tables: Dict[int, QtWidgets.QTableWidget] = {}
+        self._sleep_epoch_feature_rows_by_channel: Dict[int, List[Dict[str, object]]] = {}
+        self._sleep_epoch_feature_labels_by_channel: Dict[int, str] = {}
+        self._sleep_epoch_feature_source_path: Optional[str] = None
+        self._sleep_epoch_feature_rows: List[Dict[str, object]] = []
+        self._sleep_channel_combo.currentIndexChanged.connect(self._sync_sleep_epoch_feature_tab_to_selected_channel)
+        self._yasa_eeg_combo = self._sleep_feature_ui.comboBox_yasa_eeg
+        self._yasa_eog_combo = self._sleep_feature_ui.comboBox_yasa_eog
+        self._yasa_emg_combo = self._sleep_feature_ui.comboBox_yasa_emg
+        self._yasa_age_edit = self._sleep_feature_ui.lineEdit_yasa_age
+        self._yasa_sex_combo = self._sleep_feature_ui.comboBox_yasa_sex
+        self._yasa_model_edit = self._sleep_feature_ui.lineEdit_yasa_model
+        self._yasa_csv_raw_to_uv_check = self._sleep_feature_ui.checkBox_yasa_csv_raw_to_uv
+        self._yasa_csv_baseline_method_combo = self._sleep_feature_ui.comboBox_yasa_csv_baseline_method
+        self._yasa_csv_baseline_value_edit = self._sleep_feature_ui.lineEdit_yasa_csv_baseline_value
+        self._yasa_csv_uv_per_count_edit = self._sleep_feature_ui.lineEdit_yasa_csv_uv_per_count
+        self._yasa_sync_features_check = self._sleep_feature_ui.checkBox_yasa_sync_features
+        self._sleep_feature_ui.pushButton_sleep_plot_band_power_trend.clicked.connect(
+            self._plot_sleep_band_power_trend
+        )
+        self._sleep_feature_ui.pushButton_sleep_generate_epoch_features.clicked.connect(
+            self._generate_sleep_epoch_feature_table
+        )
+        self._sleep_feature_ui.pushButton_sleep_export_epoch_features.clicked.connect(
+            self._export_sleep_epoch_feature_table_csv
+        )
+        self._sleep_feature_ui.pushButton_yasa_run_staging.clicked.connect(
+            self._run_yasa_sleep_staging
+        )
+
+    @QtCore.pyqtSlot()
+    def _show_sleep_feature_analysis_dialog(self) -> None:
+        self._refresh_sleep_feature_dialog()
+        self._sleep_feature_dialog.show()
+        self._sleep_feature_dialog.raise_()
+        self._sleep_feature_dialog.activateWindow()
+
+    def _refresh_sleep_feature_dialog(self) -> None:
+        self._sleep_channel_combo.blockSignals(True)
+        self._sleep_channel_combo.clear()
+        path = getattr(self, "_offline_csv_path", None)
+        if path is not None and self._is_edf_like_file(path) and self._offline_file_info is not None:
+            for index, label in enumerate(self._offline_file_info.channel_labels):
+                unit = (
+                    self._offline_file_info.channel_units[index]
+                    if index < len(self._offline_file_info.channel_units)
+                    else self._offline_full_unit
+                )
+                self._sleep_channel_combo.addItem(f"{label} ({unit})", index)
+            if self._offline_loaded_channel >= 0:
+                self._sleep_channel_combo.setCurrentIndex(
+                    min(self._offline_loaded_channel, self._sleep_channel_combo.count() - 1)
+                )
+        else:
+            label = getattr(self, "_offline_full_label", "CH1") or "CH1"
+            self._sleep_channel_combo.addItem(label, 0)
+        self._sleep_channel_combo.blockSignals(False)
+        if path is not None and self._is_edf_like_file(path):
+            duration_s = (
+                float(self._offline_full_raw.size / self._offline_full_fs)
+                if self._offline_full_fs > 0
+                else 0.0
+            )
+            self._sleep_start_sec_edit.setPlaceholderText("0.0")
+            self._sleep_end_sec_edit.setPlaceholderText(f"{duration_s:.1f}")
+        else:
+            current = self._current_offline_raw_for_mne()
+            if current is not None:
+                raw, fs, start_s, _title, _unit = current
+                end_s = start_s + raw.size / fs
+                self._sleep_start_sec_edit.setPlaceholderText(f"{start_s:.1f}")
+                self._sleep_end_sec_edit.setPlaceholderText(f"{end_s:.1f}")
+        self._refresh_yasa_channel_combos()
+        self._refresh_sleep_epoch_feature_tabs()
+
+    def _current_sleep_channel_index(self) -> int:
+        try:
+            return int(self._sleep_channel_combo.currentData() or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _clean_channel_tab_label(label: object, fallback: str) -> str:
+        text = str(label or fallback).strip()
+        if "(" in text:
+            text = text.split("(", 1)[0].strip()
+        return text or fallback
+
+    def _sleep_feature_channel_items(self) -> List[Tuple[int, str]]:
+        items: List[Tuple[int, str]] = []
+        path = getattr(self, "_offline_csv_path", None)
+        if path is not None and self._is_edf_like_file(path) and self._offline_file_info is not None:
+            for index, label in enumerate(self._offline_file_info.channel_labels):
+                items.append((index, self._clean_channel_tab_label(label, f"CH{index + 1}")))
+        else:
+            label = getattr(self, "_offline_full_label", "CH1") or "CH1"
+            items.append((0, self._clean_channel_tab_label(label, "CH1")))
+        return items
+
+    def _refresh_sleep_epoch_feature_tabs(self) -> None:
+        path = str(getattr(self, "_offline_csv_path", "") or "")
+        if path != getattr(self, "_sleep_epoch_feature_source_path", None):
+            self._sleep_epoch_feature_rows_by_channel = {}
+            self._sleep_epoch_feature_labels_by_channel = {}
+            self._sleep_epoch_feature_rows = []
+            self._sleep_epoch_feature_source_path = path
+
+        current_channel = self._current_sleep_channel_index()
+        old_block = self._sleep_epoch_feature_tabs.blockSignals(True)
+        try:
+            self._sleep_epoch_feature_tabs.clear()
+            self._sleep_epoch_feature_tables = {}
+            for channel_index, label in self._sleep_feature_channel_items():
+                table = QtWidgets.QTableWidget(self._sleep_epoch_feature_tabs)
+                table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+                table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+                table.verticalHeader().setVisible(False)
+                table.setObjectName(f"tableWidget_sleep_epoch_features_ch{channel_index}")
+                self._sleep_epoch_feature_tables[channel_index] = table
+                self._sleep_epoch_feature_labels_by_channel[channel_index] = label
+                self._sleep_epoch_feature_tabs.addTab(table, label)
+                rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+                if rows:
+                    self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            for idx in range(self._sleep_epoch_feature_tabs.count()):
+                widget = self._sleep_epoch_feature_tabs.widget(idx)
+                for channel_index, table in self._sleep_epoch_feature_tables.items():
+                    if widget is table and channel_index == current_channel:
+                        self._sleep_epoch_feature_tabs.setCurrentIndex(idx)
+                        break
+        finally:
+            self._sleep_epoch_feature_tabs.blockSignals(old_block)
+
+    def _current_sleep_epoch_feature_channel(self) -> int:
+        widget = self._sleep_epoch_feature_tabs.currentWidget()
+        for channel_index, table in self._sleep_epoch_feature_tables.items():
+            if widget is table:
+                return channel_index
+        return self._current_sleep_channel_index()
+
+    @QtCore.pyqtSlot(int)
+    def _sync_sleep_epoch_feature_tab_to_selected_channel(self, _index: int = 0) -> None:
+        channel_index = self._current_sleep_channel_index()
+        table = self._sleep_epoch_feature_tables.get(channel_index)
+        if table is None:
+            return
+        for idx in range(self._sleep_epoch_feature_tabs.count()):
+            if self._sleep_epoch_feature_tabs.widget(idx) is table:
+                self._sleep_epoch_feature_tabs.setCurrentIndex(idx)
+                return
+
+    def _refresh_yasa_channel_combos(self) -> None:
+        path = getattr(self, "_offline_csv_path", None)
+        combos = (self._yasa_eeg_combo, self._yasa_eog_combo, self._yasa_emg_combo)
+        for combo in combos:
+            combo.blockSignals(True)
+            combo.clear()
+        try:
+            if path is not None and self._is_edf_like_file(path) and self._offline_file_info is not None:
+                labels = list(self._offline_file_info.channel_labels)
+                for index, label in enumerate(labels):
+                    self._yasa_eeg_combo.addItem(label, index)
+                for combo in (self._yasa_eog_combo, self._yasa_emg_combo):
+                    combo.addItem("无", None)
+                    for index, label in enumerate(labels):
+                        combo.addItem(label, index)
+                if self._offline_loaded_channel >= 0:
+                    eeg_index = min(self._offline_loaded_channel, self._yasa_eeg_combo.count() - 1)
+                    self._yasa_eeg_combo.setCurrentIndex(max(0, eeg_index))
+            else:
+                label = getattr(self, "_offline_full_label", "EEG") or "EEG"
+                self._yasa_eeg_combo.addItem(label, 0)
+                self._yasa_eog_combo.addItem("无", None)
+                self._yasa_emg_combo.addItem("无", None)
+        finally:
+            for combo in combos:
+                combo.blockSignals(False)
+
+    @staticmethod
+    def _sleep_band_defs() -> Dict[str, Tuple[float, float]]:
+        return {
+            "delta": (0.5, 4.0),
+            "theta": (4.0, 8.0),
+            "alpha": (8.0, 13.0),
+            "sigma": (11.0, 16.0),
+            "beta": (13.0, 30.0),
+        }
+
+    def _sleep_feature_data(self) -> Optional[tuple[np.ndarray, float, float, str, str]]:
+        path = getattr(self, "_offline_csv_path", None)
+        channel_index = int(self._sleep_channel_combo.currentData() or 0)
+        try:
+            if path is not None and self._is_edf_like_file(path):
+                if channel_index == self._offline_loaded_channel:
+                    raw = np.asarray(self._offline_full_raw, dtype=np.float64)
+                    fs = float(self._offline_full_fs)
+                    if raw.size < 8 or fs <= 0:
+                        self._log("睡眠特征分析：当前 EDF 通道完整数据无效")
+                        return None
+                    return raw, fs, 0.0, self._offline_full_label, self._offline_full_unit
+                raw, fs, label, unit = load_eeg_file_channel(path, channel_index)
+                raw = np.asarray(raw, dtype=np.float64)
+                return raw, float(fs), 0.0, label, unit
+            current = self._current_offline_raw_for_mne()
+            if current is None:
+                return None
+            raw, fs, start_s, _title, y_label = current
+            return raw, fs, start_s, y_label, y_label
+        except Exception as exc:
+            self._log(f"读取睡眠特征数据失败: {exc}")
+            return None
+
+    def _read_sleep_trend_params(
+        self,
+        raw: np.ndarray,
+        fs: float,
+        offset_s: float,
+        *,
+        require_power_type: bool = True,
+    ):
+        epoch_s = self._required_float_from_edit(self._sleep_epoch_sec_edit, "epoch长度")
+        hop_text = self._sleep_hop_sec_combo.currentText().strip()
+        try:
+            hop_s = float(hop_text)
+        except ValueError as exc:
+            raise ValueError("hop长度必须是数字") from exc
+        duration_s = raw.size / fs
+        start_s, end_s = self._read_relative_seconds_range(
+            self._sleep_start_sec_edit,
+            self._sleep_end_sec_edit,
+            source_offset_s=offset_s,
+            duration_s=duration_s,
+        )
+        if epoch_s <= 0 or hop_s <= 0:
+            raise ValueError("epoch长度和hop长度必须大于0")
+        if end_s - start_s < epoch_s:
+            raise ValueError("选择的时间范围短于epoch长度")
+        bands = [name for name, cb in self._sleep_band_checks.items() if cb.isChecked()]
+        if not bands:
+            raise ValueError("至少选择一个频段")
+        if require_power_type and not self._sleep_abs_power_check.isChecked() and not self._sleep_rel_power_check.isChecked():
+            raise ValueError("至少选择绝对功率或相对功率")
+        return start_s, end_s, epoch_s, hop_s, bands
+
+    def _compute_sleep_band_power_trend(
+        self,
+        raw: np.ndarray,
+        fs: float,
+        *,
+        offset_s: float,
+        start_s: float,
+        end_s: float,
+        epoch_s: float,
+        hop_s: float,
+        bands: List[str],
+        exclude_bad: bool,
+    ) -> tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        band_defs = self._sleep_band_defs()
+        starts = np.arange(start_s, end_s - epoch_s + 1e-9, hop_s, dtype=np.float64)
+        centers: List[float] = []
+        abs_values: Dict[str, List[float]] = {name: [] for name in bands}
+        rel_values: Dict[str, List[float]] = {name: [] for name in bands}
+        mask = self._bad_mask_for_data(raw, fs, offset_s) if exclude_bad else None
+        use_window_mask = mask is not None and mask.size == raw.size
+        for win_start in starts:
+            i0 = max(0, int(round(win_start * fs)))
+            i1 = min(raw.size, int(round((win_start + epoch_s) * fs)))
+            seg = np.asarray(raw[i0:i1], dtype=np.float64)
+            if use_window_mask:
+                seg = seg[~mask[i0:i1]]
+            if seg.size < max(8, int(fs * 0.5)):
+                continue
+            nperseg = min(seg.size, max(8, int(round(min(epoch_s, 4.0) * fs))))
+            freqs, psd = welch(seg, fs=fs, nperseg=nperseg)
+            powers: Dict[str, float] = {}
+            for name in bands:
+                low, high = band_defs[name]
+                band_mask = (freqs >= low) & (freqs <= high)
+                powers[name] = float(np.trapz(psd[band_mask], freqs[band_mask])) if np.any(band_mask) else 0.0
+            total = sum(max(v, 0.0) for v in powers.values())
+            centers.append(float(win_start + epoch_s * 0.5))
+            for name in bands:
+                abs_values[name].append(powers[name])
+                rel_values[name].append((powers[name] / total * 100.0) if total > 0 else 0.0)
+        if not centers:
+            raise ValueError("没有足够有效窗口用于绘制趋势")
+        return (
+            np.asarray(centers, dtype=np.float64),
+            {name: np.asarray(values, dtype=np.float64) for name, values in abs_values.items()},
+            {name: np.asarray(values, dtype=np.float64) for name, values in rel_values.items()},
+        )
+
+    def _make_sleep_mne_raw(
+        self,
+        raw: np.ndarray,
+        fs: float,
+        unit: str,
+        *,
+        offset_s: float,
+        reject_by_annotation: bool,
+    ):
+        try:
+            import mne  # type: ignore
+        except ImportError:
+            self._log("未安装 mne，请先运行：python -m pip install mne")
+            return None
+        path = getattr(self, "_offline_csv_path", None)
+        unit_text = str(unit)
+        if (
+            path is not None
+            and not self._is_edf_like_file(path)
+            and unit_text.strip().lower() == "raw"
+            and self._yasa_csv_raw_to_uv_check.isChecked()
+        ):
+            data_v, baseline, uv_per_count = self._csv_raw_to_yasa_volts(np.asarray(raw, dtype=np.float64))
+            data = data_v.reshape(1, -1)
+            self._log(
+                f"睡眠 MNE 特征 CSV/raw 已按 baseline={baseline:.6g}, {uv_per_count:.6g} uV/count 临时换算"
+            )
+        else:
+            scale = self._mne_unit_scale(unit_text)
+            data = (np.asarray(raw, dtype=np.float64) * scale).reshape(1, -1)
+        info = mne.create_info(["EEG"], sfreq=float(fs), ch_types=["eeg"])
+        raw_mne = mne.io.RawArray(data, info, verbose="ERROR")
+        if reject_by_annotation:
+            mask = self._bad_mask_for_data(raw, fs, offset_s)
+            if mask is not None and mask.size == np.asarray(raw).size:
+                raw_mne.set_annotations(self._mask_to_mne_annotations(mne, mask, fs))
+        return mne, raw_mne
+
+    def _yasa_metadata_from_ui(self) -> Optional[Dict[str, object]]:
+        metadata: Dict[str, object] = {}
+        age_text = self._yasa_age_edit.text().strip()
+        if age_text:
+            try:
+                metadata["age"] = int(float(age_text))
+            except ValueError as exc:
+                raise ValueError("YASA 年龄必须是数字，或留空") from exc
+        sex = self._yasa_sex_combo.currentText().strip()
+        if sex == "男":
+            metadata["male"] = True
+        elif sex == "女":
+            metadata["male"] = False
+        return metadata or None
+
+    @staticmethod
+    def _yasa_hypnogram_labels(prediction) -> List[str]:
+        if hasattr(prediction, "hypno"):
+            return [str(v) for v in list(prediction.hypno)]
+        return [str(v) for v in list(prediction)]
+
+    @staticmethod
+    def _yasa_prediction_confidence(prediction, fallback_proba=None) -> List[float]:
+        proba = getattr(prediction, "proba", None)
+        if proba is None:
+            proba = fallback_proba
+        if proba is None:
+            return []
+        values = getattr(proba, "values", proba)
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.ndim == 1:
+            return [float(v) for v in arr]
+        if arr.ndim >= 2 and arr.shape[0] > 0:
+            return [float(v) for v in np.nanmax(arr, axis=1)]
+        return []
+
+    def _sync_sleep_channel_to_yasa_eeg(self) -> None:
+        eeg_index = self._yasa_eeg_combo.currentData()
+        if eeg_index is None:
+            return
+        for i in range(self._sleep_channel_combo.count()):
+            if self._sleep_channel_combo.itemData(i) == eeg_index:
+                self._sleep_channel_combo.setCurrentIndex(i)
+                return
+
+    def _csv_raw_to_yasa_volts(self, raw: np.ndarray) -> tuple[np.ndarray, float, float]:
+        arr = np.asarray(raw, dtype=np.float64)
+        if arr.size < 8:
+            raise ValueError("CSV/raw 样本过少，无法估计 baseline")
+        uv_text = self._yasa_csv_uv_per_count_edit.text().strip()
+        try:
+            uv_per_count = float(uv_text)
+        except ValueError as exc:
+            raise ValueError("CSV uV/count 必须是数字") from exc
+        if uv_per_count <= 0:
+            raise ValueError("CSV uV/count 必须大于 0")
+        method_index = int(self._yasa_csv_baseline_method_combo.currentIndex())
+        if method_index == 0:
+            baseline = float(np.nanmedian(arr))
+        elif method_index == 1:
+            baseline = float(np.nanmean(arr))
+        else:
+            text = self._yasa_csv_baseline_value_edit.text().strip()
+            if not text:
+                raise ValueError("CSV baseline 选择固定值时必须填写固定值")
+            try:
+                baseline = float(text)
+            except ValueError as exc:
+                raise ValueError("CSV baseline 固定值必须是数字") from exc
+        if not np.isfinite(baseline):
+            raise ValueError("CSV baseline 估计失败，请检查 raw 数据")
+        data_v = (arr - baseline) * uv_per_count * 1e-6
+        return data_v, baseline, uv_per_count
+
+    def _make_yasa_raw_from_ui(self, *, start_s: float, end_s: float):
+        try:
+            import mne  # type: ignore
+        except ImportError:
+            self._log("未安装 mne，请先运行：python -m pip install mne")
+            return None
+        path = getattr(self, "_offline_csv_path", None)
+        eeg_index = self._yasa_eeg_combo.currentData()
+        eog_index = self._yasa_eog_combo.currentData()
+        emg_index = self._yasa_emg_combo.currentData()
+        names: List[str] = []
+        ch_types: List[str] = []
+        data_rows: List[np.ndarray] = []
+        fs_values: List[float] = []
+
+        def _append_channel(index: int, ch_type: str, fallback_label: str) -> str:
+            if path is not None and self._is_edf_like_file(path):
+                raw_i, fs_i, label_i, unit_i = load_eeg_file_channel(path, int(index))
+                label = str(label_i or fallback_label)
+            else:
+                raw_i = np.asarray(getattr(self, "_offline_current_raw", np.zeros(0)), dtype=np.float64)
+                fs_i = float(getattr(self, "_offline_current_fs", 0.0))
+                label = fallback_label
+                unit_i = str(getattr(self, "_offline_current_y_label", "raw") or "raw")
+            arr = np.asarray(raw_i, dtype=np.float64)
+            fs_values.append(float(fs_i))
+            unit_text = str(unit_i)
+            if (
+                path is not None
+                and not self._is_edf_like_file(path)
+                and unit_text.strip().lower() == "raw"
+                and self._yasa_csv_raw_to_uv_check.isChecked()
+            ):
+                data_v, baseline, uv_per_count = self._csv_raw_to_yasa_volts(arr)
+                data_rows.append(data_v)
+                self._log(
+                    f"YASA CSV/raw 已按 baseline={baseline:.6g}, {uv_per_count:.6g} uV/count 临时换算"
+                )
+            else:
+                data_rows.append(arr * self._mne_unit_scale(unit_text))
+            names.append(label)
+            ch_types.append(ch_type)
+            return label
+
+        eeg_name = _append_channel(int(eeg_index or 0), "eeg", "EEG")
+        eog_name = _append_channel(int(eog_index), "eog", "EOG") if eog_index is not None else None
+        emg_name = _append_channel(int(emg_index), "emg", "EMG") if emg_index is not None else None
+        if not data_rows or min(row.size for row in data_rows) < 8:
+            raise ValueError("YASA 分期数据有效样本过少")
+        fs = float(np.median(np.asarray(fs_values, dtype=np.float64)))
+        if any(abs(v - fs) > 1e-6 for v in fs_values):
+            raise ValueError("YASA 分期暂不支持所选 EEG/EOG/EMG 通道采样率不同")
+        n = min(row.size for row in data_rows)
+        data = np.vstack([row[:n] for row in data_rows])
+        info = mne.create_info(names, sfreq=fs, ch_types=ch_types)
+        raw_mne = mne.io.RawArray(data, info, verbose="ERROR")
+        tmax = max(start_s, min(end_s, raw_mne.times[-1]))
+        raw_mne = raw_mne.crop(tmin=float(start_s), tmax=tmax, include_tmax=False)
+        return raw_mne, eeg_name, eog_name, emg_name, fs
+
+    @QtCore.pyqtSlot()
+    def _run_yasa_sleep_staging(self) -> None:
+        self._sync_sleep_channel_to_yasa_eeg()
+        data = self._sleep_feature_data()
+        if data is None:
+            return
+        raw, fs, offset_s, label, _unit = data
+        try:
+            start_s, end_s, epoch_s, hop_s, _bands = self._read_sleep_trend_params(
+                raw,
+                fs,
+                offset_s,
+                require_power_type=False,
+            )
+            if abs(epoch_s - 30.0) > 1e-6 or abs(hop_s - 30.0) > 1e-6:
+                raise ValueError("YASA SleepStaging 官方输出固定 30 秒 epoch；请将 epoch=30、hop=30 后再运行")
+            try:
+                import yasa  # type: ignore
+            except ImportError:
+                self._log("未安装 yasa，请先运行：python -m pip install yasa==0.6.5")
+                return
+            channel_index = self._current_sleep_channel_index()
+            current_rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not current_rows and self._yasa_sync_features_check.isChecked():
+                self._generate_sleep_epoch_feature_table()
+                current_rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            raw_mne, eeg_name, eog_name, emg_name, _fs = self._make_yasa_raw_from_ui(
+                start_s=start_s,
+                end_s=end_s,
+            )
+            metadata = self._yasa_metadata_from_ui()
+            sls = yasa.SleepStaging(
+                raw_mne,
+                eeg_name=eeg_name,
+                eog_name=eog_name,
+                emg_name=emg_name,
+                metadata=metadata,
+            )
+            model = self._yasa_model_edit.text().strip() or "auto"
+            prediction = sls.predict(path_to_model=model)
+            fallback_proba = None
+            if not hasattr(prediction, "proba") and hasattr(sls, "predict_proba"):
+                try:
+                    fallback_proba = sls.predict_proba(path_to_model=model)
+                except Exception:
+                    fallback_proba = None
+            stages = self._yasa_hypnogram_labels(prediction)
+            confidence = self._yasa_prediction_confidence(prediction, fallback_proba)
+            rows = list(current_rows)
+            if not rows:
+                rows = [
+                    {
+                        "epoch": idx + 1,
+                        "start_s": float(offset_s + start_s + idx * 30.0),
+                        "end_s": float(offset_s + start_s + (idx + 1) * 30.0),
+                        "duration_s": 30.0,
+                    }
+                    for idx in range(len(stages))
+                ]
+            stage_origin_s = float(offset_s + start_s)
+            matched_count = 0
+            for row in rows:
+                try:
+                    row_start = float(row.get("start_s", -1.0))
+                except (TypeError, ValueError):
+                    continue
+                idx = int(round((row_start - stage_origin_s) / 30.0))
+                if idx < 0 or idx >= len(stages):
+                    continue
+                expected_start = stage_origin_s + idx * 30.0
+                if abs(row_start - expected_start) > 0.5:
+                    continue
+                row["stage_yasa"] = stages[idx]
+                if idx < len(confidence):
+                    row["yasa_confidence"] = confidence[idx]
+                matched_count += 1
+            self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
+            self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
+            self._sleep_epoch_feature_rows = rows
+            self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            self._log(f"YASA 分期写回特征表: {matched_count}/{len(rows)} 行")
+            self._log(
+                f"YASA 自动睡眠分期完成: {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s | {len(stages)} 个 30s epoch"
+            )
+        except Exception as exc:
+            self._log(f"YASA 自动睡眠分期失败: {exc}")
+
+    def _populate_sleep_epoch_feature_table(self, rows: List[Dict[str, object]], *, channel_index: Optional[int] = None) -> None:
+        if channel_index is None:
+            channel_index = self._current_sleep_channel_index()
+        table = self._sleep_epoch_feature_tables.get(channel_index)
+        if table is None:
+            self._refresh_sleep_epoch_feature_tabs()
+            table = self._sleep_epoch_feature_tables.get(channel_index)
+        if table is None:
+            return
+        bands = [name for name in self._sleep_band_checks if any(f"{name}_" in key for row in rows for key in row.keys())]
+        headers = ["epoch", "start_s", "end_s", "duration_s"]
+        for key in ("stage_yasa", "yasa_confidence"):
+            if any(key in row for row in rows):
+                headers.append(key)
+        for band in bands:
+            headers.extend([f"{band}_abs", f"{band}_rel_pct"])
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            for col_idx, key in enumerate(headers):
+                value = row.get(key, "")
+                if isinstance(value, float):
+                    text = f"{value:.6g}"
+                else:
+                    text = str(value)
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                table.setItem(row_idx, col_idx, item)
+        table.resizeColumnsToContents()
+        for idx in range(self._sleep_epoch_feature_tabs.count()):
+            if self._sleep_epoch_feature_tabs.widget(idx) is table:
+                self._sleep_epoch_feature_tabs.setCurrentIndex(idx)
+                break
+
+    @QtCore.pyqtSlot()
+    def _generate_sleep_epoch_feature_table(self) -> None:
+        data = self._sleep_feature_data()
+        if data is None:
+            return
+        raw, fs, offset_s, label, unit = data
+        try:
+            start_s, end_s, epoch_s, hop_s, bands = self._read_sleep_trend_params(
+                raw,
+                fs,
+                offset_s,
+                require_power_type=False,
+            )
+            if hop_s > epoch_s:
+                raise ValueError("MNE make_fixed_length_epochs 仅支持 overlap，hop 长度不能大于 epoch 长度")
+            bundle = self._make_sleep_mne_raw(
+                raw,
+                fs,
+                unit,
+                offset_s=offset_s,
+                reject_by_annotation=self._sleep_exclude_bad_check.isChecked(),
+            )
+            if bundle is None:
+                return
+            mne, raw_mne = bundle
+            raw_crop = raw_mne.copy().crop(
+                tmin=start_s,
+                tmax=max(start_s, min(end_s, raw_mne.times[-1])),
+                include_tmax=False,
+            )
+            epochs = mne.make_fixed_length_epochs(
+                raw_crop,
+                duration=float(epoch_s),
+                overlap=float(epoch_s - hop_s),
+                preload=True,
+                reject_by_annotation=self._sleep_exclude_bad_check.isChecked(),
+                proj=False,
+                verbose="ERROR",
+            )
+            if len(epochs) == 0:
+                raise ValueError("MNE 未生成有效 epoch，可能是时间范围太短或全部被 BAD annotation 排除")
+            band_defs = self._sleep_band_defs()
+            fmin = min(band_defs[name][0] for name in bands)
+            fmax = max(band_defs[name][1] for name in bands)
+            spectrum = epochs.compute_psd(
+                method="welch",
+                fmin=fmin,
+                fmax=fmax,
+                n_fft=max(8, int(round(min(epoch_s, 4.0) * fs))),
+                n_per_seg=max(8, int(round(min(epoch_s, 4.0) * fs))),
+                verbose="ERROR",
+            )
+            psds, freqs = spectrum.get_data(return_freqs=True)
+            psds = np.asarray(psds, dtype=np.float64)[:, 0, :]
+            rows: List[Dict[str, object]] = []
+            event_samples = epochs.events[:, 0].astype(np.float64)
+            first_samp = float(getattr(raw_crop, "first_samp", 0))
+            epoch_starts = start_s + (event_samples - first_samp) / fs
+            for idx, epoch_start in enumerate(epoch_starts):
+                powers: Dict[str, float] = {}
+                for band in bands:
+                    low, high = band_defs[band]
+                    band_mask = (freqs >= low) & (freqs <= high)
+                    powers[band] = (
+                        float(np.trapz(psds[idx, band_mask], freqs[band_mask]))
+                        if np.any(band_mask)
+                        else 0.0
+                    )
+                total = sum(max(v, 0.0) for v in powers.values())
+                row: Dict[str, object] = {
+                    "epoch": idx + 1,
+                    "start_s": float(offset_s + epoch_start),
+                    "end_s": float(offset_s + epoch_start + epoch_s),
+                    "duration_s": float(epoch_s),
+                }
+                for band in bands:
+                    row[f"{band}_abs"] = powers[band]
+                    row[f"{band}_rel_pct"] = (powers[band] / total * 100.0) if total > 0 else 0.0
+                rows.append(row)
+            channel_index = self._current_sleep_channel_index()
+            self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
+            self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
+            self._sleep_epoch_feature_rows = rows
+            self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            self._log(
+                f"MNE 睡眠Epoch特征表已生成: {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s | epoch {epoch_s:g}s hop {hop_s:g}s | {len(rows)} 行"
+            )
+        except Exception as exc:
+            self._log(f"MNE 睡眠Epoch特征表生成失败: {exc}")
+
+    @QtCore.pyqtSlot()
+    def _export_sleep_epoch_feature_table_csv(self) -> None:
+        channel_index = self._current_sleep_epoch_feature_channel()
+        rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+        if not rows:
+            self._log("请先生成睡眠Epoch特征表，再导出 CSV")
+            return
+        default_dir = Path(getattr(self, "_offline_csv_path", _ROOT) or _ROOT).parent
+        label = self._sleep_epoch_feature_labels_by_channel.get(channel_index, f"ch{channel_index + 1}")
+        safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label).strip("_") or f"ch{channel_index + 1}"
+        path_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "导出睡眠Epoch特征CSV",
+            str(default_dir / f"sleep_epoch_features_mne_{safe_label}.csv"),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        headers = list(rows[0].keys())
+        try:
+            with path.open("w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(rows)
+            self._log(f"睡眠Epoch特征CSV已导出: {path}")
+        except Exception as exc:
+            self._log(f"睡眠Epoch特征CSV导出失败: {exc}")
+
+    @QtCore.pyqtSlot()
+    def _plot_sleep_band_power_trend(self) -> None:
+        data = self._sleep_feature_data()
+        if data is None:
+            return
+        raw, fs, offset_s, label, _unit = data
+        try:
+            start_s, end_s, epoch_s, hop_s, bands = self._read_sleep_trend_params(raw, fs, offset_s)
+            if self._sleep_exclude_bad_check.isChecked():
+                mask = self._bad_mask_for_data(raw, fs, offset_s)
+                if mask is None or mask.size != raw.size:
+                    self._log(
+                        "睡眠特征分析：当前离线窗口没有可排除的红带坏段预览，按未排除坏段计算"
+                    )
+            centers, abs_values, rel_values = self._compute_sleep_band_power_trend(
+                raw,
+                fs,
+                offset_s=offset_s,
+                start_s=start_s,
+                end_s=end_s,
+                epoch_s=epoch_s,
+                hop_s=hop_s,
+                bands=bands,
+                exclude_bad=self._sleep_exclude_bad_check.isChecked(),
+            )
+            fig = self._analysis_plot.figure
+            fig.clear()
+            want_abs = self._sleep_abs_power_check.isChecked()
+            want_rel = self._sleep_rel_power_check.isChecked()
+            n_axes = int(want_abs) + int(want_rel)
+            axes = fig.subplots(n_axes, 1, sharex=True, squeeze=False)
+            axis_index = 0
+            colors = {
+                "delta": "#5B8FF9",
+                "theta": "#5AD8A6",
+                "alpha": "#F6BD16",
+                "sigma": "#6A1B9A",
+                "beta": "#E8684A",
+            }
+            if want_abs:
+                ax = axes[axis_index, 0]
+                for name in bands:
+                    ax.plot(centers + offset_s, abs_values[name], label=name, color=colors.get(name), linewidth=1.0, marker="o", markersize=4)
+                ax.set_ylabel("绝对功率")
+                ax.set_title("睡眠频段绝对功率趋势")
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc="upper right", ncol=min(len(bands), 5), fontsize=8)
+                axis_index += 1
+            if want_rel:
+                ax = axes[axis_index, 0]
+                for name in bands:
+                    ax.plot(centers + offset_s, rel_values[name], label=name, color=colors.get(name), linewidth=1.0, marker="o", markersize=4)
+                ax.set_ylabel("相对功率(%)")
+                ax.set_title("睡眠频段相对功率趋势")
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc="upper right", ncol=min(len(bands), 5), fontsize=8)
+            axes[-1, 0].set_xlabel("Time (s)")
+            x_values = centers + offset_s
+            if x_values.size == 1:
+                pad = max(1.0, min(float(epoch_s) * 0.25, 15.0))
+                for ax in axes[:, 0]:
+                    ax.set_xlim(float(x_values[0] - pad), float(x_values[0] + pad))
+            else:
+                pad = max(0.5, float(hop_s) * 0.5)
+                for ax in axes[:, 0]:
+                    ax.set_xlim(float(x_values[0] - pad), float(x_values[-1] + pad))
+            fig.suptitle(
+                f"睡眠频段功率趋势 | {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s | epoch {epoch_s:g}s hop {hop_s:g}s",
+                fontsize=12,
+            )
+            self._analysis_plot.refresh()
+            self._show_analysis_plot_view()
+            self._log(f"睡眠频段功率趋势有效窗口: {centers.size} 个")
+            self._log(
+                f"睡眠频段功率趋势已绘制: {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s | epoch {epoch_s:g}s hop {hop_s:g}s"
+            )
+        except Exception as exc:
+            self._log(f"睡眠频段功率趋势绘制失败: {exc}")
+
+    def _current_offline_raw_for_mne(self) -> Optional[tuple[np.ndarray, float, float, str, str]]:
+        raw = np.asarray(getattr(self, "_offline_current_raw", np.zeros(0)), dtype=np.float64)
+        fs = float(getattr(self, "_offline_current_fs", 0.0))
+        if raw.size < 8 or fs <= 0:
+            self._log("请先加载一段离线 EEG 波形，再运行 MNE 标记")
+            return None
+        return (
+            raw,
+            fs,
+            float(getattr(self, "_offline_current_time_offset_s", 0.0)),
+            str(getattr(self, "_offline_current_title", "") or "offline"),
+            str(getattr(self, "_offline_current_y_label", "") or "raw"),
+        )
+
+    def _current_psd_data(self, source_index: int) -> Optional[tuple[np.ndarray, float, float, str, str]]:
+        if int(source_index) == 0:
+            return self._current_offline_raw_for_mne()
+        path = getattr(self, "_offline_csv_path", None)
+        if path is None:
+            self._log("请先加载离线文件，再选择完整文件/当前通道 PSD")
+            return None
+        try:
+            if self._is_edf_like_file(path):
+                raw = np.asarray(self._offline_full_raw, dtype=np.float64)
+                fs = float(self._offline_full_fs)
+                title = f"{path.name} | {self._offline_full_label} | full"
+                y_label = self._offline_full_unit
+            else:
+                raw, fs = load_eeg_csv_with_rate(path)
+                raw = np.asarray(raw, dtype=np.float64)
+                title = f"{path.name} | full"
+                y_label = "raw"
+        except Exception as exc:
+            self._log(f"读取 PSD 数据失败: {exc}")
+            return None
+        if raw.size < 8 or fs <= 0:
+            self._log("PSD 数据有效样本过少")
+            return None
+        return raw, float(fs), 0.0, title, y_label
+
+    @staticmethod
+    def _required_float_from_edit(edit: QtWidgets.QLineEdit, name: str) -> float:
+        text = edit.text().strip()
+        if not text:
+            text = edit.placeholderText().strip()
+        try:
+            return float(text)
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是数字") from exc
+
+    def _read_relative_seconds_range(
+        self,
+        start_edit: QtWidgets.QLineEdit,
+        end_edit: QtWidgets.QLineEdit,
+        *,
+        source_offset_s: float,
+        duration_s: float,
+    ) -> tuple[float, float]:
+        start_text = start_edit.text().strip()
+        end_text = end_edit.text().strip()
+        if not start_text and not end_text:
+            return 0.0, float(duration_s)
+        if not start_text or not end_text:
+            raise ValueError("起始秒和结束秒请同时填写，或都留空")
+        start_s = float(start_text)
+        end_s = float(end_text)
+        if start_s >= source_offset_s and end_s <= source_offset_s + duration_s:
+            start_s -= source_offset_s
+            end_s -= source_offset_s
+        if end_s <= start_s:
+            raise ValueError("结束秒必须大于起始秒")
+        start_s = max(0.0, start_s)
+        end_s = min(float(duration_s), end_s)
+        if end_s <= start_s:
+            raise ValueError("时间范围不在当前数据内")
+        return start_s, end_s
+
+    def _current_remove_mask(self) -> Optional[np.ndarray]:
+        mask = getattr(self._offline_view, "_remove_mask", None)
+        if mask is None:
+            return None
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        return mask if mask.size else None
+
+    def _bad_mask_for_data(
+        self,
+        raw: np.ndarray,
+        fs: float,
+        offset_s: float,
+        *,
+        path: Optional[Path] = None,
+        channel_index: Optional[int] = None,
+    ) -> Optional[np.ndarray]:
+        mask = self._offline_bad_mask_for_window(
+            n_samples=int(np.asarray(raw).size),
+            fs=float(fs),
+            time_offset_s=float(offset_s),
+            path=path,
+            channel_index=channel_index,
+        )
+        if mask is not None:
+            return mask
+        view_mask = self._current_remove_mask()
+        if view_mask is not None and view_mask.size == np.asarray(raw).size:
+            return view_mask
+        return None
+
+    def _offline_bad_key(
+        self,
+        path: Optional[Path] = None,
+        channel_index: Optional[int] = None,
+    ) -> Optional[Tuple[str, int]]:
+        if path is None:
+            path = getattr(self, "_offline_csv_path", None)
+        if path is None:
+            return None
+        if channel_index is None:
+            channel_index = int(getattr(self, "_offline_loaded_channel", -1))
+        try:
+            path_key = str(Path(path).resolve()).casefold()
+        except Exception:
+            path_key = str(path).casefold()
+        return path_key, int(channel_index)
+
+    @staticmethod
+    def _merge_bad_spans(
+        spans: Iterable[Tuple[float, float, str]],
+    ) -> List[Tuple[float, float, str]]:
+        ordered = sorted(
+            ((float(s), float(e), str(label)) for s, e, label in spans if e > s),
+            key=lambda item: item[0],
+        )
+        merged: List[Tuple[float, float, str]] = []
+        for start_s, end_s, label in ordered:
+            if not merged or start_s > merged[-1][1]:
+                merged.append((start_s, end_s, label))
+                continue
+            old_start, old_end, old_label = merged[-1]
+            labels = old_label if label in old_label.split("+") else f"{old_label}+{label}"
+            merged[-1] = (old_start, max(old_end, end_s), labels)
+        return merged
+
+    @staticmethod
+    def _mask_to_absolute_spans(
+        mask: np.ndarray,
+        fs: float,
+        time_offset_s: float,
+        label: str,
+    ) -> List[Tuple[float, float, str]]:
+        mask_arr = np.asarray(mask, dtype=bool).reshape(-1)
+        spans: List[Tuple[float, float, str]] = []
+        n = int(mask_arr.size)
+        i = 0
+        while i < n:
+            if not mask_arr[i]:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and mask_arr[j]:
+                j += 1
+            spans.append(
+                (
+                    float(time_offset_s) + i / fs,
+                    float(time_offset_s) + j / fs,
+                    label,
+                )
+            )
+            i = j
+        return spans
+
+    def _add_offline_bad_mask(
+        self,
+        mask: np.ndarray,
+        fs: float,
+        time_offset_s: float,
+        label: str,
+    ) -> int:
+        key = self._offline_bad_key()
+        if key is None:
+            return 0
+        spans = self._mask_to_absolute_spans(mask, fs, time_offset_s, label)
+        if not spans:
+            return 0
+        existing = self._offline_bad_segments.get(key, [])
+        self._offline_bad_segments[key] = self._merge_bad_spans([*existing, *spans])
+        self._refresh_session_bad_segments_table()
+        return len(spans)
+
+    def _offline_bad_mask_for_window(
+        self,
+        *,
+        n_samples: int,
+        fs: float,
+        time_offset_s: float,
+        path: Optional[Path] = None,
+        channel_index: Optional[int] = None,
+    ) -> Optional[np.ndarray]:
+        key = self._offline_bad_key(path, channel_index)
+        if key is None:
+            return None
+        spans = self._offline_bad_segments.get(key, [])
+        if not spans:
+            return None
+        mask = np.zeros(int(n_samples), dtype=bool)
+        win_start = float(time_offset_s)
+        win_end = win_start + int(n_samples) / fs
+        for start_s, end_s, _label in spans:
+            if end_s <= win_start or start_s >= win_end:
+                continue
+            i0 = max(0, int(np.floor((start_s - win_start) * fs)))
+            i1 = min(int(n_samples), int(np.ceil((end_s - win_start) * fs)))
+            if i1 > i0:
+                mask[i0:i1] = True
+        return mask if np.any(mask) else None
+
+    def _clear_offline_bad_segments(self, *, current_key_only: bool = True) -> None:
+        if current_key_only:
+            key = self._offline_bad_key()
+            if key is not None:
+                self._offline_bad_segments.pop(key, None)
+        else:
+            self._offline_bad_segments.clear()
+        self._refresh_session_bad_segments_table()
+
+    def _current_offline_bad_spans(self) -> List[Tuple[float, float, str]]:
+        key = self._offline_bad_key()
+        if key is None:
+            return []
+        return list(self._offline_bad_segments.get(key, []))
+
+    def _set_current_offline_bad_spans(
+        self,
+        spans: Iterable[Tuple[float, float, str]],
+    ) -> None:
+        key = self._offline_bad_key()
+        if key is None:
+            return
+        merged = self._merge_bad_spans(spans)
+        if merged:
+            self._offline_bad_segments[key] = merged
+        else:
+            self._offline_bad_segments.pop(key, None)
+        self._refresh_session_bad_segments_table()
+
+    def _refresh_session_bad_segments_table(self) -> None:
+        table = getattr(self, "_session_bad_table", None)
+        if table is None:
+            return
+        spans = self._current_offline_bad_spans()
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for row, (start_s, end_s, label) in enumerate(spans):
+            table.insertRow(row)
+            values = (
+                str(row + 1),
+                f"{start_s:.3f}",
+                f"{end_s:.3f}",
+                f"{end_s - start_s:.3f}",
+                label,
+            )
+            for col, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                item.setData(QtCore.Qt.UserRole, row)
+                table.setItem(row, col, item)
+        table.blockSignals(False)
+
+    def _redraw_offline_with_session_bad_mask(self) -> None:
+        raw = np.asarray(getattr(self, "_offline_current_raw", np.zeros(0)), dtype=np.float64)
+        fs = float(getattr(self, "_offline_current_fs", 0.0))
+        if raw.size < 8 or fs <= 0:
+            return
+        time_offset_s = float(getattr(self, "_offline_current_time_offset_s", 0.0))
+        title = str(getattr(self, "_offline_current_title", "") or "offline")
+        y_label = str(getattr(self, "_offline_current_y_label", "") or "raw")
+        mask = self._offline_bad_mask_for_window(
+            n_samples=raw.size,
+            fs=fs,
+            time_offset_s=time_offset_s,
+        )
+        self._offline_view.load_raw(
+            raw,
+            fs,
+            source_name=title,
+            time_offset_s=time_offset_s,
+            remove_mask=mask,
+            y_label=y_label,
+        )
+        self._apply_offline_y_limits()
+        self._refresh_offline_visible_channels()
+
+    @QtCore.pyqtSlot()
+    def _remove_selected_session_bad_segments(self) -> None:
+        table = getattr(self, "_session_bad_table", None)
+        if table is None:
+            return
+        selected_rows = sorted({idx.row() for idx in table.selectedIndexes()}, reverse=True)
+        if not selected_rows:
+            self._log("请先在会话坏段表中选择要删除的坏段")
+            return
+        spans = self._current_offline_bad_spans()
+        keep = [span for index, span in enumerate(spans) if index not in set(selected_rows)]
+        removed = len(spans) - len(keep)
+        self._set_current_offline_bad_spans(keep)
+        self._redraw_offline_with_session_bad_mask()
+        self._log(f"已从当前会话坏段中删除 {removed} 段；不修改原文件")
+
+    @QtCore.pyqtSlot()
+    def _clear_current_session_bad_segments(self) -> None:
+        count = len(self._current_offline_bad_spans())
+        self._clear_offline_bad_segments(current_key_only=True)
+        self._redraw_offline_with_session_bad_mask()
+        self._log(f"已清空当前文件/通道会话坏段 {count} 段；不修改原文件")
+
+    @staticmethod
+    def _mask_to_mne_annotations(mne, mask: np.ndarray, fs: float):
+        spans = []
+        n = int(mask.size)
+        i = 0
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and mask[j]:
+                j += 1
+            spans.append((i, j))
+            i = j
+        return mne.Annotations(
+            onset=[i0 / fs for i0, _i1 in spans],
+            duration=[(i1 - i0) / fs for i0, i1 in spans],
+            description=["BAD_preview"] * len(spans),
+        )
+
+    @QtCore.pyqtSlot()
+    def _plot_custom_psd_from_dialog(self) -> None:
+        data = self._current_psd_data(self._custom_psd_source_combo.currentIndex())
+        if data is None:
+            return
+        raw, fs, offset_s, title, _y_label = data
+        try:
+            duration_s = raw.size / fs
+            start_s, end_s = self._read_relative_seconds_range(
+                self._custom_psd_start_edit,
+                self._custom_psd_end_edit,
+                source_offset_s=offset_s,
+                duration_s=duration_s,
+            )
+            welch_seconds = self._required_float_from_edit(
+                self._custom_psd_welch_edit, "Welch窗长"
+            )
+            fmin = self._required_float_from_edit(self._custom_psd_fmin_edit, "频率下限")
+            fmax = self._required_float_from_edit(self._custom_psd_fmax_edit, "频率上限")
+            if welch_seconds <= 0 or fmax <= fmin:
+                raise ValueError("Welch窗长必须大于0，且频率上限必须大于下限")
+            i0 = int(round(start_s * fs))
+            i1 = int(round(end_s * fs))
+            segment = np.asarray(raw[i0:i1], dtype=np.float64)
+            if self._custom_psd_exclude_bad_check.isChecked():
+                mask = self._bad_mask_for_data(raw, fs, offset_s)
+                if mask is not None and mask.size == raw.size:
+                    segment_mask = mask[i0:i1]
+                    segment = segment[~segment_mask]
+            if segment.size < 8:
+                raise ValueError("排除坏段后有效样本过少")
+            analysis = compute_band_powers(segment, sample_rate=fs, welch_seconds=welch_seconds)
+            plot_band_powers(
+                analysis,
+                title=f"Custom PSD | {title} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s",
+                show=False,
+                figure=self._analysis_plot.figure,
+            )
+            if self._analysis_plot.figure.axes:
+                self._analysis_plot.figure.axes[0].set_xlim(fmin, fmax)
+            self._analysis_plot.refresh()
+            self._show_analysis_plot_view()
+            self._log(
+                f"自定义PSD已绘制: {title} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s | Welch {welch_seconds:g}s"
+            )
+        except Exception as exc:
+            self._log(f"自定义PSD绘制失败: {exc}")
+
+    @QtCore.pyqtSlot()
+    def _plot_mne_psd_from_dialog(self) -> None:
+        data = self._current_psd_data(self._mne_psd_source_combo.currentIndex())
+        if data is None:
+            return
+        try:
+            import mne  # type: ignore
+        except ImportError:
+            self._log("未安装 mne，请先运行：python -m pip install mne")
+            return
+        raw, fs, offset_s, title, y_label = data
+        try:
+            duration_s = raw.size / fs
+            tmin_abs = self._optional_float_from_edit(self._mne_psd_tmin_edit, "tmin")
+            tmax_abs = self._optional_float_from_edit(self._mne_psd_tmax_edit, "tmax")
+            if tmin_abs is None and tmax_abs is None:
+                start_s, end_s = 0.0, duration_s
+            elif tmin_abs is None or tmax_abs is None:
+                raise ValueError("tmin 和 tmax 请同时填写，或都留空")
+            else:
+                start_s, end_s = self._read_relative_seconds_range(
+                    self._mne_psd_tmin_edit,
+                    self._mne_psd_tmax_edit,
+                    source_offset_s=offset_s,
+                    duration_s=duration_s,
+                )
+            mne_tmax = max(start_s, min(end_s, duration_s - 1.0 / fs))
+            scale = self._mne_unit_scale(y_label)
+            data_v = (raw.astype(np.float64, copy=False) * scale).reshape(1, -1)
+            info = mne.create_info(["EEG"], sfreq=fs, ch_types=["eeg"])
+            raw_mne = mne.io.RawArray(data_v, info, verbose="ERROR")
+            mask = self._bad_mask_for_data(raw, fs, offset_s)
+            if (
+                self._mne_psd_reject_annot_check.isChecked()
+                and mask is not None
+                and mask.size == raw.size
+            ):
+                raw_mne.set_annotations(self._mask_to_mne_annotations(mne, mask, fs))
+            if self._mne_psd_filter_check.isChecked():
+                raw_mne = raw_mne.copy().filter(
+                    l_freq=0.5,
+                    h_freq=min(40.0, fs * 0.5 - 0.5),
+                    verbose="ERROR",
+                )
+            fmin = self._required_float_from_edit(self._mne_psd_fmin_edit, "fmin")
+            fmax = self._required_float_from_edit(self._mne_psd_fmax_edit, "fmax")
+            n_fft_sec = self._required_float_from_edit(self._mne_psd_nfft_sec_edit, "n_fft秒")
+            overlap_pct = self._required_float_from_edit(self._mne_psd_overlap_edit, "overlap")
+            method = self._mne_psd_method_combo.currentText()
+            average = self._mne_psd_average_combo.currentText()
+            if fmax <= fmin or n_fft_sec <= 0:
+                raise ValueError("fmax必须大于fmin，n_fft秒必须大于0")
+            if method == "welch":
+                n_fft = max(8, int(round(n_fft_sec * fs)))
+                n_overlap = int(round(n_fft * max(0.0, min(overlap_pct, 95.0)) / 100.0))
+                spectrum = raw_mne.compute_psd(
+                    method="welch",
+                    fmin=fmin,
+                    fmax=fmax,
+                    tmin=start_s,
+                    tmax=mne_tmax,
+                    n_fft=n_fft,
+                    n_per_seg=n_fft,
+                    n_overlap=n_overlap,
+                    average=average,
+                    remove_dc=self._mne_psd_remove_dc_check.isChecked(),
+                    reject_by_annotation=self._mne_psd_reject_annot_check.isChecked(),
+                    verbose="ERROR",
+                )
+            else:
+                spectrum = raw_mne.compute_psd(
+                    method="multitaper",
+                    fmin=fmin,
+                    fmax=fmax,
+                    tmin=start_s,
+                    tmax=mne_tmax,
+                    remove_dc=self._mne_psd_remove_dc_check.isChecked(),
+                    reject_by_annotation=self._mne_psd_reject_annot_check.isChecked(),
+                    verbose="ERROR",
+                )
+            psds, freqs = spectrum.get_data(return_freqs=True)
+            y = np.asarray(psds[0], dtype=np.float64)
+            if self._mne_psd_db_check.isChecked():
+                y = 10.0 * np.log10(np.maximum(y, np.finfo(float).tiny))
+                ylabel = "PSD (dB)"
+            else:
+                ylabel = "PSD"
+            fig = self._analysis_plot.figure
+            fig.clear()
+            ax = fig.add_subplot(111)
+            ax.plot(freqs, y, color="#212121", linewidth=1.0)
+            ax.set_title(
+                f"MNE {method} PSD | {title} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s"
+            )
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(fmin, fmax)
+            self._analysis_plot.refresh()
+            self._show_analysis_plot_view()
+            self._log(
+                f"MNE PSD已绘制: method={method}, {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s, {fmin:g}-{fmax:g}Hz"
+            )
+        except Exception as exc:
+            self._log(f"MNE PSD绘制失败: {exc}")
+
+    @staticmethod
+    def _mne_unit_scale(y_label: str) -> float:
+        unit = y_label.strip().lower().replace("μ", "u")
+        if unit in {"uv", "µv", "microv"}:
+            return 1e-6
+        if unit == "mv":
+            return 1e-3
+        return 1.0
+
+    def _make_mne_raw_from_current(self):
+        current = self._current_offline_raw_for_mne()
+        if current is None:
+            return None
+        try:
+            import mne  # type: ignore
+        except ImportError:
+            self._log("未安装 mne，请先运行：python -m pip install mne")
+            return None
+        raw, fs, time_offset_s, title, y_label = current
+        scale = self._mne_unit_scale(y_label)
+        data = (raw.astype(np.float64, copy=False) * scale).reshape(1, -1)
+        info = mne.create_info(["EEG"], sfreq=fs, ch_types=["eeg"])
+        raw_mne = mne.io.RawArray(data, info, verbose="ERROR")
+        return mne, raw_mne, scale, raw, fs, time_offset_s, title, y_label
+
+    @staticmethod
+    def _optional_float_from_edit(edit: QtWidgets.QLineEdit, name: str) -> Optional[float]:
+        text = edit.text().strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是数字") from exc
+
+    def _annotations_to_mask(self, annotations, fs: float, n_samples: int) -> np.ndarray:
+        mask = np.zeros(int(n_samples), dtype=bool)
+        for onset, duration, desc in zip(
+            list(annotations.onset),
+            list(annotations.duration),
+            list(annotations.description),
+        ):
+            if not str(desc).lower().startswith("bad"):
+                continue
+            i0 = max(0, int(np.floor(float(onset) * fs)))
+            i1 = min(int(n_samples), int(np.ceil((float(onset) + float(duration)) * fs)))
+            if i1 > i0:
+                mask[i0:i1] = True
+        return mask
+
+    def _apply_mne_preview_mask(
+        self,
+        mask: np.ndarray,
+        label: str,
+        *,
+        span_count: int,
+    ) -> None:
+        current = self._current_offline_raw_for_mne()
+        if current is None:
+            return
+        raw, fs, time_offset_s, title, y_label = current
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if mask.size != raw.size:
+            self._log(f"MNE 标记长度不匹配：mask={mask.size}, raw={raw.size}")
+            return
+        added_spans = self._add_offline_bad_mask(mask, fs, time_offset_s, f"MNE {label}")
+        display_mask = self._offline_bad_mask_for_window(
+            n_samples=raw.size,
+            fs=fs,
+            time_offset_s=time_offset_s,
+        )
+        n_bad = int(np.count_nonzero(mask))
+        self._offline_view.load_raw(
+            raw,
+            fs,
+            source_name=f"{title} · MNE {label}({n_bad}点)",
+            time_offset_s=time_offset_s,
+            remove_mask=display_mask if display_mask is not None else mask,
+            y_label=y_label,
+        )
+        self._apply_offline_y_limits()
+        self._refresh_offline_visible_channels()
+        if added_spans:
+            self._log(f"已记录会话坏段 {added_spans} 段；仅用于当前会话预览/排除，不修改原文件")
+        self._log(
+            f"MNE {label} 预览完成：{span_count} 段，{n_bad} 点；仅标记当前离线显示窗口，不修改文件"
+        )
+
+    @QtCore.pyqtSlot()
+    def _run_mne_annotate_amplitude_preview(self) -> None:
+        bundle = self._make_mne_raw_from_current()
+        if bundle is None:
+            return
+        mne, raw_mne, scale, _raw, fs, _offset, _title, _y_label = bundle
+        try:
+            peak = self._optional_float_from_edit(self._mne_amp_peak_edit, "peak阈值")
+            flat = self._optional_float_from_edit(self._mne_amp_flat_edit, "flat阈值")
+            min_duration = self._optional_float_from_edit(
+                self._mne_amp_min_duration_edit, "min_duration"
+            )
+            bad_percent = self._optional_float_from_edit(
+                self._mne_amp_bad_percent_edit, "bad_percent"
+            )
+            annotations, bads = mne.preprocessing.annotate_amplitude(
+                raw_mne,
+                peak=None if peak is None else peak * scale,
+                flat=None if flat is None else flat * scale,
+                bad_percent=5 if bad_percent is None else bad_percent,
+                min_duration=0.005 if min_duration is None else min_duration,
+                picks="eeg",
+                verbose="ERROR",
+            )
+        except Exception as exc:
+            self._log(f"MNE annotate_amplitude 失败: {exc}")
+            return
+        mask = self._annotations_to_mask(annotations, fs, raw_mne.n_times)
+        self._apply_mne_preview_mask(
+            mask, "连续振幅标记", span_count=len(annotations)
+        )
+        if bads:
+            self._log(f"MNE annotate_amplitude 同时标记坏通道: {', '.join(bads)}")
+
+    @QtCore.pyqtSlot()
+    def _run_mne_epoch_reject_preview(self) -> None:
+        bundle = self._make_mne_raw_from_current()
+        if bundle is None:
+            return
+        mne, raw_mne, scale, _raw, fs, _offset, _title, _y_label = bundle
+        try:
+            window_s = self._optional_float_from_edit(self._mne_epoch_window_edit, "窗口")
+            reject_ptp = self._optional_float_from_edit(
+                self._mne_epoch_reject_edit, "reject PTP"
+            )
+            flat_ptp = self._optional_float_from_edit(self._mne_epoch_flat_edit, "flat PTP")
+            if window_s is None or window_s <= 0:
+                raise ValueError("窗口必须大于 0")
+            if reject_ptp is None and flat_ptp is None:
+                raise ValueError("reject PTP 和 flat PTP 至少填写一个")
+            events = mne.make_fixed_length_events(
+                raw_mne,
+                id=1,
+                start=0,
+                stop=raw_mne.n_times / fs,
+                duration=float(window_s),
+            )
+            if len(events) == 0:
+                raise ValueError("当前窗口太短，无法生成固定长度 epoch")
+            tmax = max(0.0, float(window_s) - 1.0 / fs)
+            epochs = mne.Epochs(
+                raw_mne,
+                events,
+                event_id=1,
+                tmin=0.0,
+                tmax=tmax,
+                baseline=None,
+                reject=None if reject_ptp is None else {"eeg": reject_ptp * scale},
+                flat=None if flat_ptp is None else {"eeg": flat_ptp * scale},
+                preload=True,
+                reject_by_annotation=False,
+                verbose="ERROR",
+            )
+        except Exception as exc:
+            self._log(f"MNE 固定窗口拒绝失败: {exc}")
+            return
+        mask = np.zeros(raw_mne.n_times, dtype=bool)
+        span_count = 0
+        for event, drop_log in zip(events, epochs.drop_log):
+            if not drop_log:
+                continue
+            i0 = max(0, int(event[0]))
+            i1 = min(raw_mne.n_times, i0 + int(round(float(window_s) * fs)))
+            if i1 > i0:
+                mask[i0:i1] = True
+                span_count += 1
+        self._apply_mne_preview_mask(mask, "固定窗口拒绝", span_count=span_count)
+
+    def _parse_manual_mne_ranges(self, fs: float, n_samples: int, time_offset_s: float):
+        import re
+
+        text = self._mne_manual_ranges_edit.toPlainText().strip()
+        if not text:
+            raise ValueError("请先填写手动坏段时间范围")
+        total_s = n_samples / fs
+        onsets: List[float] = []
+        durations: List[float] = []
+        for raw_part in re.split(r"[\n,;，；]+", text):
+            part = raw_part.strip()
+            if not part:
+                continue
+            match = re.match(r"^\s*([0-9.]+)\s*[-~到]\s*([0-9.]+)\s*$", part)
+            if not match:
+                raise ValueError(f"无法解析时间段：{part}")
+            start = float(match.group(1))
+            end = float(match.group(2))
+            if end <= start:
+                raise ValueError(f"结束时间必须大于开始时间：{part}")
+            if start >= time_offset_s and end <= time_offset_s + total_s:
+                start -= time_offset_s
+                end -= time_offset_s
+            start = max(0.0, start)
+            end = min(total_s, end)
+            if end > start:
+                onsets.append(start)
+                durations.append(end - start)
+        if not onsets:
+            raise ValueError("没有落在当前显示窗口内的手动坏段")
+        return onsets, durations
+
+    @QtCore.pyqtSlot()
+    def _run_mne_manual_annotation_preview(self) -> None:
+        bundle = self._make_mne_raw_from_current()
+        if bundle is None:
+            return
+        mne, raw_mne, _scale, _raw, fs, time_offset_s, _title, _y_label = bundle
+        try:
+            onsets, durations = self._parse_manual_mne_ranges(
+                fs, raw_mne.n_times, time_offset_s
+            )
+            annotations = mne.Annotations(
+                onset=onsets,
+                duration=durations,
+                description=["BAD_manual"] * len(onsets),
+            )
+        except Exception as exc:
+            self._log(f"MNE 手动坏段标记失败: {exc}")
+            return
+        mask = self._annotations_to_mask(annotations, fs, raw_mne.n_times)
+        self._apply_mne_preview_mask(mask, "手动坏段", span_count=len(onsets))
+
+    @QtCore.pyqtSlot()
+    def _run_mne_annotate_nan_preview(self) -> None:
+        bundle = self._make_mne_raw_from_current()
+        if bundle is None:
+            return
+        mne, raw_mne, _scale, _raw, fs, _offset, _title, _y_label = bundle
+        try:
+            result = mne.preprocessing.annotate_nan(raw_mne)
+            if isinstance(result, tuple):
+                annotations = result[0]
+            elif hasattr(result, "onset"):
+                annotations = result
+            else:
+                annotations = raw_mne.annotations
+        except Exception as exc:
+            self._log(f"MNE annotate_nan 失败: {exc}")
+            return
+        mask = self._annotations_to_mask(annotations, fs, raw_mne.n_times)
+        self._apply_mne_preview_mask(mask, "NaN坏段", span_count=len(annotations))
+
+    @QtCore.pyqtSlot()
+    def _clear_mne_preview_mask(self) -> None:
+        current = self._current_offline_raw_for_mne()
+        if current is None:
+            return
+        raw, fs, time_offset_s, title, y_label = current
+        self._clear_offline_bad_segments(current_key_only=True)
+        self._offline_view.load_raw(
+            raw,
+            fs,
+            source_name=title,
+            time_offset_s=time_offset_s,
+            remove_mask=None,
+            y_label=y_label,
+        )
+        self._apply_offline_y_limits()
+        self._refresh_offline_visible_channels()
+        self._log("已清除 MNE 预览标记")
+
+    @staticmethod
+    def _custom_reject_param_specs() -> List[Tuple[str, str, str]]:
+        return [
+            ("EEG_REJECT_SEGMENT_SEC", "分段时长(s)", "按固定秒数切片后做阈值判断。"),
+            ("EEG_RAW_MIN_VALID", "raw有效下限", "低于或等于该值会被视为贴边/异常。"),
+            ("EEG_RAW_MAX_VALID", "raw有效上限", "高于或等于该值会被视为贴边/异常。"),
+            ("EEG_SEGMENT_MAX_PTP", "单段峰峰值上限", "max(segment)-min(segment) 超过后标红。"),
+            ("EEG_SEGMENT_MAX_DEVIATION", "单点偏离上限", "点值远离本段中位数过多时标红。"),
+            ("EEG_ADAPTIVE_MAD_MULT", "自适应MAD倍数", "全局 median + N*MAD 的倍数。"),
+            ("EEG_SUSPICIOUS_MIN_PTP", "可疑峰峰值下限", "可疑段峰峰值规则的最低阈值。"),
+            ("EEG_SUSPICIOUS_MIN_DIFF", "相邻跳变下限", "可疑段相邻采样跳变规则的最低阈值。"),
+            ("EEG_SUSPICIOUS_DELTA_RMS_MAD_MULT", "delta RMS MAD倍数", "delta RMS 可疑段自适应倍数。"),
+            ("EEG_SUSPICIOUS_DELTA_RMS_RATIO", "delta RMS背景倍数", "delta RMS 相对背景的最低倍数。"),
+            ("EEG_MULTIBAND_PTP_FLOOR", "多频段PTP底线", "多频段同步尖峰规则的最低阈值。"),
+            ("EEG_MULTIBAND_PTP_RATIO", "多频段PTP倍数", "多频段阈值相对背景的倍数。"),
+            ("EEG_MULTIBAND_PTP_MAD_MULT", "多频段MAD倍数", "多频段阈值的 MAD 倍数。"),
+            ("EEG_MULTIBAND_SYNC_MIN_BANDS", "可疑同步频段数", "超过阈值的频段数达到该值时标可疑。"),
+            ("EEG_MULTIBAND_SYNC_REJECT_MIN_BANDS", "拒绝同步频段数", "超过阈值的频段数达到该值时标拒绝。"),
+            ("EEG_SPLICE_ALIGN_WINDOW_SEC", "拼接对齐窗(s)", "剔坏后拼接时用于局部中位数对齐。"),
+            ("EEG_SUSPICIOUS_ALPHA_RMS_MAD_MULT", "alpha RMS MAD倍数", "alpha RMS 可疑段自适应倍数。"),
+            ("EEG_SUSPICIOUS_ALPHA_RMS_RATIO", "alpha RMS背景倍数", "alpha RMS 相对背景的最低倍数。"),
+            ("EEG_SUSPICIOUS_ALPHA_RMS_FLOOR", "alpha RMS底线", "alpha RMS 规则最低阈值。"),
+        ]
+
+    @staticmethod
+    def _format_reject_param_value(value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    @QtCore.pyqtSlot()
+    def _reset_custom_reject_params(self) -> None:
+        for name, edit in self._custom_reject_param_edits.items():
+            edit.setText(self._format_reject_param_value(getattr(movement_artifact, name)))
+        self._refresh_offline_rejection_preview()
+
+    def _read_custom_reject_params(self) -> Dict[str, float | int]:
+        params: Dict[str, float | int] = {}
+        for name, edit in self._custom_reject_param_edits.items():
+            text = edit.text().strip()
+            if not text:
+                raise ValueError(f"{name} 不能为空")
+            value_type = self._custom_reject_param_types[name]
+            try:
+                value = float(text)
+            except ValueError as exc:
+                raise ValueError(f"{name} 必须是数字") from exc
+            if value_type is int:
+                if not value.is_integer():
+                    raise ValueError(f"{name} 必须是整数")
+                params[name] = int(value)
+            else:
+                params[name] = float(value)
+        return params
+
+    def _build_threshold_rejection_for_offline_preview(
+        self, raw: np.ndarray, sample_rate: float
+    ):
+        if not getattr(self, "_custom_reject_override", None) or (
+            not self._custom_reject_override.isChecked()
+        ):
+            return build_threshold_rejection(raw, sample_rate)
+        params = self._read_custom_reject_params()
+        old_values = {name: getattr(movement_artifact, name) for name in params}
+        try:
+            for name, value in params.items():
+                setattr(movement_artifact, name, value)
+            return movement_artifact.build_threshold_rejection(raw, sample_rate)
+        finally:
+            for name, value in old_values.items():
+                setattr(movement_artifact, name, value)
+
+    @QtCore.pyqtSlot()
+    def _refresh_offline_rejection_preview(self) -> None:
+        if (
+            getattr(self, "_offline_view_active", False)
+            and getattr(self, "_offline_csv_path", None) is not None
+            and not self._is_edf_like_file(self._offline_csv_path)
+        ):
+            self._load_offline_eeg_csv()
 
     def _parse_offline_minute_range(self) -> Optional[Tuple[int, int]]:
         """解析分钟起止；都空返回 None；只填一侧或非法则抛 ValueError。"""
@@ -1398,6 +3278,26 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if end_m < start_m:
             raise ValueError(f"结束分钟 {end_m} 不能小于起始分钟 {start_m}")
         return start_m, end_m
+
+    def _clear_zero_based_minutes_for_csv(self) -> bool:
+        """Clear EDF-style 0.x minute ranges before loading CSV files."""
+        start_text = self.ui.lineEdit_offline_min_start.text().strip()
+        end_text = self.ui.lineEdit_offline_min_end.text().strip()
+        if not start_text and not end_text:
+            return False
+        try:
+            values = [float(text) for text in (start_text, end_text) if text]
+        except ValueError:
+            return False
+        if values and min(values) < 1.0:
+            self.ui.lineEdit_offline_min_start.blockSignals(True)
+            self.ui.lineEdit_offline_min_end.blockSignals(True)
+            self.ui.lineEdit_offline_min_start.clear()
+            self.ui.lineEdit_offline_min_end.clear()
+            self.ui.lineEdit_offline_min_start.blockSignals(False)
+            self.ui.lineEdit_offline_min_end.blockSignals(False)
+            return True
+        return False
 
     @staticmethod
     def _is_offline_full_csv(path: Path) -> bool:
@@ -1421,6 +3321,227 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             if re.fullmatch(r"eeg_chunk_\d+\.csv", name, flags=re.IGNORECASE):
                 cleaned.append(p)
         return sorted(cleaned, key=_chunk_sort_key)
+
+    @staticmethod
+    def _is_edf_like_file(path: Path) -> bool:
+        return path.suffix.lower() in {".edf", ".bdf"}
+
+    def _populate_offline_channels(self, path: Path) -> None:
+        info = load_eeg_file_info(path)
+        self._offline_file_info = info
+        self._offline_channel_combo.blockSignals(True)
+        self._offline_channel_combo.clear()
+        for index, label in enumerate(info.channel_labels):
+            rate = info.channel_rates[index] if index < len(info.channel_rates) else 0.0
+            samples = info.channel_samples[index] if index < len(info.channel_samples) else 0
+            unit = info.channel_units[index] if index < len(info.channel_units) else "raw"
+            self._offline_channel_combo.addItem(
+                f"{label}  ({samples} @ {rate:g} Hz, {unit})", index
+            )
+        self._offline_channel_combo.setCurrentIndex(0)
+        self._offline_channel_combo.setEnabled(
+            self._is_edf_like_file(path) and self._offline_channel_combo.count() > 1
+        )
+        self._offline_channel_combo.blockSignals(False)
+
+    def _load_offline_edf_channel(self, path: Path, channel_index: int) -> None:
+        raw, fs, label, unit = load_eeg_file_channel(path, channel_index)
+        self._offline_loaded_path = path
+        self._offline_loaded_channel = int(channel_index)
+        self._offline_full_raw = np.asarray(raw, dtype=np.float64)
+        self._offline_full_fs = float(fs)
+        self._offline_full_label = label
+        self._offline_full_unit = unit
+
+    def _configure_offline_time_slider(self, reset_start: bool) -> None:
+        duration_s = (
+            float(self._offline_full_raw.size / self._offline_full_fs)
+            if self._offline_full_fs > 0
+            else 0.0
+        )
+        base_window = self._offline_window_sec or float(OFFLINE_EDF_WINDOW_SEC)
+        window = min(float(base_window), duration_s) if duration_s > 0 else 0.0
+        self._offline_window_sec = max(window, 1.0 / max(self._offline_full_fs, 1.0))
+        max_start = max(0, int(np.floor(duration_s - self._offline_window_sec)))
+        current = 0 if reset_start else min(self._offline_time_slider.value(), max_start)
+        self._offline_time_slider.blockSignals(True)
+        self._offline_time_slider.setRange(0, max_start)
+        self._offline_time_slider.setPageStep(max(1, int(round(self._offline_window_sec))))
+        self._offline_time_slider.setSingleStep(1)
+        self._offline_time_slider.setValue(current)
+        self._offline_time_slider.setEnabled(max_start > 0)
+        self._offline_time_slider.blockSignals(False)
+        self._offline_prev_button.setEnabled(max_start > 0)
+        self._offline_next_button.setEnabled(max_start > 0)
+
+    def _render_offline_edf_window(self) -> None:
+        if self._offline_full_raw.size < 8 or self._offline_csv_path is None:
+            return
+        fs = float(self._offline_full_fs)
+        start_s = float(self._offline_time_slider.value())
+        window_s = float(self._offline_window_sec)
+        i0 = max(0, int(round(start_s * fs)))
+        i1 = min(int(self._offline_full_raw.size), int(round((start_s + window_s) * fs)))
+        if i1 <= i0:
+            i1 = min(int(self._offline_full_raw.size), i0 + 8)
+        raw = self._offline_full_raw[i0:i1]
+        end_s = start_s + raw.size / fs
+        title = f"{self._offline_csv_path.name} | {self._offline_full_label} | {start_s:.1f}-{end_s:.1f}s"
+        self._offline_time_status.setText(
+            f"{start_s:.1f}-{end_s:.1f} s / {self._offline_full_raw.size / fs / 60.0:.1f} min"
+        )
+        remove_mask = self._offline_bad_mask_for_window(
+            n_samples=raw.size,
+            fs=fs,
+            time_offset_s=start_s,
+        )
+        self._offline_view.load_raw(
+            raw,
+            fs,
+            source_name=title,
+            time_offset_s=start_s,
+            remove_mask=remove_mask,
+            y_label=self._offline_full_unit,
+        )
+        self._offline_current_raw = np.asarray(raw, dtype=np.float64)
+        self._offline_current_fs = fs
+        self._offline_current_time_offset_s = start_s
+        self._offline_current_title = title
+        self._offline_current_y_label = self._offline_full_unit
+        self._apply_offline_y_limits()
+
+    def _parse_one_decimal_minutes(self, text: str, field_name: str) -> Optional[float]:
+        value = text.strip()
+        if not value:
+            return None
+        if "." in value and len(value.split(".", 1)[1]) > 1:
+            raise ValueError(f"{field_name}最多支持一位小数")
+        try:
+            minutes = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name}必须是数字") from exc
+        if minutes < 0:
+            raise ValueError(f"{field_name}不能小于 0")
+        return minutes
+
+    def _parse_offline_edf_window_seconds(self) -> tuple[float, float]:
+        start_m = self._parse_one_decimal_minutes(
+            self.ui.lineEdit_offline_min_start.text(), "起始分钟"
+        )
+        end_m = self._parse_one_decimal_minutes(
+            self.ui.lineEdit_offline_min_end.text(), "结束分钟"
+        )
+        duration_s = (
+            float(self._offline_full_raw.size / self._offline_full_fs)
+            if self._offline_full_fs > 0
+            else 0.0
+        )
+        if start_m is None and end_m is None:
+            return 0.0, min(float(OFFLINE_EDF_WINDOW_SEC), duration_s)
+        if start_m is None or end_m is None:
+            raise ValueError("EDF 离线查看请同时填写起始分钟和结束分钟，或都留空")
+        start_s = float(start_m) * 60.0
+        end_s = float(end_m) * 60.0
+        if end_s <= start_s:
+            raise ValueError("结束分钟必须大于起始分钟")
+        if start_s >= duration_s:
+            raise ValueError(f"起始分钟超出文件时长（约 {duration_s / 60.0:.1f} 分钟）")
+        return start_s, min(end_s, duration_s)
+
+    def _apply_offline_y_limits(self) -> None:
+        y_min_text = self._offline_y_min_edit.text().strip()
+        y_max_text = self._offline_y_max_edit.text().strip()
+        if not y_min_text and not y_max_text:
+            self._offline_view.set_y_limits(None, None)
+            return
+        if not y_min_text or not y_max_text:
+            raise ValueError("Y轴范围请同时填写下限和上限，或都留空")
+        try:
+            y_min = float(y_min_text)
+            y_max = float(y_max_text)
+        except ValueError as exc:
+            raise ValueError("Y轴范围必须是数字") from exc
+        self._offline_view.set_y_limits(y_min, y_max)
+
+    def _set_offline_minute_edits_from_window(self) -> None:
+        if self._offline_full_fs <= 0 or self._offline_full_raw.size == 0:
+            return
+        start_s = float(self._offline_time_slider.value())
+        end_s = min(
+            float(self._offline_full_raw.size / self._offline_full_fs),
+            start_s + float(self._offline_window_sec),
+        )
+        self.ui.lineEdit_offline_min_start.blockSignals(True)
+        self.ui.lineEdit_offline_min_end.blockSignals(True)
+        self.ui.lineEdit_offline_min_start.setText(f"{start_s / 60.0:.1f}")
+        self.ui.lineEdit_offline_min_end.setText(f"{end_s / 60.0:.1f}")
+        self.ui.lineEdit_offline_min_start.blockSignals(False)
+        self.ui.lineEdit_offline_min_end.blockSignals(False)
+
+    def _load_offline_edf_file(self, path: Path) -> None:
+        self._offline_csv_path = path
+        self._populate_offline_channels(path)
+        channel_index = max(0, self._offline_channel_combo.currentIndex())
+        self._load_offline_edf_channel(path, channel_index)
+        start_s, end_s = self._parse_offline_edf_window_seconds()
+        self._offline_window_sec = max(
+            1.0 / max(self._offline_full_fs, 1.0), end_s - start_s
+        )
+        self._configure_offline_time_slider(reset_start=True)
+        self._offline_time_slider.setValue(
+            max(self._offline_time_slider.minimum(), min(self._offline_time_slider.maximum(), int(round(start_s))))
+        )
+        self._offline_view.scroll_panel.show()
+        self._render_offline_edf_window()
+        self._set_offline_minute_edits_from_window()
+        self._finish_show_offline_view(path.name)
+        self._log(
+            f"EDF/BDF 已加载: {path.name} | 通道 {self._offline_full_label} | "
+            f"{self._offline_full_raw.size} 点 @ {self._offline_full_fs:.0f} Hz"
+        )
+
+    @QtCore.pyqtSlot(int)
+    def _on_offline_channel_changed(self, index: int) -> None:
+        path = self._offline_csv_path
+        if path is None or not self._offline_view_active or not self._is_edf_like_file(path):
+            return
+        try:
+            self._load_offline_edf_channel(path, max(0, int(index)))
+            self._configure_offline_time_slider(reset_start=True)
+            self._render_offline_edf_window()
+            self._refresh_offline_visible_channels()
+            self._update_status_bar()
+            return
+        except Exception as exc:
+            self._log(f"切换 EDF 通道失败: {exc}")
+            return
+    @QtCore.pyqtSlot(int)
+    def _on_offline_scroll_changed(self, _value: int) -> None:
+        path = self._offline_csv_path
+        if path is None or not self._offline_view_active or not self._is_edf_like_file(path):
+            return
+        try:
+            self._render_offline_edf_window()
+            self._set_offline_minute_edits_from_window()
+            self._refresh_offline_visible_channels()
+            self._update_status_bar()
+        except Exception as exc:
+            self._log(f"刷新 EDF 窗口失败: {exc}")
+
+    def _step_offline_window(self, direction: int) -> None:
+        slider = self._offline_time_slider
+        step = max(1, int(round(self._offline_window_sec)))
+        value = slider.value() + int(direction) * step
+        slider.setValue(max(slider.minimum(), min(slider.maximum(), value)))
+
+    @QtCore.pyqtSlot()
+    def _on_offline_y_limits_changed(self) -> None:
+        if not self._offline_view_active or not self._offline_view.has_data:
+            return
+        try:
+            self._apply_offline_y_limits()
+        except Exception as exc:
+            self._log(str(exc))
 
     def _load_offline_selected_slice(
         self,
@@ -1498,13 +3619,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _browse_offline_eeg_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "选择 EEG CSV",
+            "选择 EEG 文件",
             str((_ROOT / "Result").resolve()),
-            "CSV Files (*.csv *.txt);;All Files (*)",
+            "EEG Files (*.csv *.txt *.edf *.bdf);;CSV Files (*.csv *.txt);;EDF/BDF Files (*.edf *.bdf);;All Files (*)",
         )
         if path:
             self.ui.lineEdit_offline_path.setText(path)
-            self._log(f"已选择 EEG CSV: {path}")
+            self._log(f"已选择 EEG 文件: {path}")
             self._load_offline_eeg_csv()
 
     def _resolve_offline_eeg_csv_path(self, text: str) -> Optional[Path]:
@@ -1525,12 +3646,40 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _ui_offline_eeg_csv_path(self) -> str:
         return self.ui.lineEdit_offline_path.text().strip()
 
+    def _finish_show_offline_view(self, title: str) -> None:
+        self._analysis_plot_active = False
+        self._analysis_plot.hide()
+        self._offline_view_active = True
+        for mode, checkbox in self._display_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(mode == "raw")
+            checkbox.blockSignals(False)
+        self._refresh_offline_visible_channels()
+        self._switch_to_eeg_view()
+        self._waveform.hide()
+        self._multi_waveform.hide()
+        self._sync_offline_geometry()
+        self._offline_view.show()
+        self._offline_view.raise_()
+        self.setWindowTitle(f"EEG 离线查看 · {title}")
+        self._update_status_bar()
+
     @QtCore.pyqtSlot()
     def _load_offline_eeg_csv(self) -> None:
         path = self._resolve_offline_eeg_csv_path(self._ui_offline_eeg_csv_path())
         if path is None:
-            self._log("请先选择有效的 EEG CSV 文件")
+            self._log("请先选择有效的 EEG CSV/EDF/BDF 文件")
             return
+        if self._is_edf_like_file(path):
+            try:
+                self._load_offline_edf_file(path)
+            except Exception as exc:
+                self._log(f"EDF/BDF 加载失败 ({path.name}): {exc}")
+            return
+        self._offline_csv_path = path
+        self._offline_loaded_channel = 0
+        if self._clear_zero_based_minutes_for_csv():
+            self._log("CSV 分钟框里有 EDF 的 0.x 起点格式，已清空并按全段加载")
         try:
             minute_range = self._parse_offline_minute_range()
         except ValueError as exc:
@@ -1541,15 +3690,35 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 path, minute_range
             )
             remove_mask = None
-            if self._want_reject_mask_power() and self._is_offline_full_csv(path):
-                quality = build_threshold_rejection(
+            if self._want_reject_mask_power():
+                is_full_csv = self._is_offline_full_csv(path)
+                if not is_full_csv:
+                    self._log(
+                        "当前 CSV 不是 *_full.csv，仍执行临时坏段标记预览；"
+                        "这不会修改原文件，也不代表该文件已重新剔坏。"
+                    )
+                quality = self._build_threshold_rejection_for_offline_preview(
                     raw.astype(np.float64), float(fs)
                 )
                 remove_mask = build_raw_remove_mask(
                     quality, int(raw.size), remove_suspicious=True
                 )
                 n_bad = int(np.count_nonzero(remove_mask))
-                title = f"{title} · 坏段标红({n_bad}点)"
+                self._add_offline_bad_mask(
+                    remove_mask,
+                    float(fs),
+                    float(time_offset_s),
+                    "custom threshold",
+                )
+                preview_tip = "" if is_full_csv else " · 临时预览"
+                title = f"{title} · 坏段标红({n_bad}点){preview_tip}"
+            stored_mask = self._bad_mask_for_data(raw, float(fs), float(time_offset_s))
+            if stored_mask is not None:
+                remove_mask = (
+                    stored_mask
+                    if remove_mask is None
+                    else np.asarray(remove_mask, dtype=bool) | stored_mask
+                )
             n, fs = self._offline_view.load_raw(
                 raw,
                 fs,
@@ -1557,10 +3726,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 time_offset_s=time_offset_s,
                 remove_mask=remove_mask,
             )
+            self._offline_current_raw = np.asarray(raw, dtype=np.float64)
+            self._offline_current_fs = float(fs)
+            self._offline_current_time_offset_s = float(time_offset_s)
+            self._offline_current_title = title
+            self._offline_current_y_label = "raw"
         except Exception as exc:
             self._log(f"离线加载失败 ({path.name}): {exc}")
             return
         self._offline_csv_path = path
+        self._offline_channel_combo.blockSignals(True)
+        self._offline_channel_combo.clear()
+        self._offline_channel_combo.addItem("CH1", 0)
+        self._offline_channel_combo.setEnabled(False)
+        self._offline_channel_combo.blockSignals(False)
+        self._offline_time_slider.blockSignals(True)
+        self._offline_time_slider.setRange(0, 0)
+        self._offline_time_slider.setValue(0)
+        self._offline_time_slider.setEnabled(False)
+        self._offline_time_slider.blockSignals(False)
+        self._offline_prev_button.setEnabled(False)
+        self._offline_next_button.setEnabled(False)
+        self._offline_time_status.setText("CSV 全段/分钟截取")
+        self._offline_view.scroll_panel.hide()
         self._analysis_plot_active = False
         self._analysis_plot.hide()
         self._offline_view_active = True
@@ -1596,6 +3784,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         self._offline_view_active = False
         self._offline_view.clear()
+        self._offline_view.scroll_panel.hide()
         self._offline_view.hide()
         if not self._analysis_plot_active:
             self._show_current_eeg_waveform()

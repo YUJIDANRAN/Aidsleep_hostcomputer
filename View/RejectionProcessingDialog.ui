@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>RejectionProcessingDialog</class>
+ <widget class="QDialog" name="RejectionProcessingDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>620</width>
+    <height>620</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>阈值拒绝/坏段标记处理</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_dialog">
+   <property name="leftMargin">
+    <number>8</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
+   <item>
+    <widget class="QTabWidget" name="tabWidget_reject_processing">
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="tab_custom_reject">
+      <attribute name="title">
+       <string>自定义阈值拒绝</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_custom">
+       <item>
+        <widget class="QCheckBox" name="checkBox_custom_reject_override">
+         <property name="text">
+          <string>使用下方参数覆盖默认值</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="checkBox_custom_reject_show_mask">
+         <property name="text">
+          <string>离线查看显示坏段标记</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_custom_reject_hint">
+         <property name="text">
+          <string>默认值来自现有自定义阈值拒绝逻辑；这里不修改算法，只允许运行时调参。</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QTableWidget" name="tableWidget_custom_reject_params">
+         <property name="columnCount">
+          <number>3</number>
+         </property>
+         <column>
+          <property name="text">
+           <string>参数</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>值</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>说明</string>
+          </property>
+         </column>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_custom_buttons">
+         <item>
+          <spacer name="horizontalSpacer_custom_buttons">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_custom_reject_reset">
+           <property name="text">
+            <string>恢复默认</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_custom_reject_refresh">
+           <property name="text">
+            <string>重新标记</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_mne_reject">
+      <attribute name="title">
+       <string>MNE</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_mne">
+       <item>
+        <widget class="QLabel" name="label_mne_hint">
+         <property name="text">
+          <string>MNE 标记只作用于当前离线显示窗口，生成红带预览；不写回原文件。</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupBox_mne_amplitude">
+         <property name="title">
+          <string>1. 连续振幅标记 annotate_amplitude</string>
+         </property>
+         <layout class="QGridLayout" name="gridLayout_mne_amplitude">
+          <item row="0" column="0">
+           <widget class="QLabel" name="label_mne_amp_peak">
+            <property name="text">
+             <string>相邻点突跳阈值</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QLineEdit" name="lineEdit_mne_amp_peak">
+            <property name="text">
+             <string>100</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="2">
+           <widget class="QLabel" name="label_mne_amp_flat">
+            <property name="text">
+             <string>平坦阈值</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="3">
+           <widget class="QLineEdit" name="lineEdit_mne_amp_flat"/>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="label_mne_amp_min_duration">
+            <property name="text">
+             <string>最短持续(s)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QLineEdit" name="lineEdit_mne_amp_min_duration">
+            <property name="text">
+             <string>0.005</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="2">
+           <widget class="QLabel" name="label_mne_amp_bad_percent">
+            <property name="text">
+             <string>坏通道比例(%)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="3">
+           <widget class="QLineEdit" name="lineEdit_mne_amp_bad_percent">
+            <property name="text">
+             <string>5</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="0" colspan="4">
+           <widget class="QPushButton" name="pushButton_mne_amp_run">
+            <property name="text">
+             <string>运行连续振幅标记</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupBox_mne_epoch">
+         <property name="title">
+          <string>2. 固定窗口阈值拒绝 Epochs reject/flat</string>
+         </property>
+         <layout class="QGridLayout" name="gridLayout_mne_epoch">
+          <item row="0" column="0">
+           <widget class="QLabel" name="label_mne_epoch_window">
+            <property name="text">
+             <string>窗口(s)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QLineEdit" name="lineEdit_mne_epoch_window">
+            <property name="text">
+             <string>1</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="2">
+           <widget class="QLabel" name="label_mne_epoch_reject">
+            <property name="text">
+             <string>reject PTP</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="3">
+           <widget class="QLineEdit" name="lineEdit_mne_epoch_reject">
+            <property name="text">
+             <string>100</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="label_mne_epoch_flat">
+            <property name="text">
+             <string>flat PTP</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QLineEdit" name="lineEdit_mne_epoch_flat"/>
+          </item>
+          <item row="2" column="0" colspan="4">
+           <widget class="QPushButton" name="pushButton_mne_epoch_run">
+            <property name="text">
+             <string>运行固定窗口拒绝</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupBox_mne_manual">
+         <property name="title">
+          <string>3. 手动坏段 Annotations</string>
+         </property>
+         <layout class="QVBoxLayout" name="verticalLayout_mne_manual">
+          <item>
+           <widget class="QPlainTextEdit" name="plainTextEdit_mne_manual_ranges">
+            <property name="maximumSize">
+             <size>
+              <width>16777215</width>
+              <height>90</height>
+             </size>
+            </property>
+            <property name="placeholderText">
+             <string>每行一个时间段，例如：2.0-2.7</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="pushButton_mne_manual_run">
+            <property name="text">
+             <string>运行手动坏段标记</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="groupBox_mne_nan">
+         <property name="title">
+          <string>4. NaN坏段标记 annotate_nan</string>
+         </property>
+         <layout class="QVBoxLayout" name="verticalLayout_mne_nan">
+          <item>
+           <widget class="QPushButton" name="pushButton_mne_nan_run">
+            <property name="text">
+             <string>运行NaN坏段标记</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_mne_clear_preview">
+         <property name="text">
+          <string>清除MNE预览标记</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_mne">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_session_bad_segments">
+      <attribute name="title">
+       <string>会话坏段</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_session_bad">
+       <item>
+        <widget class="QLabel" name="label_session_bad_hint">
+         <property name="text">
+          <string>这里记录当前文件/通道在本次会话中标记的坏段；仅用于红带预览和分析时排除，不写回原始文件。</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QTableWidget" name="tableWidget_session_bad_segments">
+         <attribute name="verticalHeaderVisible">
+          <bool>false</bool>
+         </attribute>
+         <property name="selectionBehavior">
+          <enum>QAbstractItemView::SelectRows</enum>
+         </property>
+         <property name="selectionMode">
+          <enum>QAbstractItemView::ExtendedSelection</enum>
+         </property>
+         <property name="editTriggers">
+          <set>QAbstractItemView::NoEditTriggers</set>
+         </property>
+         <property name="columnCount">
+          <number>5</number>
+         </property>
+         <column>
+          <property name="text">
+           <string>序号</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>起始(s)</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>结束(s)</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>时长(s)</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
+           <string>来源</string>
+          </property>
+         </column>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_session_bad_buttons">
+         <item>
+          <spacer name="horizontalSpacer_session_bad_buttons">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_session_bad_refresh">
+           <property name="text">
+            <string>刷新</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_session_bad_remove_selected">
+           <property name="text">
+            <string>删除选中坏段</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_session_bad_clear_current">
+           <property name="text">
+            <string>清空当前通道</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

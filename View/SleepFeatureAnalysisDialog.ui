@@ -1,0 +1,598 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>SleepFeatureAnalysisDialog</class>
+ <widget class="QDialog" name="SleepFeatureAnalysisDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>620</width>
+    <height>480</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>睡眠特征分析</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_dialog">
+   <property name="leftMargin">
+    <number>8</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
+   <item>
+    <widget class="QTabWidget" name="tabWidget_sleep_feature">
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="tab_band_power_trend">
+      <attribute name="title">
+       <string>频段功率趋势</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_band_power_trend">
+       <item>
+        <layout class="QGridLayout" name="gridLayout_band_power_params">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_sleep_channel">
+           <property name="text">
+            <string>通道</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1" colspan="3">
+          <widget class="QComboBox" name="comboBox_sleep_channel"/>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="label_sleep_epoch">
+           <property name="text">
+            <string>epoch长度(s)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QLineEdit" name="lineEdit_sleep_epoch_sec">
+           <property name="text">
+            <string>30</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="2">
+          <widget class="QLabel" name="label_sleep_hop">
+           <property name="text">
+            <string>hop长度(s)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="3">
+          <widget class="QComboBox" name="comboBox_sleep_hop_sec">
+           <property name="editable">
+            <bool>true</bool>
+           </property>
+           <item>
+            <property name="text">
+             <string>30</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>5</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="label_sleep_time_start">
+           <property name="text">
+            <string>起始秒</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QLineEdit" name="lineEdit_sleep_start_sec"/>
+         </item>
+         <item row="2" column="2">
+          <widget class="QLabel" name="label_sleep_time_end">
+           <property name="text">
+            <string>结束秒</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="3">
+          <widget class="QLineEdit" name="lineEdit_sleep_end_sec"/>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="label_sleep_bands">
+           <property name="text">
+            <string>频段</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1" colspan="3">
+          <layout class="QHBoxLayout" name="horizontalLayout_sleep_bands">
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_delta">
+             <property name="text">
+              <string>delta</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_theta">
+             <property name="text">
+              <string>theta</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_alpha">
+             <property name="text">
+              <string>alpha</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_sigma">
+             <property name="text">
+              <string>sigma</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_beta">
+             <property name="text">
+              <string>beta</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+         <item row="4" column="0">
+          <widget class="QLabel" name="label_sleep_power_type">
+           <property name="text">
+            <string>功率类型</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="1" colspan="3">
+          <layout class="QHBoxLayout" name="horizontalLayout_sleep_power_type">
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_absolute_power">
+             <property name="text">
+              <string>绝对功率</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_relative_power">
+             <property name="text">
+              <string>相对功率</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="checkBox_sleep_exclude_bad">
+             <property name="text">
+              <string>排除会话红带坏段</string>
+             </property>
+             <property name="toolTip">
+              <string>排除当前文件/通道在本次会话中已标红的坏段；不会写入文件，也不会给原数据打tag。</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_sleep_plot_band_power_trend">
+         <property name="text">
+          <string>绘制频段功率趋势</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_sleep_feature">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_yasa_sleep_staging">
+      <attribute name="title">
+       <string>YASA自动睡眠分期</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_yasa_staging">
+       <item>
+        <widget class="QLabel" name="label_yasa_staging_hint">
+         <property name="text">
+          <string>使用 YASA 官方 SleepStaging 接口预测 30 秒 epoch 的睡眠阶段，并同步写入“睡眠Epoch特征表”的 stage_yasa 列。YASA 会自动降采样并按微伏处理；不建议在运行前手动滤波或标准化。</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QGridLayout" name="gridLayout_yasa_staging">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_yasa_eeg">
+           <property name="text">
+            <string>EEG通道</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1" colspan="3">
+          <widget class="QComboBox" name="comboBox_yasa_eeg"/>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="label_yasa_eog">
+           <property name="text">
+            <string>EOG通道</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QComboBox" name="comboBox_yasa_eog"/>
+         </item>
+         <item row="1" column="2">
+          <widget class="QLabel" name="label_yasa_emg">
+           <property name="text">
+            <string>EMG通道</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="3">
+          <widget class="QComboBox" name="comboBox_yasa_emg"/>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="label_yasa_age">
+           <property name="text">
+            <string>年龄</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QLineEdit" name="lineEdit_yasa_age">
+           <property name="placeholderText">
+            <string>可空</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="2">
+          <widget class="QLabel" name="label_yasa_sex">
+           <property name="text">
+            <string>性别</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="3">
+          <widget class="QComboBox" name="comboBox_yasa_sex">
+           <item>
+            <property name="text">
+             <string>未知</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>男</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>女</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="label_yasa_model">
+           <property name="text">
+            <string>模型</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1" colspan="3">
+          <widget class="QLineEdit" name="lineEdit_yasa_model">
+           <property name="text">
+            <string>auto</string>
+           </property>
+           <property name="toolTip">
+            <string>YASA SleepStaging.predict(path_to_model)，默认 auto 使用 YASA 预训练模型；也可填 joblib 模型路径。</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="0" colspan="4">
+          <widget class="QCheckBox" name="checkBox_yasa_csv_raw_to_uv">
+           <property name="text">
+            <string>CSV/raw 输入按 baseline 临时换算为 uV</string>
+           </property>
+           <property name="toolTip">
+            <string>仅对 CSV/raw 数据生效；EDF/BDF 会继续使用文件里的物理单位。换算公式：uV=(raw-baseline)*uV_per_count。</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="0">
+          <widget class="QLabel" name="label_yasa_csv_baseline_method">
+           <property name="text">
+            <string>CSV baseline</string>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="1">
+          <widget class="QComboBox" name="comboBox_yasa_csv_baseline_method">
+           <item>
+            <property name="text">
+             <string>中位数</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>均值</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>固定值</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="5" column="2">
+          <widget class="QLabel" name="label_yasa_csv_baseline_value">
+           <property name="text">
+            <string>固定值</string>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="3">
+          <widget class="QLineEdit" name="lineEdit_yasa_csv_baseline_value">
+           <property name="placeholderText">
+            <string>仅固定值模式填写</string>
+           </property>
+          </widget>
+         </item>
+         <item row="6" column="0">
+          <widget class="QLabel" name="label_yasa_csv_uv_per_count">
+           <property name="text">
+            <string>uV/count</string>
+           </property>
+          </widget>
+         </item>
+         <item row="6" column="1">
+          <widget class="QLineEdit" name="lineEdit_yasa_csv_uv_per_count">
+           <property name="text">
+            <string>0.746</string>
+           </property>
+           <property name="toolTip">
+            <string>按 3.3V 参考、12位ADC、1080倍增益估算：3.3/4095/1080*1e6≈0.746 uV/count。</string>
+           </property>
+          </widget>
+         </item>
+         <item row="7" column="0" colspan="4">
+          <widget class="QCheckBox" name="checkBox_yasa_sync_features">
+           <property name="text">
+            <string>分期前若特征表为空，先生成 MNE epoch 特征表</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_yasa_run_staging">
+         <property name="text">
+          <string>运行YASA自动分期并更新特征表</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_yasa_staging">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_epoch_feature_table">
+      <attribute name="title">
+       <string>睡眠Epoch特征表</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_epoch_feature">
+       <item>
+        <widget class="QLabel" name="label_epoch_feature_hint">
+         <property name="text">
+          <string>使用 MNE 官方 make_fixed_length_epochs 和 compute_psd 生成当前通道的 epoch 频段功率特征；通道、起止秒、epoch、hop、频段和坏段排除设置沿用“频段功率趋势”页。</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QTabWidget" name="tabWidget_sleep_epoch_feature_tables">
+         <property name="tabPosition">
+          <enum>QTabWidget::North</enum>
+         </property>
+         <property name="movable">
+          <bool>false</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_epoch_feature_buttons">
+         <item>
+          <spacer name="horizontalSpacer_epoch_feature_buttons">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_sleep_generate_epoch_features">
+           <property name="text">
+            <string>生成特征</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="pushButton_sleep_export_epoch_features">
+           <property name="text">
+            <string>导出CSV</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="tab_spindle_sigma">
+      <attribute name="title">
+       <string>Spindle/Sigma候选</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_spindle_sigma">
+       <item>
+        <widget class="QLabel" name="label_spindle_sigma_hint">
+         <property name="text">
+          <string>MNE-Python core 目前没有官方 spindle/sigma 候选段检测接口。这里先不实现自定义 MAD 检测，避免混入非 MNE 官方逻辑；后续可接入 YASA 等专门睡眠分析库，或等你确认算法方案后再实现。</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QGridLayout" name="gridLayout_spindle_sigma">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_spindle_sigma_band">
+           <property name="text">
+            <string>sigma频段(Hz)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QLineEdit" name="lineEdit_spindle_sigma_fmin">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>11</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="2">
+          <widget class="QLineEdit" name="lineEdit_spindle_sigma_fmax">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>16</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="label_spindle_sigma_mad">
+           <property name="text">
+            <string>阈值 MAD倍数</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1" colspan="2">
+          <widget class="QLineEdit" name="lineEdit_spindle_sigma_mad">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>3</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pushButton_spindle_sigma_mark">
+         <property name="enabled">
+          <bool>false</bool>
+         </property>
+         <property name="text">
+          <string>MNE core 暂无官方接口，暂不标记候选段</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_spindle_sigma">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
