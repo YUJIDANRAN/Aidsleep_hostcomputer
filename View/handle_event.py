@@ -75,6 +75,7 @@ from analysis_plot_view import (
 from RejectionProcessingDialog import Ui_RejectionProcessingDialog
 from PsdAnalysisDialog import Ui_PsdAnalysisDialog
 from SleepFeatureAnalysisDialog import Ui_SleepFeatureAnalysisDialog
+from MuscleArtifactDialog import Ui_MuscleArtifactDialog
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from controller import (
     AlphaPhaseSnapshot,
@@ -1115,6 +1116,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view.hide()
         self._setup_offline_viewer_ui()
         self._setup_rejection_processing_ui()
+        self._setup_muscle_artifact_ui()
         self._setup_psd_analysis_ui()
         self._setup_sleep_feature_analysis_ui()
         self._multi_waveform = MultiChannelEegView(
@@ -1550,6 +1552,31 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._reject_dialog.raise_()
         self._reject_dialog.activateWindow()
 
+    def _setup_muscle_artifact_ui(self) -> None:
+        """Bind MNE muscle/high-frequency artifact dialog controls."""
+        self._muscle_button = self.ui.pushButton_muscle_artifact
+        self._muscle_button.setToolTip("打开 MNE 肌电/高频伪迹标记参数")
+        self._muscle_button.clicked.connect(self._show_muscle_artifact_dialog)
+
+        self._muscle_dialog = QtWidgets.QDialog(self)
+        self._muscle_ui = Ui_MuscleArtifactDialog()
+        self._muscle_ui.setupUi(self._muscle_dialog)
+        self._muscle_threshold_edit = self._muscle_ui.lineEdit_threshold
+        self._muscle_ch_type_combo = self._muscle_ui.comboBox_ch_type
+        self._muscle_filter_low_edit = self._muscle_ui.lineEdit_filter_low
+        self._muscle_filter_high_edit = self._muscle_ui.lineEdit_filter_high
+        self._muscle_min_good_edit = self._muscle_ui.lineEdit_min_good
+        self._muscle_n_jobs_edit = self._muscle_ui.lineEdit_n_jobs
+        self._muscle_record_bad_check = self._muscle_ui.checkBox_record_session_bad
+        self._muscle_ui.pushButton_run.clicked.connect(self._run_mne_muscle_artifact_preview)
+        self._muscle_ui.pushButton_close.clicked.connect(self._muscle_dialog.close)
+
+    @QtCore.pyqtSlot()
+    def _show_muscle_artifact_dialog(self) -> None:
+        self._muscle_dialog.show()
+        self._muscle_dialog.raise_()
+        self._muscle_dialog.activateWindow()
+
     def _setup_psd_analysis_ui(self) -> None:
         """Bind Designer-defined PSD analysis dialog controls."""
         self._psd_button = self.ui.pushButton_psd_analysis
@@ -1655,6 +1682,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._yasa_csv_baseline_value_edit = self._sleep_feature_ui.lineEdit_yasa_csv_baseline_value
         self._yasa_csv_uv_per_count_edit = self._sleep_feature_ui.lineEdit_yasa_csv_uv_per_count
         self._yasa_sync_features_check = self._sleep_feature_ui.checkBox_yasa_sync_features
+        self._setup_spindle_sigma_runtime_ui()
+        self._setup_slow_wave_runtime_ui()
         self._sleep_feature_ui.pushButton_sleep_plot_band_power_trend.clicked.connect(
             self._plot_sleep_band_power_trend
         )
@@ -1666,6 +1695,174 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
         self._sleep_feature_ui.pushButton_yasa_run_staging.clicked.connect(
             self._run_yasa_sleep_staging
+        )
+        self._sleep_feature_ui.pushButton_spindle_sigma_mark.clicked.connect(
+            self._run_yasa_spindle_refinement
+        )
+
+    def _setup_slow_wave_runtime_ui(self) -> None:
+        ui = self._sleep_feature_ui
+        self._tab_slow_wave_n3 = QtWidgets.QWidget(ui.tabWidget_sleep_feature)
+        self._tab_slow_wave_n3.setObjectName("tab_slow_wave_n3")
+        layout = QtWidgets.QVBoxLayout(self._tab_slow_wave_n3)
+        hint = QtWidgets.QLabel(
+            "基于慢波活动和 delta 功率对 YASA 初分期做 N3 二次修正。"
+            "第一版主要处理“真实 N3 被判成 N2”的情况，输出 slow_wave_* 特征和 stage_refined_slow。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        grid = QtWidgets.QGridLayout()
+        layout.addLayout(grid)
+
+        self._slow_wave_band_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_band_edit.setText("0.5,2")
+        self._slow_wave_duration_min_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_duration_max_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_duration_min_edit.setText("0.25")
+        self._slow_wave_duration_max_edit.setText("1.0")
+        self._slow_wave_ptp_uv_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_ptp_uv_edit.setText("75")
+        self._slow_wave_neg_uv_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_neg_uv_edit.setText("40")
+        self._slow_wave_time_pct_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_time_pct_edit.setText("20")
+        self._slow_wave_delta_rel_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_delta_rel_edit.setText("45")
+        self._slow_wave_confidence_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_confidence_edit.setText("0.85")
+
+        grid.addWidget(QtWidgets.QLabel("慢波频段(Hz)", self._tab_slow_wave_n3), 0, 0, 1, 1)
+        grid.addWidget(self._slow_wave_band_edit, 0, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("持续时间(s)", self._tab_slow_wave_n3), 0, 2, 1, 1)
+        grid.addWidget(self._slow_wave_duration_min_edit, 0, 3, 1, 1)
+        grid.addWidget(self._slow_wave_duration_max_edit, 0, 4, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("PTP阈值(uV)", self._tab_slow_wave_n3), 1, 0, 1, 1)
+        grid.addWidget(self._slow_wave_ptp_uv_edit, 1, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("负峰阈值(uV)", self._tab_slow_wave_n3), 1, 2, 1, 1)
+        grid.addWidget(self._slow_wave_neg_uv_edit, 1, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("慢波占时下限(%)", self._tab_slow_wave_n3), 2, 0, 1, 1)
+        grid.addWidget(self._slow_wave_time_pct_edit, 2, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("delta相对功率下限(%)", self._tab_slow_wave_n3), 2, 2, 1, 1)
+        grid.addWidget(self._slow_wave_delta_rel_edit, 2, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("N2低置信阈值", self._tab_slow_wave_n3), 3, 0, 1, 1)
+        grid.addWidget(self._slow_wave_confidence_edit, 3, 1, 1, 1)
+
+        self._slow_wave_only_n2_check = QtWidgets.QCheckBox("仅修正 YASA=N2 的 epoch", self._tab_slow_wave_n3)
+        self._slow_wave_only_n2_check.setChecked(True)
+        self._slow_wave_require_low_conf_check = QtWidgets.QCheckBox("要求 YASA 置信度低于阈值", self._tab_slow_wave_n3)
+        self._slow_wave_require_low_conf_check.setChecked(False)
+        grid.addWidget(self._slow_wave_only_n2_check, 3, 2, 1, 2)
+        grid.addWidget(self._slow_wave_require_low_conf_check, 4, 0, 1, 2)
+
+        self._slow_wave_run_button = QtWidgets.QPushButton("运行 SlowWave/Delta N3 修正", self._tab_slow_wave_n3)
+        self._slow_wave_run_button.clicked.connect(self._run_slow_wave_n3_refinement)
+        layout.addWidget(self._slow_wave_run_button)
+        self._slow_wave_results_table = QtWidgets.QTableWidget(self._tab_slow_wave_n3)
+        self._slow_wave_results_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._slow_wave_results_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._slow_wave_results_table.verticalHeader().setVisible(False)
+        layout.addWidget(self._slow_wave_results_table)
+        ui.tabWidget_sleep_feature.addTab(self._tab_slow_wave_n3, "SlowWave/N3修正")
+
+    def _setup_spindle_sigma_runtime_ui(self) -> None:
+        ui = self._sleep_feature_ui
+        ui.label_spindle_sigma_hint.setText(
+            "使用 YASA spindles_detect 在所选 EEG 通道上检测纺锤波，并按 30s epoch 汇总为特征；"
+            "随后用可解释规则对 YASA 初分期做二次修正。检测默认覆盖 N1/N2/N3，避免只在初判 N2 内查找。"
+        )
+        ui.label_spindle_sigma_band.setText("spindle频段(Hz)")
+        ui.lineEdit_spindle_sigma_fmin.setEnabled(True)
+        ui.lineEdit_spindle_sigma_fmax.setEnabled(True)
+        ui.lineEdit_spindle_sigma_fmin.setText("12")
+        ui.lineEdit_spindle_sigma_fmax.setText("15")
+        ui.label_spindle_sigma_mad.setText("宽频背景(Hz)")
+        ui.lineEdit_spindle_sigma_mad.setEnabled(True)
+        ui.lineEdit_spindle_sigma_mad.setText("1,30")
+
+        grid = ui.gridLayout_spindle_sigma
+        self._spindle_duration_min_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_duration_max_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_duration_min_edit.setText("0.5")
+        self._spindle_duration_max_edit.setText("2.0")
+        grid.addWidget(QtWidgets.QLabel("持续时间(s)", ui.tab_spindle_sigma), 2, 0, 1, 1)
+        grid.addWidget(self._spindle_duration_min_edit, 2, 1, 1, 1)
+        grid.addWidget(self._spindle_duration_max_edit, 2, 2, 1, 1)
+
+        self._spindle_include_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_include_edit.setText("N1,N2,N3")
+        grid.addWidget(QtWidgets.QLabel("检测阶段", ui.tab_spindle_sigma), 3, 0, 1, 1)
+        grid.addWidget(self._spindle_include_edit, 3, 1, 1, 2)
+
+        self._spindle_thresh_corr_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_thresh_rel_pow_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_thresh_rms_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_thresh_corr_edit.setText("0.65")
+        self._spindle_thresh_rel_pow_edit.setText("0.2")
+        self._spindle_thresh_rms_edit.setText("1.5")
+        grid.addWidget(QtWidgets.QLabel("阈值 corr/rel/rms", ui.tab_spindle_sigma), 4, 0, 1, 1)
+        grid.addWidget(self._spindle_thresh_corr_edit, 4, 1, 1, 1)
+        grid.addWidget(self._spindle_thresh_rel_pow_edit, 4, 2, 1, 1)
+        grid.addWidget(self._spindle_thresh_rms_edit, 4, 3, 1, 1)
+
+        self._spindle_min_distance_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_min_distance_edit.setText("500")
+        self._spindle_min_count_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_min_count_edit.setText("1")
+        grid.addWidget(QtWidgets.QLabel("最小间隔(ms)", ui.tab_spindle_sigma), 5, 0, 1, 1)
+        grid.addWidget(self._spindle_min_distance_edit, 5, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("修正最少个数", ui.tab_spindle_sigma), 5, 2, 1, 1)
+        grid.addWidget(self._spindle_min_count_edit, 5, 3, 1, 1)
+
+        self._spindle_confidence_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_confidence_edit.setText("0.75")
+        self._spindle_sigma_rel_min_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_sigma_rel_min_edit.setPlaceholderText("可空")
+        grid.addWidget(QtWidgets.QLabel("低置信阈值", ui.tab_spindle_sigma), 6, 0, 1, 1)
+        grid.addWidget(self._spindle_confidence_edit, 6, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("sigma相对功率下限(%)", ui.tab_spindle_sigma), 6, 2, 1, 1)
+        grid.addWidget(self._spindle_sigma_rel_min_edit, 6, 3, 1, 1)
+
+        self._spindle_use_yasa_stage_check = QtWidgets.QCheckBox("使用 stage_yasa 作为 hypno 约束", ui.tab_spindle_sigma)
+        self._spindle_use_yasa_stage_check.setChecked(True)
+        self._spindle_auto_stage_check = QtWidgets.QCheckBox("缺少 stage_yasa 时先运行 YASA 初分期", ui.tab_spindle_sigma)
+        self._spindle_auto_stage_check.setChecked(True)
+        self._spindle_remove_outliers_check = QtWidgets.QCheckBox("YASA remove_outliers", ui.tab_spindle_sigma)
+        self._spindle_remove_outliers_check.setChecked(False)
+        grid.addWidget(self._spindle_use_yasa_stage_check, 7, 0, 1, 2)
+        grid.addWidget(self._spindle_auto_stage_check, 7, 2, 1, 2)
+        grid.addWidget(self._spindle_remove_outliers_check, 8, 0, 1, 2)
+
+        self._kcomplex_enable_check = QtWidgets.QCheckBox("启用 K-complex 候选修正", ui.tab_spindle_sigma)
+        self._kcomplex_enable_check.setChecked(True)
+        self._kcomplex_band_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._kcomplex_band_edit.setText("0.3,4")
+        self._kcomplex_duration_min_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._kcomplex_duration_max_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._kcomplex_duration_min_edit.setText("0.5")
+        self._kcomplex_duration_max_edit.setText("1.5")
+        self._kcomplex_ptp_uv_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._kcomplex_ptp_uv_edit.setText("75")
+        self._kcomplex_neg_uv_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._kcomplex_neg_uv_edit.setText("40")
+        grid.addWidget(self._kcomplex_enable_check, 9, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("K低频带(Hz)", ui.tab_spindle_sigma), 9, 2, 1, 1)
+        grid.addWidget(self._kcomplex_band_edit, 9, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("K持续时间(s)", ui.tab_spindle_sigma), 10, 0, 1, 1)
+        grid.addWidget(self._kcomplex_duration_min_edit, 10, 1, 1, 1)
+        grid.addWidget(self._kcomplex_duration_max_edit, 10, 2, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("K PTP/负峰(uV)", ui.tab_spindle_sigma), 11, 0, 1, 1)
+        grid.addWidget(self._kcomplex_ptp_uv_edit, 11, 1, 1, 1)
+        grid.addWidget(self._kcomplex_neg_uv_edit, 11, 2, 1, 1)
+
+        ui.pushButton_spindle_sigma_mark.setEnabled(True)
+        ui.pushButton_spindle_sigma_mark.setText("运行 Spindle/K-complex 检测并修正分期")
+        self._spindle_results_table = QtWidgets.QTableWidget(ui.tab_spindle_sigma)
+        self._spindle_results_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._spindle_results_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._spindle_results_table.verticalHeader().setVisible(False)
+        ui.verticalLayout_spindle_sigma.insertWidget(
+            max(0, ui.verticalLayout_spindle_sigma.count() - 1),
+            self._spindle_results_table,
         )
 
     @QtCore.pyqtSlot()
@@ -2013,6 +2210,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sleep_channel_combo.setCurrentIndex(i)
                 return
 
+    def _sync_yasa_eeg_to_sleep_channel(self) -> None:
+        channel_index = self._current_sleep_channel_index()
+        for i in range(self._yasa_eeg_combo.count()):
+            if self._yasa_eeg_combo.itemData(i) == channel_index:
+                self._yasa_eeg_combo.setCurrentIndex(i)
+                return
+
     def _csv_raw_to_yasa_volts(self, raw: np.ndarray) -> tuple[np.ndarray, float, float]:
         arr = np.asarray(raw, dtype=np.float64)
         if arr.size < 8:
@@ -2091,16 +2295,39 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         emg_name = _append_channel(int(emg_index), "emg", "EMG") if emg_index is not None else None
         if not data_rows or min(row.size for row in data_rows) < 8:
             raise ValueError("YASA 分期数据有效样本过少")
-        fs = float(np.median(np.asarray(fs_values, dtype=np.float64)))
-        if any(abs(v - fs) > 1e-6 for v in fs_values):
-            raise ValueError("YASA 分期暂不支持所选 EEG/EOG/EMG 通道采样率不同")
-        n = min(row.size for row in data_rows)
-        data = np.vstack([row[:n] for row in data_rows])
-        info = mne.create_info(names, sfreq=fs, ch_types=ch_types)
+        target_fs = float(fs_values[0])
+
+        def _resample_for_yasa(row: np.ndarray, src_fs: float, target: float) -> np.ndarray:
+            if abs(float(src_fs) - float(target)) <= 1e-6:
+                return row
+            try:
+                from scipy.signal import resample_poly
+            except ImportError as exc:
+                raise ValueError("YASA 所选 EEG/EOG/EMG 采样率不同，需要 scipy 做临时重采样") from exc
+            from math import gcd
+
+            src_i = int(round(float(src_fs)))
+            target_i = int(round(float(target)))
+            if src_i <= 0 or target_i <= 0:
+                raise ValueError("YASA 通道采样率无效，无法重采样")
+            common = gcd(src_i, target_i)
+            up = target_i // common
+            down = src_i // common
+            return np.asarray(resample_poly(row, up, down), dtype=np.float64)
+
+        resampled_rows: List[np.ndarray] = []
+        for name, row, fs_i in zip(names, data_rows, fs_values):
+            resampled = _resample_for_yasa(row, float(fs_i), target_fs)
+            if abs(float(fs_i) - target_fs) > 1e-6:
+                self._log(f"YASA 临时重采样: {name} {float(fs_i):g} Hz -> {target_fs:g} Hz")
+            resampled_rows.append(resampled)
+        n = min(row.size for row in resampled_rows)
+        data = np.vstack([row[:n] for row in resampled_rows])
+        info = mne.create_info(names, sfreq=target_fs, ch_types=ch_types)
         raw_mne = mne.io.RawArray(data, info, verbose="ERROR")
         tmax = max(start_s, min(end_s, raw_mne.times[-1]))
         raw_mne = raw_mne.crop(tmin=float(start_s), tmax=tmax, include_tmax=False)
-        return raw_mne, eeg_name, eog_name, emg_name, fs
+        return raw_mne, eeg_name, eog_name, emg_name, target_fs
 
     @QtCore.pyqtSlot()
     def _run_yasa_sleep_staging(self) -> None:
@@ -2189,6 +2416,657 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"YASA 自动睡眠分期失败: {exc}")
 
+    @staticmethod
+    def _stage_to_yasa_code(stage: object) -> int:
+        text = str(stage or "").strip().upper()
+        mapping = {
+            "W": 0,
+            "WAKE": 0,
+            "N1": 1,
+            "N2": 2,
+            "N3": 3,
+            "R": 4,
+            "REM": 4,
+        }
+        return mapping.get(text, -2)
+
+    def _read_spindle_float(self, edit: QtWidgets.QLineEdit, label: str) -> float:
+        text = edit.text().strip()
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError(f"{label}必须是数字") from exc
+        if not np.isfinite(value):
+            raise ValueError(f"{label}无效")
+        return value
+
+    def _read_spindle_freq_broad(self) -> Tuple[float, float]:
+        text = self._sleep_feature_ui.lineEdit_spindle_sigma_mad.text().strip()
+        parts = [p.strip() for p in text.replace("，", ",").replace(";", ",").split(",") if p.strip()]
+        if len(parts) != 2:
+            raise ValueError("宽频背景请填写为 1,30 这样的两个数字")
+        try:
+            low, high = float(parts[0]), float(parts[1])
+        except ValueError as exc:
+            raise ValueError("宽频背景必须是两个数字") from exc
+        if low <= 0 or high <= low:
+            raise ValueError("宽频背景频段不合法")
+        return low, high
+
+    def _read_spindle_include_codes(self) -> Tuple[int, ...]:
+        text = self._spindle_include_edit.text().strip()
+        if not text:
+            return (1, 2, 3)
+        codes: List[int] = []
+        for part in text.replace("，", ",").replace(";", ",").split(","):
+            token = part.strip()
+            if not token:
+                continue
+            code = self._stage_to_yasa_code(token)
+            if code < 0:
+                raise ValueError(f"检测阶段不支持：{token}，请使用 W/N1/N2/N3/REM")
+            if code not in codes:
+                codes.append(code)
+        return tuple(codes or [1, 2, 3])
+
+    def _read_float_pair_edit(self, edit: QtWidgets.QLineEdit, label: str) -> Tuple[float, float]:
+        text = edit.text().strip()
+        parts = [p.strip() for p in text.replace("，", ",").replace(";", ",").split(",") if p.strip()]
+        if len(parts) != 2:
+            raise ValueError(f"{label}请填写为两个数字，例如 0.3,4")
+        try:
+            low, high = float(parts[0]), float(parts[1])
+        except ValueError as exc:
+            raise ValueError(f"{label}必须是两个数字") from exc
+        if low <= 0 or high <= low:
+            raise ValueError(f"{label}范围不合法")
+        return low, high
+
+    def _build_epoch_hypno_samples(
+        self,
+        rows: List[Dict[str, object]],
+        *,
+        n_samples: int,
+        fs: float,
+        origin_abs_s: float,
+    ) -> Optional[np.ndarray]:
+        if not rows or not any("stage_yasa" in row for row in rows):
+            return None
+        hypno = np.full(int(n_samples), -2, dtype=int)
+        for row in rows:
+            code = self._stage_to_yasa_code(row.get("stage_yasa", ""))
+            if code < 0:
+                continue
+            try:
+                start_s = float(row.get("start_s", 0.0))
+                end_s = float(row.get("end_s", start_s))
+            except (TypeError, ValueError):
+                continue
+            i0 = max(0, int(round((start_s - origin_abs_s) * fs)))
+            i1 = min(n_samples, int(round((end_s - origin_abs_s) * fs)))
+            if i1 > i0:
+                hypno[i0:i1] = code
+        return hypno if np.any(hypno >= 0) else None
+
+    @staticmethod
+    def _safe_event_float(record: Dict[str, object], *keys: str, default: float = np.nan) -> float:
+        for key in keys:
+            if key in record:
+                try:
+                    return float(record.get(key))
+                except (TypeError, ValueError):
+                    return default
+        return default
+
+    def _spindle_events_from_summary(self, summary) -> List[Dict[str, float]]:
+        if summary is None:
+            return []
+        try:
+            records = summary.to_dict("records")
+        except AttributeError:
+            records = list(summary)
+        events: List[Dict[str, float]] = []
+        for record in records:
+            row = dict(record)
+            start = self._safe_event_float(row, "Start", "start", default=np.nan)
+            if not np.isfinite(start):
+                continue
+            duration = self._safe_event_float(row, "Duration", "duration", default=np.nan)
+            end = self._safe_event_float(row, "End", "end", default=start + duration if np.isfinite(duration) else start)
+            peak = self._safe_event_float(row, "Peak", "peak", default=start + max(0.0, end - start) * 0.5)
+            events.append(
+                {
+                    "Start": start,
+                    "Peak": peak,
+                    "End": end,
+                    "Duration": duration if np.isfinite(duration) else max(0.0, end - start),
+                    "Amplitude": self._safe_event_float(row, "Amplitude", "amplitude"),
+                    "Frequency": self._safe_event_float(row, "Frequency", "frequency"),
+                    "RelPower": self._safe_event_float(row, "RelPower", "rel_power"),
+                }
+            )
+        return events
+
+    def _populate_spindle_results_table(self, events: List[Dict[str, float]], *, origin_abs_s: float) -> None:
+        table = self._spindle_results_table
+        headers = ["#", "Start_s", "Peak_s", "End_s", "Duration_s", "Amplitude", "Frequency", "RelPower"]
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(events))
+        for idx, event in enumerate(events):
+            values = [
+                idx + 1,
+                origin_abs_s + event.get("Start", 0.0),
+                origin_abs_s + event.get("Peak", 0.0),
+                origin_abs_s + event.get("End", 0.0),
+                event.get("Duration", np.nan),
+                event.get("Amplitude", np.nan),
+                event.get("Frequency", np.nan),
+                event.get("RelPower", np.nan),
+            ]
+            for col, value in enumerate(values):
+                text = f"{value:.6g}" if isinstance(value, float) else str(value)
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                table.setItem(idx, col, item)
+        table.resizeColumnsToContents()
+
+    def _detect_kcomplex_candidates(
+        self,
+        data_uv: np.ndarray,
+        fs: float,
+        *,
+        hypno: Optional[np.ndarray],
+        include: Tuple[int, ...],
+    ) -> List[Dict[str, float]]:
+        arr = np.asarray(data_uv, dtype=np.float64).reshape(-1)
+        if arr.size < max(8, int(round(fs * 2.0))):
+            return []
+        try:
+            from scipy.signal import butter, filtfilt, find_peaks
+        except ImportError as exc:
+            raise ValueError("K-complex 候选检测需要 scipy.signal") from exc
+        band = self._read_float_pair_edit(self._kcomplex_band_edit, "K低频带")
+        duration = (
+            self._read_spindle_float(self._kcomplex_duration_min_edit, "K持续时间下限"),
+            self._read_spindle_float(self._kcomplex_duration_max_edit, "K持续时间上限"),
+        )
+        ptp_min = self._read_spindle_float(self._kcomplex_ptp_uv_edit, "K PTP阈值")
+        neg_min = self._read_spindle_float(self._kcomplex_neg_uv_edit, "K负峰阈值")
+        if duration[0] <= 0 or duration[1] <= duration[0]:
+            raise ValueError("K-complex 持续时间范围不合法")
+        nyq = float(fs) * 0.5
+        if band[1] >= nyq:
+            raise ValueError(f"K低频带上限必须小于 Nyquist={nyq:g} Hz")
+        b, a = butter(2, [band[0] / nyq, band[1] / nyq], btype="bandpass")
+        filt = filtfilt(b, a, arr)
+        min_distance = max(1, int(round(0.3 * fs)))
+        neg_peaks, _ = find_peaks(-filt, distance=min_distance)
+        pos_peaks, _ = find_peaks(filt, distance=max(1, int(round(0.15 * fs))))
+        events: List[Dict[str, float]] = []
+        last_end = -1
+        for neg_idx in neg_peaks:
+            if hypno is not None and hypno.size == arr.size:
+                code = int(hypno[min(int(neg_idx), hypno.size - 1)])
+                if code not in include:
+                    continue
+            min_pos = int(neg_idx + round(duration[0] * fs * 0.25))
+            max_pos = int(neg_idx + round(duration[1] * fs))
+            cand_pos = pos_peaks[(pos_peaks > min_pos) & (pos_peaks <= max_pos)]
+            if cand_pos.size == 0:
+                continue
+            pos_idx = int(cand_pos[0])
+            dur = (pos_idx - int(neg_idx)) / float(fs)
+            if dur < duration[0] or dur > duration[1]:
+                continue
+            neg_amp = -float(filt[int(neg_idx)])
+            ptp = float(filt[pos_idx] - filt[int(neg_idx)])
+            if neg_amp < neg_min or ptp < ptp_min:
+                continue
+            start_idx = max(0, int(neg_idx - round(0.25 * fs)))
+            end_idx = min(arr.size - 1, int(pos_idx + round(0.25 * fs)))
+            if start_idx <= last_end:
+                continue
+            last_end = end_idx
+            events.append(
+                {
+                    "Start": start_idx / float(fs),
+                    "Peak": int(neg_idx) / float(fs),
+                    "End": end_idx / float(fs),
+                    "Duration": dur,
+                    "NegAmplitude": neg_amp,
+                    "PTP": ptp,
+                }
+            )
+        return events
+
+    def _detect_slow_wave_candidates(
+        self,
+        data_uv: np.ndarray,
+        fs: float,
+    ) -> List[Dict[str, float]]:
+        arr = np.asarray(data_uv, dtype=np.float64).reshape(-1)
+        if arr.size < max(8, int(round(fs * 2.0))):
+            return []
+        try:
+            from scipy.signal import butter, filtfilt, find_peaks
+        except ImportError as exc:
+            raise ValueError("Slow wave 候选检测需要 scipy.signal") from exc
+        band = self._read_float_pair_edit(self._slow_wave_band_edit, "慢波频段")
+        duration = (
+            self._read_spindle_float(self._slow_wave_duration_min_edit, "慢波持续时间下限"),
+            self._read_spindle_float(self._slow_wave_duration_max_edit, "慢波持续时间上限"),
+        )
+        ptp_min = self._read_spindle_float(self._slow_wave_ptp_uv_edit, "慢波PTP阈值")
+        neg_min = self._read_spindle_float(self._slow_wave_neg_uv_edit, "慢波负峰阈值")
+        if duration[0] <= 0 or duration[1] <= duration[0]:
+            raise ValueError("慢波持续时间范围不合法")
+        nyq = float(fs) * 0.5
+        if band[1] >= nyq:
+            raise ValueError(f"慢波频段上限必须小于 Nyquist={nyq:g} Hz")
+        b, a = butter(2, [band[0] / nyq, band[1] / nyq], btype="bandpass")
+        filt = filtfilt(b, a, arr)
+        neg_peaks, _ = find_peaks(-filt, distance=max(1, int(round(duration[0] * fs * 0.5))))
+        pos_peaks, _ = find_peaks(filt)
+        events: List[Dict[str, float]] = []
+        last_end = -1
+        for neg_idx in neg_peaks:
+            min_pos = int(neg_idx + round(duration[0] * fs))
+            max_pos = int(neg_idx + round(duration[1] * fs))
+            cand_pos = pos_peaks[(pos_peaks > min_pos) & (pos_peaks <= max_pos)]
+            if cand_pos.size == 0:
+                continue
+            pos_idx = int(cand_pos[0])
+            dur = (pos_idx - int(neg_idx)) / float(fs)
+            neg_amp = -float(filt[int(neg_idx)])
+            ptp = float(filt[pos_idx] - filt[int(neg_idx)])
+            if neg_amp < neg_min or ptp < ptp_min:
+                continue
+            start_idx = max(0, int(neg_idx - round(0.1 * fs)))
+            end_idx = min(arr.size - 1, int(pos_idx + round(0.1 * fs)))
+            if start_idx <= last_end:
+                continue
+            last_end = end_idx
+            events.append(
+                {
+                    "Start": start_idx / float(fs),
+                    "Peak": int(neg_idx) / float(fs),
+                    "End": end_idx / float(fs),
+                    "Duration": max(0.0, (end_idx - start_idx) / float(fs)),
+                    "NegToPosDuration": dur,
+                    "NegAmplitude": neg_amp,
+                    "PTP": ptp,
+                }
+            )
+        return events
+
+    def _populate_slow_wave_results_table(self, events: List[Dict[str, float]], *, origin_abs_s: float) -> None:
+        table = self._slow_wave_results_table
+        headers = ["#", "Start_s", "Peak_s", "End_s", "Duration_s", "NegToPos_s", "PTP_uV", "NegAmp_uV"]
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(events))
+        for idx, event in enumerate(events):
+            values = [
+                idx + 1,
+                origin_abs_s + event.get("Start", 0.0),
+                origin_abs_s + event.get("Peak", 0.0),
+                origin_abs_s + event.get("End", 0.0),
+                event.get("Duration", np.nan),
+                event.get("NegToPosDuration", np.nan),
+                event.get("PTP", np.nan),
+                event.get("NegAmplitude", np.nan),
+            ]
+            for col, value in enumerate(values):
+                text = f"{value:.6g}" if isinstance(value, float) else str(value)
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                table.setItem(idx, col, item)
+        table.resizeColumnsToContents()
+
+    def _apply_slow_wave_features_to_epoch_rows(
+        self,
+        rows: List[Dict[str, object]],
+        events: List[Dict[str, float]],
+        *,
+        origin_abs_s: float,
+    ) -> int:
+        time_pct_min = self._read_spindle_float(self._slow_wave_time_pct_edit, "慢波占时下限")
+        delta_rel_min = self._read_spindle_float(self._slow_wave_delta_rel_edit, "delta相对功率下限")
+        conf_threshold = self._read_spindle_float(self._slow_wave_confidence_edit, "N2低置信阈值")
+        refined = 0
+        for row in rows:
+            try:
+                epoch_start = float(row.get("start_s", 0.0))
+                epoch_end = float(row.get("end_s", epoch_start))
+            except (TypeError, ValueError):
+                continue
+            in_epoch = [
+                event
+                for event in events
+                if epoch_start <= origin_abs_s + float(event.get("Peak", event.get("Start", 0.0))) < epoch_end
+            ]
+            epoch_duration = max(1e-9, epoch_end - epoch_start)
+            count = len(in_epoch)
+            total_time = sum(max(0.0, float(event.get("Duration", 0.0))) for event in in_epoch)
+            row["slow_wave_count"] = count
+            row["slow_wave_density"] = count / (epoch_duration / 60.0)
+            row["slow_wave_time_pct"] = min(100.0, total_time / epoch_duration * 100.0)
+            for out_key, event_key in (
+                ("slow_wave_mean_duration", "Duration"),
+                ("slow_wave_mean_ptp", "PTP"),
+                ("slow_wave_mean_neg_amp", "NegAmplitude"),
+            ):
+                values = [float(e.get(event_key, np.nan)) for e in in_epoch]
+                values = [v for v in values if np.isfinite(v)]
+                row[out_key] = float(np.mean(values)) if values else ""
+            stage = str(row.get("stage_refined", row.get("stage_yasa", "")) or "").strip().upper()
+            if stage == "":
+                stage = str(row.get("stage_yasa", "") or "").strip().upper()
+            stage_refined_slow = stage
+            reason = "保留初判"
+            try:
+                delta_rel = float(row.get("delta_rel_pct", 0.0))
+            except (TypeError, ValueError):
+                delta_rel = 0.0
+            try:
+                confidence = float(row.get("yasa_confidence", np.nan))
+            except (TypeError, ValueError):
+                confidence = np.nan
+            low_conf_ok = True
+            if self._slow_wave_require_low_conf_check.isChecked():
+                low_conf_ok = (not np.isfinite(confidence)) or confidence < conf_threshold
+            stage_ok = stage == "N2" or not self._slow_wave_only_n2_check.isChecked()
+            slow_ok = (
+                stage_ok
+                and low_conf_ok
+                and row["slow_wave_time_pct"] >= time_pct_min
+                and delta_rel >= delta_rel_min
+            )
+            if slow_ok:
+                stage_refined_slow = "N3"
+                reason = "慢波占时和delta功率达到阈值，修正为N3"
+                if stage != "N3":
+                    refined += 1
+            else:
+                if stage != "N2" and self._slow_wave_only_n2_check.isChecked():
+                    reason = "非N2初判，不执行N3慢波修正"
+                elif not low_conf_ok:
+                    reason = "YASA置信度高，未执行N3慢波修正"
+                elif delta_rel < delta_rel_min:
+                    reason = "delta相对功率不足，保留初判"
+                elif row["slow_wave_time_pct"] < time_pct_min:
+                    reason = "慢波占时不足，保留初判"
+            row["stage_refined_slow"] = stage_refined_slow
+            row["slow_wave_refine_reason"] = reason
+        return refined
+
+    @QtCore.pyqtSlot()
+    def _run_slow_wave_n3_refinement(self) -> None:
+        data = self._sleep_feature_data()
+        if data is None:
+            return
+        raw, fs, offset_s, label, unit = data
+        try:
+            start_s, end_s, epoch_s, hop_s, _bands = self._read_sleep_trend_params(
+                raw,
+                fs,
+                offset_s,
+                require_power_type=False,
+            )
+            if abs(epoch_s - 30.0) > 1e-6 or abs(hop_s - 30.0) > 1e-6:
+                raise ValueError("N3慢波修正按 30s epoch 回填；请先设置 epoch=30、hop=30")
+            channel_index = self._current_sleep_channel_index()
+            rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not rows:
+                self._generate_sleep_epoch_feature_table()
+                rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not any("stage_yasa" in row for row in rows):
+                self._sync_yasa_eeg_to_sleep_channel()
+                self._run_yasa_sleep_staging()
+                rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not rows:
+                raise ValueError("请先生成睡眠Epoch特征表")
+            bundle = self._make_sleep_mne_raw(
+                raw,
+                fs,
+                unit,
+                offset_s=offset_s,
+                reject_by_annotation=self._sleep_exclude_bad_check.isChecked(),
+            )
+            if bundle is None:
+                return
+            _mne, raw_mne = bundle
+            raw_crop = raw_mne.copy().crop(
+                tmin=start_s,
+                tmax=max(start_s, min(end_s, raw_mne.times[-1])),
+                include_tmax=False,
+            )
+            origin_abs_s = float(offset_s + start_s)
+            data_uv = np.asarray(raw_crop.get_data(picks=[0])[0], dtype=np.float64) * 1e6
+            events = self._detect_slow_wave_candidates(data_uv, float(raw_crop.info["sfreq"]))
+            refined = self._apply_slow_wave_features_to_epoch_rows(rows, events, origin_abs_s=origin_abs_s)
+            self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
+            self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
+            self._sleep_epoch_feature_rows = rows
+            self._populate_slow_wave_results_table(events, origin_abs_s=origin_abs_s)
+            self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            self._log(
+                f"SlowWave/N3 修正完成: {label} | {origin_abs_s:.1f}-{offset_s + end_s:.1f}s | "
+                f"slow wave {len(events)} 个 | 修正 {refined} 个 epoch"
+            )
+        except Exception as exc:
+            self._log(f"SlowWave/N3 修正失败: {exc}")
+
+    def _apply_spindle_features_to_epoch_rows(
+        self,
+        rows: List[Dict[str, object]],
+        events: List[Dict[str, float]],
+        k_events: Optional[List[Dict[str, float]]] = None,
+        *,
+        origin_abs_s: float,
+    ) -> int:
+        if k_events is None:
+            k_events = []
+        min_count = int(round(self._read_spindle_float(self._spindle_min_count_edit, "修正最少个数")))
+        confidence_threshold = self._read_spindle_float(self._spindle_confidence_edit, "低置信阈值")
+        sigma_rel_text = self._spindle_sigma_rel_min_edit.text().strip()
+        sigma_rel_min = float(sigma_rel_text) if sigma_rel_text else None
+        refined = 0
+        for row in rows:
+            try:
+                epoch_start = float(row.get("start_s", 0.0))
+                epoch_end = float(row.get("end_s", epoch_start))
+            except (TypeError, ValueError):
+                continue
+            in_epoch = [
+                event
+                for event in events
+                if epoch_start <= origin_abs_s + float(event.get("Peak", event.get("Start", 0.0))) < epoch_end
+            ]
+            k_in_epoch = [
+                event
+                for event in k_events
+                if epoch_start <= origin_abs_s + float(event.get("Peak", event.get("Start", 0.0))) < epoch_end
+            ]
+            count = len(in_epoch)
+            k_count = len(k_in_epoch)
+            duration_min = max(1e-9, (epoch_end - epoch_start) / 60.0)
+            row["spindle_count"] = count
+            row["spindle_density"] = count / duration_min
+            for out_key, event_key in (
+                ("spindle_mean_duration", "Duration"),
+                ("spindle_mean_amplitude", "Amplitude"),
+                ("spindle_mean_frequency", "Frequency"),
+                ("spindle_mean_rel_power", "RelPower"),
+            ):
+                values = [float(e.get(event_key, np.nan)) for e in in_epoch]
+                values = [v for v in values if np.isfinite(v)]
+                row[out_key] = float(np.mean(values)) if values else ""
+            row["kcomplex_count"] = k_count
+            row["kcomplex_density"] = k_count / duration_min
+            for out_key, event_key in (
+                ("kcomplex_mean_duration", "Duration"),
+                ("kcomplex_mean_ptp", "PTP"),
+                ("kcomplex_mean_neg_amp", "NegAmplitude"),
+            ):
+                values = [float(e.get(event_key, np.nan)) for e in k_in_epoch]
+                values = [v for v in values if np.isfinite(v)]
+                row[out_key] = float(np.mean(values)) if values else ""
+            stage = str(row.get("stage_yasa", "") or "").strip().upper()
+            stage_refined = stage
+            try:
+                confidence = float(row.get("yasa_confidence", np.nan))
+            except (TypeError, ValueError):
+                confidence = np.nan
+            sigma_ok = True
+            if sigma_rel_min is not None:
+                try:
+                    sigma_ok = float(row.get("sigma_rel_pct", 0.0)) >= sigma_rel_min
+                except (TypeError, ValueError):
+                    sigma_ok = False
+            has_spindle = count >= max(1, min_count) and sigma_ok
+            has_kcomplex = k_count >= max(1, min_count)
+            has_n2_marker = has_spindle or has_kcomplex
+            low_conf = (not np.isfinite(confidence)) or confidence < confidence_threshold
+            marker_text = "纺锤波" if has_spindle and not has_kcomplex else "K-complex" if has_kcomplex and not has_spindle else "纺锤波+K-complex"
+            if has_n2_marker and stage in ("", "N1") and low_conf:
+                stage_refined = "N2"
+                reason = f"低置信初判 + 检出{marker_text}，修正为N2"
+                refined += 1
+            elif has_n2_marker and stage == "W" and low_conf:
+                stage_refined = "N2"
+                reason = f"低置信W + 检出{marker_text}，建议复核N2"
+                refined += 1
+            elif has_n2_marker and stage == "N2":
+                reason = f"YASA N2 + {marker_text}支持"
+            elif has_n2_marker and stage in ("R", "REM"):
+                reason = f"REM中检出{marker_text}，保留初判并建议复核EOG/EMG"
+            elif has_n2_marker:
+                reason = f"检出{marker_text}，保留初判"
+            else:
+                reason = "未检出N2特征，保留初判"
+            row["stage_refined"] = stage_refined
+            row["refine_reason"] = reason
+        return refined
+
+    @QtCore.pyqtSlot()
+    def _run_yasa_spindle_refinement(self) -> None:
+        data = self._sleep_feature_data()
+        if data is None:
+            return
+        raw, fs, offset_s, label, unit = data
+        try:
+            start_s, end_s, epoch_s, hop_s, _bands = self._read_sleep_trend_params(
+                raw,
+                fs,
+                offset_s,
+                require_power_type=False,
+            )
+            if abs(epoch_s - 30.0) > 1e-6 or abs(hop_s - 30.0) > 1e-6:
+                raise ValueError("纺锤波修正按 30s epoch 回填；请先设置 epoch=30、hop=30")
+            try:
+                import yasa  # type: ignore
+            except ImportError:
+                self._log("未安装 yasa，请先运行：python -m pip install yasa==0.6.5")
+                return
+            channel_index = self._current_sleep_channel_index()
+            rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not rows:
+                self._generate_sleep_epoch_feature_table()
+                rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if self._spindle_auto_stage_check.isChecked() and not any("stage_yasa" in row for row in rows):
+                self._sync_yasa_eeg_to_sleep_channel()
+                self._run_yasa_sleep_staging()
+                rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not rows:
+                raise ValueError("请先生成睡眠Epoch特征表")
+
+            bundle = self._make_sleep_mne_raw(
+                raw,
+                fs,
+                unit,
+                offset_s=offset_s,
+                reject_by_annotation=self._sleep_exclude_bad_check.isChecked(),
+            )
+            if bundle is None:
+                return
+            _mne, raw_mne = bundle
+            raw_crop = raw_mne.copy().crop(
+                tmin=start_s,
+                tmax=max(start_s, min(end_s, raw_mne.times[-1])),
+                include_tmax=False,
+            )
+            origin_abs_s = float(offset_s + start_s)
+            hypno = None
+            if self._spindle_use_yasa_stage_check.isChecked():
+                hypno = self._build_epoch_hypno_samples(
+                    rows,
+                    n_samples=int(raw_crop.n_times),
+                    fs=float(raw_crop.info["sfreq"]),
+                    origin_abs_s=origin_abs_s,
+                )
+            freq_sp = (
+                self._read_spindle_float(self._sleep_feature_ui.lineEdit_spindle_sigma_fmin, "spindle fmin"),
+                self._read_spindle_float(self._sleep_feature_ui.lineEdit_spindle_sigma_fmax, "spindle fmax"),
+            )
+            freq_broad = self._read_spindle_freq_broad()
+            duration = (
+                self._read_spindle_float(self._spindle_duration_min_edit, "持续时间下限"),
+                self._read_spindle_float(self._spindle_duration_max_edit, "持续时间上限"),
+            )
+            if freq_sp[0] <= 0 or freq_sp[1] <= freq_sp[0]:
+                raise ValueError("spindle 频段不合法")
+            if duration[0] <= 0 or duration[1] <= duration[0]:
+                raise ValueError("持续时间范围不合法")
+            thresh = {
+                "corr": self._read_spindle_float(self._spindle_thresh_corr_edit, "corr阈值"),
+                "rel_pow": self._read_spindle_float(self._spindle_thresh_rel_pow_edit, "rel_pow阈值"),
+                "rms": self._read_spindle_float(self._spindle_thresh_rms_edit, "rms阈值"),
+            }
+            result = yasa.spindles_detect(
+                raw_crop,
+                hypno=hypno,
+                include=self._read_spindle_include_codes(),
+                freq_sp=freq_sp,
+                freq_broad=freq_broad,
+                duration=duration,
+                min_distance=self._read_spindle_float(self._spindle_min_distance_edit, "最小间隔"),
+                thresh=thresh,
+                remove_outliers=self._spindle_remove_outliers_check.isChecked(),
+                verbose=False,
+            )
+            summary = result.summary() if result is not None else None
+            events = self._spindle_events_from_summary(summary)
+            k_events: List[Dict[str, float]] = []
+            if self._kcomplex_enable_check.isChecked():
+                data_uv = np.asarray(raw_crop.get_data(picks=[0])[0], dtype=np.float64) * 1e6
+                k_events = self._detect_kcomplex_candidates(
+                    data_uv,
+                    float(raw_crop.info["sfreq"]),
+                    hypno=hypno,
+                    include=self._read_spindle_include_codes(),
+                )
+            refined = self._apply_spindle_features_to_epoch_rows(
+                rows,
+                events,
+                k_events,
+                origin_abs_s=origin_abs_s,
+            )
+            self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
+            self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
+            self._sleep_epoch_feature_rows = rows
+            self._populate_spindle_results_table(events, origin_abs_s=origin_abs_s)
+            self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            self._log(
+                f"Spindle/K-complex 检测完成: {label} | {origin_abs_s:.1f}-{offset_s + end_s:.1f}s | "
+                f"spindle {len(events)} 个, K-complex {len(k_events)} 个 | 修正 {refined} 个 epoch"
+            )
+        except Exception as exc:
+            self._log(f"Spindle/K-complex 检测/分期修正失败: {exc}")
+
     def _populate_sleep_epoch_feature_table(self, rows: List[Dict[str, object]], *, channel_index: Optional[int] = None) -> None:
         if channel_index is None:
             channel_index = self._current_sleep_channel_index()
@@ -2198,13 +3076,41 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             table = self._sleep_epoch_feature_tables.get(channel_index)
         if table is None:
             return
-        bands = [name for name in self._sleep_band_checks if any(f"{name}_" in key for row in rows for key in row.keys())]
+        all_keys = {key for row in rows for key in row.keys()}
+        bands = [name for name in self._sleep_band_checks if any(f"{name}_" in key for key in all_keys)]
         headers = ["epoch", "start_s", "end_s", "duration_s"]
-        for key in ("stage_yasa", "yasa_confidence"):
+        for key in (
+            "stage_yasa",
+            "yasa_confidence",
+            "stage_refined",
+            "refine_reason",
+            "spindle_count",
+            "spindle_density",
+            "spindle_mean_duration",
+            "spindle_mean_amplitude",
+            "spindle_mean_frequency",
+            "spindle_mean_rel_power",
+            "kcomplex_count",
+            "kcomplex_density",
+            "kcomplex_mean_duration",
+            "kcomplex_mean_ptp",
+            "kcomplex_mean_neg_amp",
+            "stage_refined_slow",
+            "slow_wave_refine_reason",
+            "slow_wave_count",
+            "slow_wave_density",
+            "slow_wave_time_pct",
+            "slow_wave_mean_duration",
+            "slow_wave_mean_ptp",
+            "slow_wave_mean_neg_amp",
+        ):
             if any(key in row for row in rows):
                 headers.append(key)
         for band in bands:
             headers.extend([f"{band}_abs", f"{band}_rel_pct"])
+        for key in sorted(all_keys):
+            if key not in headers and not any(key == f"{band}_abs" or key == f"{band}_rel_pct" for band in bands):
+                headers.append(key)
         table.clear()
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
@@ -2334,7 +3240,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not path_str:
             return
         path = Path(path_str)
-        headers = list(rows[0].keys())
+        headers: List[str] = []
+        for row in rows:
+            for key in row.keys():
+                if key not in headers:
+                    headers.append(key)
         try:
             with path.open("w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(f, fieldnames=headers)
@@ -2967,6 +3877,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         label: str,
         *,
         span_count: int,
+        record_session_bad: bool = True,
     ) -> None:
         current = self._current_offline_raw_for_mne()
         if current is None:
@@ -2976,7 +3887,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if mask.size != raw.size:
             self._log(f"MNE 标记长度不匹配：mask={mask.size}, raw={raw.size}")
             return
-        added_spans = self._add_offline_bad_mask(mask, fs, time_offset_s, f"MNE {label}")
+        added_spans = (
+            self._add_offline_bad_mask(mask, fs, time_offset_s, f"MNE {label}")
+            if record_session_bad
+            else 0
+        )
         display_mask = self._offline_bad_mask_for_window(
             n_samples=raw.size,
             fs=fs,
@@ -3159,6 +4074,54 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         mask = self._annotations_to_mask(annotations, fs, raw_mne.n_times)
         self._apply_mne_preview_mask(mask, "NaN坏段", span_count=len(annotations))
+
+    @QtCore.pyqtSlot()
+    def _run_mne_muscle_artifact_preview(self) -> None:
+        bundle = self._make_mne_raw_from_current()
+        if bundle is None:
+            return
+        mne, raw_mne, _scale, _raw, fs, _offset, _title, _y_label = bundle
+        try:
+            threshold = self._required_float_from_edit(self._muscle_threshold_edit, "z-score阈值")
+            low = self._required_float_from_edit(self._muscle_filter_low_edit, "高频下限")
+            high = self._required_float_from_edit(self._muscle_filter_high_edit, "高频上限")
+            min_good = self._optional_float_from_edit(self._muscle_min_good_edit, "最短好段")
+            n_jobs = self._optional_float_from_edit(self._muscle_n_jobs_edit, "并行数")
+            if threshold <= 0:
+                raise ValueError("z-score阈值必须大于 0")
+            if low <= 0 or high <= low:
+                raise ValueError("高频频段必须满足 0 < 下限 < 上限")
+            nyquist = float(fs) * 0.5
+            if high >= nyquist:
+                raise ValueError(f"高频上限必须小于采样率一半（当前 Nyquist={nyquist:g} Hz）")
+            if min_good is not None and min_good < 0:
+                raise ValueError("最短好段不能小于 0")
+            n_jobs_i = None if n_jobs is None else int(round(n_jobs))
+            ch_type_text = self._muscle_ch_type_combo.currentText().strip()
+            ch_type = None if ch_type_text == "自动" else ch_type_text
+            annotations, scores = mne.preprocessing.annotate_muscle_zscore(
+                raw_mne,
+                threshold=float(threshold),
+                ch_type=ch_type,
+                min_length_good=0 if min_good is None else float(min_good),
+                filter_freq=(float(low), float(high)),
+                n_jobs=n_jobs_i,
+                verbose="ERROR",
+            )
+        except Exception as exc:
+            self._log(f"MNE 肌电/高频伪迹标记失败: {exc}")
+            return
+        mask = self._annotations_to_mask(annotations, fs, raw_mne.n_times)
+        self._apply_mne_preview_mask(
+            mask,
+            "肌电/高频伪迹",
+            span_count=len(annotations),
+            record_session_bad=self._muscle_record_bad_check.isChecked(),
+        )
+        if len(scores):
+            self._log(
+                f"MNE 肌电z-score: max={float(np.nanmax(scores)):.3g}, mean={float(np.nanmean(scores)):.3g}"
+            )
 
     @QtCore.pyqtSlot()
     def _clear_mne_preview_mask(self) -> None:

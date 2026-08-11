@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MuscleArtifactDialog</class>
+ <widget class="QDialog" name="MuscleArtifactDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>520</width>
+    <height>260</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MNE肌电/高频伪迹标记</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_dialog">
+   <property name="leftMargin">
+    <number>10</number>
+   </property>
+   <property name="topMargin">
+    <number>10</number>
+   </property>
+   <property name="rightMargin">
+    <number>10</number>
+   </property>
+   <property name="bottomMargin">
+    <number>10</number>
+   </property>
+   <item>
+    <widget class="QLabel" name="label_muscle_hint">
+     <property name="text">
+      <string>使用 MNE 官方 annotate_muscle_zscore 标记高频肌电伪迹；这里只生成会话红带预览，不写回原始文件。</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QGridLayout" name="gridLayout_params">
+     <property name="horizontalSpacing">
+      <number>8</number>
+     </property>
+     <property name="verticalSpacing">
+      <number>8</number>
+     </property>
+     <item row="0" column="0">
+      <widget class="QLabel" name="label_threshold">
+       <property name="text">
+        <string>z-score阈值</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="1">
+      <widget class="QLineEdit" name="lineEdit_threshold">
+       <property name="text">
+        <string>4</string>
+       </property>
+       <property name="toolTip">
+        <string>高频包络超过该 z-score 时标记为肌电伪迹；数值越小越敏感。</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="2">
+      <widget class="QLabel" name="label_ch_type">
+       <property name="text">
+        <string>通道类型</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="3">
+      <widget class="QComboBox" name="comboBox_ch_type">
+       <item>
+        <property name="text">
+         <string>eeg</string>
+        </property>
+       </item>
+       <item>
+        <property name="text">
+         <string>自动</string>
+        </property>
+       </item>
+      </widget>
+     </item>
+     <item row="1" column="0">
+      <widget class="QLabel" name="label_filter_low">
+       <property name="text">
+        <string>高频下限(Hz)</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="1">
+      <widget class="QLineEdit" name="lineEdit_filter_low">
+       <property name="text">
+        <string>30</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="2">
+      <widget class="QLabel" name="label_filter_high">
+       <property name="text">
+        <string>高频上限(Hz)</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="3">
+      <widget class="QLineEdit" name="lineEdit_filter_high">
+       <property name="text">
+        <string>45</string>
+       </property>
+       <property name="toolTip">
+        <string>MNE 官方默认是 110-140 Hz；低采样睡眠 EEG 可改为 30-45 Hz，但上限必须小于采样率一半。</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="0">
+      <widget class="QLabel" name="label_min_good">
+       <property name="text">
+        <string>最短好段(s)</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="1">
+      <widget class="QLineEdit" name="lineEdit_min_good">
+       <property name="text">
+        <string>0.1</string>
+       </property>
+       <property name="toolTip">
+        <string>两个坏段之间若好段短于该值，会被合并进坏段；None 等效为 0。</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="2">
+      <widget class="QLabel" name="label_n_jobs">
+       <property name="text">
+        <string>并行数</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="3">
+      <widget class="QLineEdit" name="lineEdit_n_jobs">
+       <property name="placeholderText">
+        <string>留空=1</string>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="0" colspan="4">
+      <widget class="QCheckBox" name="checkBox_record_session_bad">
+       <property name="text">
+        <string>标记为会话坏段，供后续 PSD/特征表/YASA 排除参考</string>
+       </property>
+       <property name="checked">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_buttons">
+     <item>
+      <spacer name="horizontalSpacer_buttons">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_run">
+       <property name="text">
+        <string>运行肌电伪迹标记</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_close">
+       <property name="text">
+        <string>关闭</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
