@@ -17,6 +17,7 @@ CH1 数据：
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterator, List, Optional, Tuple
@@ -49,7 +50,7 @@ BYTES_PER_SECOND = int(
     )
     / SAMPLES_PER_SYNC_GROUP
 )
-POLL_READ_MAX_BYTES = 512
+POLL_READ_MAX_BYTES = 8192
 MAX_PARSER_BUF = 8192
 LOW_BYTE_ESCAPE = 0xFE
 UINT16_MASK = 0xFFFF  ## 下位机按 uint16_t 传输，可能是 ADC count，也可能是滤波/缩放后的协议值
@@ -209,6 +210,7 @@ class Ks1082Serial:
         self.stopbits = stopbits
         self._ser: Optional[Serial] = None
         self._parser = AdcStreamParser()
+        self._io_lock = threading.Lock()
         self.on_sample: Optional[Callable[[AdcSample], None]] = None
         self.bytes_received = 0
         self._recent_raw = bytearray()
@@ -259,18 +261,20 @@ class Ks1082Serial:
         """丢弃串口接收缓冲中的待发字节，避免暂停期间积压。"""
         if not self.is_open or self._ser is None:
             return 0
-        waiting = self._ser.in_waiting
-        if waiting:
-            self._ser.read(waiting)
-        self._parser.reset()
-        return waiting
+        with self._io_lock:
+            waiting = self._ser.in_waiting
+            if waiting:
+                self._ser.read(waiting)
+            self._parser.reset()
+            return waiting
 
     def discard_pending_input(self) -> int:
         """暂停采集时调用：读空硬件缓冲并重置解析状态。"""
         return self.flush_input_buffer()
 
     def set_channel_count(self, channel_count: int) -> None:
-        self._parser.set_channel_count(channel_count)
+        with self._io_lock:
+            self._parser.set_channel_count(channel_count)
 
     @property
     def channel_count(self) -> int:
@@ -287,23 +291,25 @@ class Ks1082Serial:
                 self.on_sample(sample)
         return samples
 
-    def poll_once(self, max_reads: int = 4) -> List[AdcSample]:
+    def drain_available(self) -> List[AdcSample]:
+        """Read every waiting byte without blocking. Safe to call from a worker thread."""
         ser = self._require_open()
-        chunks: List[bytes] = []
-        for _ in range(max_reads):
-            waiting = ser.in_waiting
-            if waiting:
-                chunk = ser.read(min(waiting, POLL_READ_MAX_BYTES))
-            elif not chunks:
-                chunk = ser.read(1)
-            else:
-                break
-            if not chunk:
-                break
-            chunks.append(chunk)
-        if not chunks:
-            return []
-        return self.feed_bytes(b"".join(chunks))
+        with self._io_lock:
+            chunks: List[bytes] = []
+            while True:
+                waiting = ser.in_waiting
+                if not waiting:
+                    break
+                chunk = ser.read(waiting)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            if not chunks:
+                return []
+            return self.feed_bytes(b"".join(chunks))
+
+    def poll_once(self, max_reads: int = 4) -> List[AdcSample]:
+        return self.drain_available()
 
     def peek_recent_raw(self, nbytes: int = 16) -> str:
         data = bytes(self._recent_raw[-nbytes:])

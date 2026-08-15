@@ -15,6 +15,7 @@
 
 from __future__ import annotations  ## 前向引用类型
 
+import threading
 import time  ## 阻塞读超时
 from dataclasses import dataclass
 from typing import Callable, Iterator, List, Optional
@@ -166,6 +167,7 @@ class OscillatorSerial:
         self.stopbits = stopbits
         self._ser: Optional[Serial] = None
         self._parser = AccStreamParser(expected_size=batch_size)
+        self._io_lock = threading.Lock()
         self.on_batch: Optional[Callable[[AccDataBatch], None]] = None  ## 收到整批时的回调
         self.bytes_received = 0  ## 累计接收字节数（调试用）
         self._recent_raw = bytearray()  ## 最近原始字节，peek 调试用
@@ -216,11 +218,12 @@ class OscillatorSerial:
         """丢弃串口接收缓冲中的待发字节，避免暂停期间积压。"""
         if not self.is_open or self._ser is None:
             return 0
-        waiting = self._ser.in_waiting
-        if waiting:
-            self._ser.read(waiting)
-        self._parser.reset()
-        return waiting
+        with self._io_lock:
+            waiting = self._ser.in_waiting
+            if waiting:
+                self._ser.read(waiting)
+            self._parser.reset()
+            return waiting
 
     def discard_pending_input(self) -> int:
         """暂停采集时调用：读空硬件缓冲并重置解析状态。"""
@@ -238,27 +241,25 @@ class OscillatorSerial:
                 self.on_batch(batch)
         return batches
 
-    def poll_once(self, max_reads: int = 4) -> List[AccDataBatch]:
-        """
-        非阻塞轮询一次：读尽当前 in_waiting，合并后解析。
-        适合挂到 QTimer 定时调用。
-        """
+    def drain_available(self) -> List[AccDataBatch]:
+        """Read every waiting byte without blocking. Safe to call from a worker thread."""
         ser = self._require_open()
-        chunks: List[bytes] = []
-        for _ in range(max_reads):
-            waiting = ser.in_waiting
-            if waiting:
-                chunk = ser.read(min(waiting, POLL_READ_MAX_BYTES))
-            elif not chunks:
-                chunk = ser.read(1)  ## 无待发数据时尝试读 1 字节（受 timeout 限制）
-            else:
-                break
-            if not chunk:
-                break
-            chunks.append(chunk)
-        if not chunks:
-            return []
-        return self.feed_bytes(b"".join(chunks))
+        with self._io_lock:
+            chunks: List[bytes] = []
+            while True:
+                waiting = ser.in_waiting
+                if not waiting:
+                    break
+                chunk = ser.read(waiting)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            if not chunks:
+                return []
+            return self.feed_bytes(b"".join(chunks))
+
+    def poll_once(self, max_reads: int = 4) -> List[AccDataBatch]:
+        return self.drain_available()
 
     def peek_recent_raw(self, nbytes: int = 64) -> str:
         """查看最近收到的原始 ASCII，串口调试时用。"""

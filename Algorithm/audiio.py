@@ -18,9 +18,8 @@
 from __future__ import annotations
 
 import threading
-from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -276,106 +275,7 @@ class StereoSineAudioOutput:
         outdata[:, 1] = right
 
 
-class PinkNoiseBurstOutput:
-    """
-    持久立体声 OutputStream + burst 队列。
-    主线程仅 enqueue 预生成缓冲，PortAudio 回调线程负责播放，避免每次 sd.play 开流卡顿。
-    """
 
-    def __init__(
-        self,
-        sample_rate: float = DEFAULT_SAMPLE_RATE,
-        blocksize: int = 256,
-        device: Optional[int | str] = None,
-        max_queued_bursts: int = 2,
-    ) -> None:
-        _require_sounddevice()
-        self._sample_rate = float(sample_rate)
-        self._blocksize = max(64, int(blocksize))
-        self._device = device
-        self._max_queued = max(1, int(max_queued_bursts))
-        self._lock = threading.Lock()
-        self._queue: Deque[np.ndarray] = deque(maxlen=self._max_queued)
-        self._current: Optional[np.ndarray] = None
-        self._pos = 0
-        self._stream: Optional[sd.OutputStream] = None
-        self._dropped = 0
-
-    @property
-    def is_running(self) -> bool:
-        return self._stream is not None and self._stream.active
-
-    @property
-    def dropped_count(self) -> int:
-        with self._lock:
-            return self._dropped
-
-    def start(self) -> None:
-        if self.is_running:
-            return
-        stream = sd.OutputStream(
-            samplerate=self._sample_rate,
-            channels=2,
-            dtype="float32",
-            blocksize=self._blocksize,
-            device=self._device,
-            callback=self._audio_callback,
-        )
-        stream.start()
-        with self._lock:
-            self._stream = stream
-
-    def stop(self) -> None:
-        with self._lock:
-            stream = self._stream
-            self._stream = None
-            self._queue.clear()
-            self._current = None
-            self._pos = 0
-        if stream is not None:
-            stream.stop()
-            stream.close()
-
-    def queue_burst(self, stereo: np.ndarray) -> bool:
-        """入队预生成 burst；队列满时丢弃并返回 False。"""
-        if stereo.ndim != 2 or stereo.shape[1] != 2:
-            raise ValueError("burst 须为 (frames, 2) float32 数组")
-        with self._lock:
-            if len(self._queue) >= self._max_queued:
-                self._dropped += 1
-                return False
-            self._queue.append(stereo)
-            return True
-
-    def _audio_callback(
-        self,
-        outdata: np.ndarray,
-        frames: int,
-        time_info: object,
-        status: sd.CallbackFlags,
-    ) -> None:
-        if status:
-            print(f"[audiio burst] {status}")
-
-        outdata.fill(0.0)
-        filled = 0
-        with self._lock:
-            while filled < frames:
-                if self._current is None:
-                    if not self._queue:
-                        break
-                    self._current = self._queue.popleft()
-                    self._pos = 0
-                remaining = len(self._current) - self._pos
-                if remaining <= 0:
-                    self._current = None
-                    continue
-                n = min(frames - filled, remaining)
-                outdata[filled : filled + n] = self._current[self._pos : self._pos + n]
-                self._pos += n
-                filled += n
-                if self._pos >= len(self._current):
-                    self._current = None
 
 
 def make_alert_chime(
