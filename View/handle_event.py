@@ -4690,7 +4690,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_csv_path = path
         self._offline_channel_combo.blockSignals(True)
         self._offline_channel_combo.clear()
-        self._offline_channel_combo.addItem("CH1", 0)
+        try:
+            self._offline_file_info = load_eeg_file_info(path)
+            label = (
+                self._offline_file_info.channel_labels[0]
+                if self._offline_file_info.channel_labels
+                else "CH1"
+            )
+        except Exception:
+            label = "CH1"
+        self._offline_channel_combo.addItem(label, 0)
         self._offline_channel_combo.setEnabled(False)
         self._offline_channel_combo.blockSignals(False)
         self._offline_time_slider.blockSignals(True)

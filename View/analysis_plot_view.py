@@ -98,7 +98,17 @@ def _load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
     elif "ch1" in frame.columns:
         series = frame["ch1"]
     else:
-        series = frame.iloc[:, 0]
+        raw_columns = [
+            col for col in frame.columns if str(col).lower().endswith("_raw")
+        ]
+        if raw_columns:
+            series = frame[raw_columns[0]]
+        else:
+            skip_names = {"index", "time_s", "time", "timestamp"}
+            data_columns = [
+                col for col in frame.columns if str(col).lower() not in skip_names
+            ]
+            series = frame[data_columns[0] if data_columns else frame.columns[0]]
     raw = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=np.float64)
     if raw.size < 8:
         raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
@@ -110,6 +120,22 @@ def _load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
         if dt.size:
             sample_rate = float(1.0 / np.median(dt))
     return raw, sample_rate
+
+
+def _csv_channel_label(path: Path) -> str:
+    """Return the first EEG-like CSV column label, e.g. ch2_raw -> CH2."""
+    try:
+        columns = list(pd.read_csv(path, nrows=0).columns)
+    except Exception:
+        return "CH1"
+    if "ch1_raw" in columns or "ch1" in columns:
+        return "CH1"
+    for col in columns:
+        name = str(col)
+        if name.lower().endswith("_raw"):
+            prefix = name[: -len("_raw")]
+            return prefix.upper() if prefix else name
+    return "CH1"
 
 
 def _load_eeg_edf_with_rate(path: Path) -> tuple[np.ndarray, float]:
@@ -174,7 +200,8 @@ def load_eeg_file_info(path: Path) -> OfflineEegFileInfo:
     suffix = path.suffix.lower()
     if suffix not in {".edf", ".bdf"}:
         raw, sample_rate = _load_eeg_csv_with_rate(path)
-        return OfflineEegFileInfo(["CH1"], [float(sample_rate)], [int(raw.size)], ["raw"])
+        label = _csv_channel_label(path)
+        return OfflineEegFileInfo([label], [float(sample_rate)], [int(raw.size)], ["raw"])
 
     reader = _open_pyedflib_reader(path)
     try:
@@ -212,7 +239,7 @@ def load_eeg_file_channel(path: Path, channel_index: int = 0) -> tuple[np.ndarra
     suffix = path.suffix.lower()
     if suffix not in {".edf", ".bdf"}:
         raw, sample_rate = _load_eeg_csv_with_rate(path)
-        return raw, sample_rate, "CH1", "raw"
+        return raw, sample_rate, _csv_channel_label(path), "raw"
 
     reader = _open_pyedflib_reader(path)
     try:
