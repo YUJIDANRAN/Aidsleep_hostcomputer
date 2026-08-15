@@ -47,6 +47,13 @@ from MovementArtifact import (  ## 阈值拒绝 / 质量标记
     clean_raw_signal,
 )
 from iaf_echt import IAFEcHTPhaseTracker
+from assr import (
+    ASSR_PLOT_FMAX_HZ,
+    ASSR_PLOT_FMIN_HZ,
+    AssrParams,
+    analyze_assr,
+    format_assr_report,
+)
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
     OSC_BANDS,
@@ -76,9 +83,11 @@ from RejectionProcessingDialog import Ui_RejectionProcessingDialog
 from PsdAnalysisDialog import Ui_PsdAnalysisDialog
 from SleepFeatureAnalysisDialog import Ui_SleepFeatureAnalysisDialog
 from MuscleArtifactDialog import Ui_MuscleArtifactDialog
+from AssrDialog import Ui_AssrDialog
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from controller import (
     AlphaPhaseSnapshot,
+    AssrStimulusController,
     SLEEP_AID_WARMUP_SEC,
     SleepAidStimulusController,
     StereoAudioController,
@@ -969,6 +978,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     """主窗口：串口采集 + 波形显示。"""
 
     _audio_stopped = QtCore.pyqtSignal()
+    _assr_stopped = QtCore.pyqtSignal()
 
     def __init__(
         self,
@@ -1011,9 +1021,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._eeg_base_legend = "RAW CH1"
         self._osc_proc = OscStreamProcessor(sample_rate=OSC_SAMPLE_RATE)  ## 振子流式滤波
         self._audio_stopped.connect(self._on_audio_stopped)
+        self._assr_stopped.connect(self._on_assr_stopped)
         self._audio_controller = StereoAudioController(
             on_stopped=self._audio_stopped.emit,
         )
+        try:
+            self._assr_controller = AssrStimulusController(
+                on_stopped=self._assr_stopped.emit,
+            )
+        except ImportError:
+            self._assr_controller = None
         self._sleep_aid_tracker = IAFEcHTPhaseTracker(sample_rate=sample_rate)
         try:
             self._sleep_aid_controller = SleepAidStimulusController(
@@ -1024,6 +1041,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_audio_ui_defaults()
         self._setup_timed_test_ui()
         self._setup_sleep_aid_window_ui()
+        self._setup_assr_ui()
         self._setup_session_name_ui()
         self._eeg_save_root: Optional[Path] = None  ## None → 默认 Result
         self._setup_compare_segments_ui()
@@ -1049,6 +1067,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._sleep_aid_burst_count = 0
         self._sleep_aid_burst_record: List[dict] = []
         self._sleep_aid_timed_auto = False  ## 定时记录自动启停助眠
+        self._assr_raw: List[int] = []
+        self._assr_params: Optional[AssrParams] = None
+        self._assr_recording = False
         self._running = False  ## 默认不采集
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
@@ -1104,31 +1125,31 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             5: self.ui.checkBox_eeg_ch6,
         }
 
-        self._osc_graphics_view = QtWidgets.QGraphicsView(self.ui.page_2)  ## 振子页占位
-        self._osc_graphics_view.setGeometry(self.ui.graphicsView.geometry())
-        self._osc_graphics_view.hide()
+        self._clear_plot_host(self.ui.plotHost)
+        self._clear_plot_host(self.ui.plotHost_osc)
 
-        self._waveform = AlphaWaveformView(  ## EEG：覆盖在 page 内 graphicsView 位置
+        self._waveform = AlphaWaveformView(  ## EEG：填满 plotHost
             sample_rate=sample_rate,
-            parent=self.ui.page,
+            parent=self.ui.plotHost,
         )
-        self._offline_view = OfflineRhythmStackView(parent=self.ui.page)
+        self._offline_view = OfflineRhythmStackView(parent=self.ui.plotHost)
         self._offline_view.hide()
         self._setup_offline_viewer_ui()
         self._setup_rejection_processing_ui()
         self._setup_muscle_artifact_ui()
         self._setup_psd_analysis_ui()
         self._setup_sleep_feature_analysis_ui()
+        self._wire_assr_button()
         self._multi_waveform = MultiChannelEegView(
             sample_rate=sample_rate,
-            parent=self.ui.page,
+            parent=self.ui.plotHost,
         )
         self._multi_waveform.hide()
-        self._analysis_plot = AnalysisPlotView(parent=self.ui.page)
+        self._analysis_plot = AnalysisPlotView(parent=self.ui.plotHost)
         self._analysis_plot.hide()
-        self._osc_waveform = AlphaWaveformView(  ## 振子：覆盖在 page_2
+        self._osc_waveform = AlphaWaveformView(  ## 振子：填满 plotHost_osc
             sample_rate=OSC_SAMPLE_RATE,
-            parent=self.ui.page_2,
+            parent=self.ui.plotHost_osc,
         )
         self._sync_waveform_geometry()
         self._sync_multi_waveform_geometry()
@@ -1140,7 +1161,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._multi_waveform.hide()
         self._osc_waveform.show()
         self._osc_waveform.raise_()
-        self.ui.graphicsView.hide()  ## 用自定义波形控件替代占位 QGraphicsView
 
         self.ui.pushButton.pressed.connect(self.on_toggle_capture)  ## 启动/停止按钮
         self.ui.tabWidget_wave_display.currentChanged.connect(self._on_wave_display_tab_changed)
@@ -1236,6 +1256,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.groupBox_eeg_display.setMinimumHeight(210)
         self.ui.groupBox_osc_display.setMinimumHeight(210)
         self.ui.groupBox_2.setMinimumHeight(360)
+        self.ui.groupBox_2.hide()
         self.ui.pushButton_7.setMinimumSize(92, 42)
         self.ui.pushButton_8.setMinimumSize(180, 42)
         self.ui.pushButton_8.setStyleSheet(
@@ -1244,7 +1265,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
 
         self.ui.plainTextEdit.setMinimumSize(420, 82)
-        self.ui.plainTextEdit.setMaximumHeight(96)
         self.ui.timeEdit.setMaximumHeight(40)
         self.ui.lcdNumber.setMinimumHeight(36)
         self.ui.lineEdit_13.setMaximumHeight(34)
@@ -1321,45 +1341,24 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             btn.clicked.connect(self._toggle_serial_connection)
 
         self.ui.pushButton.setMinimumSize(130, 78)
-        self.ui.bottomPanel.raise_()
-        self._layout_main_regions()
 
-    def _layout_main_regions(self) -> None:
-        """Resize the plot, right controls, and bottom controls with the window."""
-        cw = self.ui.centralwidget
-        width = max(640, cw.width())
-        height = max(520, cw.height())
-        margin = 10
-        gap = 10
-        bottom_h = max(175, min(225, int(height * 0.2)))
-        top_h = max(320, height - bottom_h - margin * 2 - gap)
-        right_w = max(620, min(760, int(width * 0.36)))
-        left_w = width - right_w - margin * 2 - gap
-        if left_w < 520:
-            left_w = max(320, int(width * 0.58))
-            right_w = max(620, width - left_w - margin * 2 - gap)
-
-        plot_rect = QtCore.QRect(margin, margin, left_w, top_h)
-        self.ui.stackedWidget.setGeometry(plot_rect)
-        view_margin = 20
-        view_w = max(200, plot_rect.width() - view_margin * 2)
-        view_h = max(160, plot_rect.height() - view_margin * 2)
-        self.ui.graphicsView.setGeometry(QtCore.QRect(view_margin, view_margin, view_w, view_h))
-
-        right_x = margin + left_w + gap
-        self.ui.groupBox.setGeometry(QtCore.QRect(right_x, margin, right_w, top_h))
-        self.ui.bottomPanel.setGeometry(
-            QtCore.QRect(
-                margin,
-                margin + top_h + gap,
-                max(1, width - margin * 2),
-                bottom_h,
-            )
-        )
+    @staticmethod
+    def _clear_plot_host(host: QtWidgets.QWidget) -> None:
+        """Remove Designer placeholder so runtime plot widgets can fill the host."""
+        layout = host.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            child = item.widget()
+            if child is not None:
+                child.hide()
+                child.setParent(None)
+        # Drop the layout so children can use absolute geometry within the host.
+        QtWidgets.QWidget().setLayout(layout)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
-        self._layout_main_regions()
         self._sync_waveform_geometry()
         self._sync_multi_waveform_geometry()
         self._sync_offline_geometry()
@@ -1386,15 +1385,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._waveform.refresh_layout()
         self._multi_waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
-
-
-
-    @QtCore.pyqtSlot()
-
-
-    @QtCore.pyqtSlot()
-
-    @QtCore.pyqtSlot()
 
     def _setup_offline_viewer_ui(self) -> None:
         """Bind Designer-defined offline viewer controls."""
@@ -6379,6 +6369,191 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._refresh_audio_button()
         self._log("音频播放结束")
 
+    def _setup_assr_ui(self) -> None:
+        self._assr_dialog = QtWidgets.QDialog(self)
+        self._assr_ui = Ui_AssrDialog()
+        self._assr_ui.setupUi(self._assr_dialog)
+        self._assr_ui.pushButton_start.clicked.connect(self._start_assr_test)
+        self._assr_ui.pushButton_stop.clicked.connect(self._stop_assr_test)
+        self._assr_ui.pushButton_analyze.clicked.connect(self._analyze_last_assr)
+
+    def _wire_assr_button(self) -> None:
+        self._assr_button = self.ui.pushButton_assr
+        self._assr_button.clicked.connect(self._show_assr_dialog)
+
+    @QtCore.pyqtSlot()
+    def _show_assr_dialog(self) -> None:
+        self._refresh_assr_status()
+        self._assr_dialog.show()
+        self._assr_dialog.raise_()
+        self._assr_dialog.activateWindow()
+
+    def _read_assr_params_from_dialog(self) -> AssrParams:
+        carrier = float(self._assr_ui.lineEdit_carrier.text().strip() or "1000")
+        modulation = float(self._assr_ui.lineEdit_modulation.text().strip() or "40")
+        depth = float(self._assr_ui.lineEdit_depth.text().strip() or "1")
+        amplitude = float(self._assr_ui.lineEdit_amplitude.text().strip() or "0.18")
+        duration = float(self._assr_ui.lineEdit_duration.text().strip() or "60")
+        discard = float(self._assr_ui.lineEdit_discard.text().strip() or "2")
+        if carrier <= 0 or modulation <= 0:
+            raise ValueError("载波和调制频率必须大于 0")
+        if duration <= 2:
+            raise ValueError("时长建议大于 2 秒")
+        if not 0.0 <= depth <= 1.0:
+            raise ValueError("调幅度必须在 0–1")
+        if not 0.0 < amplitude <= 1.0:
+            raise ValueError("音量必须在 0–1")
+        if discard < 0 or discard >= duration:
+            raise ValueError("去起始时长必须小于总时长")
+        return AssrParams(
+            carrier_hz=carrier,
+            modulation_hz=modulation,
+            depth=depth,
+            duration_sec=duration,
+            discard_sec=discard,
+            amplitude=amplitude,
+            stimulus=self._assr_ui.comboBox_stimulus.currentText(),
+            ear=self._assr_ui.comboBox_ear.currentText(),
+        )
+
+    def _refresh_assr_status(self) -> None:
+        label = getattr(self, "_assr_ui", None)
+        if label is None:
+            return
+        if self._assr_controller is not None and self._assr_controller.is_playing:
+            remain = self._assr_controller.remaining_sec()
+            n = len(self._assr_raw)
+            text = f"播放中 剩余 {remain:.0f}s，已采 {n} 点"
+        elif self._assr_raw:
+            text = f"已停止，缓冲 {len(self._assr_raw)} 点，可点「分析最近记录」"
+        else:
+            text = "未开始"
+        self._assr_ui.label_status.setText(text)
+
+    @QtCore.pyqtSlot()
+    def _start_assr_test(self) -> None:
+        if self._assr_controller is None:
+            self._log("ASSR 不可用: 请 pip install sounddevice")
+            return
+        if not self._running:
+            self._log("请先开始 EEG 采集，再做 ASSR")
+            return
+        try:
+            params = self._read_assr_params_from_dialog()
+        except ValueError as exc:
+            self._log(f"ASSR 参数错误: {exc}")
+            return
+        if self._sleep_aid_controller is not None and self._sleep_aid_controller.is_active:
+            self._stop_sleep_aid_stimulus(manual=True)
+        if self._audio_controller.is_playing:
+            self._audio_controller.stop()
+            self._refresh_audio_button()
+        self._assr_params = params
+        self._assr_raw = []
+        self._assr_recording = True
+        try:
+            self._assr_controller.start(
+                carrier_hz=params.carrier_hz,
+                modulation_hz=params.modulation_hz,
+                depth=params.depth,
+                amplitude=params.amplitude,
+                duration_sec=params.duration_sec,
+                stimulus=params.stimulus,
+                ear=params.ear,
+            )
+        except Exception as exc:
+            self._assr_recording = False
+            self._log(f"ASSR 启动失败: {exc}")
+            self._refresh_assr_status()
+            return
+        self._refresh_assr_status()
+        self._log(
+            f"ASSR 已开始: {params.stimulus} 载波 {params.carrier_hz:g} Hz / "
+            f"调制 {params.modulation_hz:g} Hz / {params.duration_sec:g}s / {params.ear}"
+        )
+
+    @QtCore.pyqtSlot()
+    def _stop_assr_test(self) -> None:
+        if self._assr_controller is not None and self._assr_controller.is_playing:
+            self._assr_controller.stop()
+        self._finish_assr_recording(analyze=True)
+
+    @QtCore.pyqtSlot()
+    def _on_assr_stopped(self) -> None:
+        self._finish_assr_recording(analyze=True)
+
+    def _finish_assr_recording(self, *, analyze: bool) -> None:
+        was_recording = self._assr_recording
+        self._assr_recording = False
+        self._refresh_assr_status()
+        if not was_recording:
+            return
+        self._log(f"ASSR 刺激结束，缓冲 {len(self._assr_raw)} 点")
+        if analyze:
+            self._analyze_last_assr()
+
+    @QtCore.pyqtSlot()
+    def _analyze_last_assr(self) -> None:
+        params = self._assr_params
+        if params is None:
+            try:
+                params = self._read_assr_params_from_dialog()
+            except ValueError as exc:
+                self._log(f"ASSR 参数错误: {exc}")
+                return
+        raw = np.asarray(self._assr_raw, dtype=np.float64)
+        if raw.size < 8:
+            self._log("ASSR 没有可分析的记录，请先开始刺激")
+            return
+        fs = self._measured_eeg_sample_rate()
+        result = analyze_assr(raw, fs, params)
+        for line in format_assr_report(result).splitlines():
+            self._log(line)
+        self._plot_assr_result(result)
+        self._refresh_assr_status()
+
+    def _plot_assr_result(self, result) -> None:
+        if result.freqs.size == 0:
+            return
+        fig = self._analysis_plot.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        fmin = ASSR_PLOT_FMIN_HZ
+        fmax = min(ASSR_PLOT_FMAX_HZ, float(result.sample_rate) * 0.5 - 1.0)
+        mask = (result.freqs >= fmin) & (result.freqs <= fmax)
+        freqs = result.freqs[mask]
+        psd = result.psd[mask]
+        y = 10.0 * np.log10(np.maximum(psd, np.finfo(float).tiny))
+        ax.plot(freqs, y, color="#212121", linewidth=1.0)
+        ax.axvline(result.fundamental.freq_hz, color="#C62828", ls="--", lw=1.2, label=f"{result.params.modulation_hz:g} Hz")
+        if result.harmonic is not None:
+            ax.axvline(result.harmonic.freq_hz, color="#1565C0", ls=":", lw=1.2, label=f"{2 * result.params.modulation_hz:g} Hz")
+        ax.set_title(f"ASSR PSD | SNR {result.fundamental.snr_db:.1f} dB | {result.duration_used_sec:.1f}s")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("PSD (dB)")
+        ax.set_xlim(fmin, fmax)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
+        self._analysis_plot.refresh()
+        self._show_analysis_plot_view()
+
+    def _record_assr_sample(self, raw: int) -> None:
+        if self._assr_recording:
+            self._assr_raw.append(int(raw))
+
+    def _set_sleep_aid_panel_visible(self, visible: bool) -> None:
+        """助眠音频面板只在振子页显示，不出现在 EEG 界面。"""
+        panel = getattr(self.ui, "groupBox_2", None)
+        if panel is not None:
+            panel.setVisible(visible)
+
+    def _set_eeg_analysis_panels_visible(self, visible: bool) -> None:
+        """离线查看 / 功率对比只在 EEG 页显示，不出现在振子界面。"""
+        for name in ("groupBox_offline", "groupBox_compare"):
+            panel = getattr(self.ui, name, None)
+            if panel is not None:
+                panel.setVisible(visible)
+
     def _switch_to_eeg_view(self) -> None:
         """切换到 EEG 波形页（stackedWidget page）。"""
         tabs = getattr(self.ui, "tabWidget_wave_display", None)
@@ -6388,6 +6563,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             tabs.blockSignals(False)
         self.ui.stackedWidget.setCurrentIndex(0)
         self._active_view = "eeg"
+        self._set_sleep_aid_panel_visible(False)
+        self._set_eeg_analysis_panels_visible(True)
         if self._analysis_plot_active:
             self._waveform.hide()
             self._multi_waveform.hide()
@@ -6516,6 +6693,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             tabs.blockSignals(False)
         self.ui.stackedWidget.setCurrentIndex(1)
         self._active_view = "osc"
+        self._set_sleep_aid_panel_visible(True)
+        self._set_eeg_analysis_panels_visible(False)
         self._refresh_osc_display()
 
     @QtCore.pyqtSlot(int)
@@ -6622,27 +6801,24 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._apply_display_mode("raw")
 
     def _sync_waveform_geometry(self) -> None:
-        """EEG 波形控件与 Designer 中 graphicsView 同位置同大小。"""
-        self._waveform.setGeometry(self.ui.graphicsView.geometry())
+        """EEG 波形控件填满 Designer 中的 plotHost。"""
+        self._waveform.setGeometry(self.ui.plotHost.rect())
 
     def _sync_multi_waveform_geometry(self) -> None:
-        self._multi_waveform.setGeometry(self.ui.graphicsView.geometry())
+        self._multi_waveform.setGeometry(self.ui.plotHost.rect())
 
     def _sync_offline_geometry(self) -> None:
-        self._offline_view.setGeometry(self.ui.graphicsView.geometry())
+        self._offline_view.setGeometry(self.ui.plotHost.rect())
 
     def _sync_analysis_plot_geometry(self) -> None:
-        self._analysis_plot.setGeometry(self.ui.graphicsView.geometry())
+        self._analysis_plot.setGeometry(self.ui.plotHost.rect())
 
     def _sync_osc_waveform_geometry(self) -> None:
-        """振子波形控件与 EEG 绘图区同尺寸。"""
-        self._osc_graphics_view.setGeometry(self.ui.graphicsView.geometry())
-        self._osc_waveform.setGeometry(self.ui.graphicsView.geometry())
+        """振子波形控件填满 plotHost_osc。"""
+        self._osc_waveform.setGeometry(self.ui.plotHost_osc.rect())
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
-        if hasattr(self.ui, "bottomPanel"):
-            self._layout_main_regions()
         if not hasattr(self, "_waveform") or not hasattr(self, "_osc_waveform"):
             return
         self._sync_waveform_geometry()
@@ -7094,6 +7270,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sleep_aid_controller.stop()
                 self._sleep_aid_timed_auto = False
                 self._refresh_sleep_aid_button()
+            if self._assr_recording or (
+                self._assr_controller is not None and self._assr_controller.is_playing
+            ):
+                if self._assr_controller is not None:
+                    self._assr_controller.stop()
+                self._finish_assr_recording(analyze=True)
             if self._test_duration_sec is not None:
                 if self._long_record_active:
                     session_dir = self._long_session_dir
@@ -7147,6 +7329,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     if len(channels) < expected_channels:
                         continue
                     self._record_eeg_sample_for_timed_test(sample)
+                    self._record_assr_sample(sample.channel1)
                     self._sample_count += 1
                     self._decim_counter += 1
                     if band is None:
@@ -7181,6 +7364,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
             for sample in samples:
                 self._record_eeg_sample_for_timed_test(sample)
+                self._record_assr_sample(sample.channel1)
                 self._sample_count += 1
                 self._decim_counter += 1
                 value = self._rhythm.push(sample.channel1, band)
@@ -7328,6 +7512,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._update_test_countdown_lcd()
                 self._maybe_manage_timed_sleep_aid()
                 self._maybe_save_long_record_chunk()
+            if self._assr_recording:
+                self._refresh_assr_status()
             now = time.monotonic()
             if now - self._last_status_update >= 0.2:
                 self._last_status_update = now
@@ -7340,6 +7526,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._audio_controller.shutdown()
         if self._sleep_aid_controller is not None:
             self._sleep_aid_controller.shutdown()
+        if getattr(self, "_assr_controller", None) is not None:
+            self._assr_controller.shutdown()
         if self._link is not None:
             self._link.close()
         if self._osc_link is not None:

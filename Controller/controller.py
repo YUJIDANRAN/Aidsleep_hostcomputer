@@ -15,6 +15,7 @@ import numpy as np
 from audiio import (
     DEFAULT_AMPLITUDE,
     DEFAULT_SAMPLE_RATE,
+    AssrToneOutput,
     PinkNoiseBurstOutput,
     StereoSineAudioOutput,
     default_output_device,
@@ -406,3 +407,101 @@ class SleepAidStimulusController:
         self._pool_index = (self._pool_index + 1) % len(self._burst_pool)
         if not self._burst_player.queue_burst(burst):
             print("[SleepAid] burst 队列已满，已丢弃")
+
+
+class AssrStimulusController:
+    """按参数播放 ASSR 刺激；duration_sec>0 时到时自动停止。"""
+
+    def __init__(
+        self,
+        sample_rate: float = DEFAULT_SAMPLE_RATE,
+        device: Optional[int | str] = None,
+        on_stopped: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if device is None:
+            device_idx, _ = default_output_device()
+            device = device_idx
+        self._audio = AssrToneOutput(sample_rate=sample_rate, device=device)
+        self._on_stopped = on_stopped
+        self._lock = threading.Lock()
+        self._playing = False
+        self._stop_timer: Optional[threading.Timer] = None
+        self._started_at = 0.0
+        self._duration_sec = 0.0
+
+    @property
+    def is_playing(self) -> bool:
+        with self._lock:
+            return self._playing
+
+    def elapsed_sec(self, now: Optional[float] = None) -> float:
+        with self._lock:
+            if not self._playing:
+                return 0.0
+            t = time.monotonic() if now is None else now
+            return max(0.0, t - self._started_at)
+
+    def remaining_sec(self, now: Optional[float] = None) -> float:
+        with self._lock:
+            if not self._playing:
+                return 0.0
+            t = time.monotonic() if now is None else now
+            if self._duration_sec <= 0:
+                return float("inf")
+            return max(0.0, self._duration_sec - (t - self._started_at))
+
+    def start(
+        self,
+        *,
+        carrier_hz: float,
+        modulation_hz: float,
+        depth: float,
+        amplitude: float,
+        duration_sec: float,
+        stimulus: str = "am",
+        ear: str = "stereo",
+    ) -> None:
+        self.stop()
+        self._audio.configure(
+            carrier_hz=carrier_hz,
+            modulation_hz=modulation_hz,
+            depth=depth,
+            amplitude=amplitude,
+            stimulus=stimulus,
+            ear=ear,
+        )
+        self._audio.start()
+        with self._lock:
+            self._playing = True
+            self._started_at = time.monotonic()
+            self._duration_sec = max(0.0, float(duration_sec))
+            if self._duration_sec > 0:
+                self._stop_timer = threading.Timer(self._duration_sec, self._auto_stop)
+                self._stop_timer.daemon = True
+                self._stop_timer.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_locked(notify=False)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._stop_locked(notify=False)
+
+    def _cancel_timer_locked(self) -> None:
+        if self._stop_timer is not None:
+            self._stop_timer.cancel()
+            self._stop_timer = None
+
+    def _stop_locked(self, *, notify: bool) -> None:
+        self._cancel_timer_locked()
+        if self._audio.is_playing:
+            self._audio.stop()
+        was_playing = self._playing
+        self._playing = False
+        if notify and was_playing and self._on_stopped is not None:
+            self._on_stopped()
+
+    def _auto_stop(self) -> None:
+        with self._lock:
+            self._stop_locked(notify=True)

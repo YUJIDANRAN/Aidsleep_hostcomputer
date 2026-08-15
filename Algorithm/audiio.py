@@ -400,6 +400,130 @@ def make_alert_chime(
     return np.concatenate(chunks, axis=0)
 
 
+class AssrToneOutput:
+    """流式播放 ASSR 刺激：AM 调幅音或等间隔短 click。"""
+
+    def __init__(
+        self,
+        sample_rate: float = DEFAULT_SAMPLE_RATE,
+        blocksize: int = DEFAULT_BLOCKSIZE,
+        device: Optional[int | str] = None,
+    ) -> None:
+        _require_sounddevice()
+        self._sample_rate = float(sample_rate)
+        self._blocksize = int(blocksize)
+        self._device = device
+        self._lock = threading.Lock()
+        self._stream: Optional[sd.OutputStream] = None
+        self._carrier_hz = 1000.0
+        self._mod_hz = 40.0
+        self._depth = 1.0
+        self._amplitude = 0.18
+        self._stimulus = "am"
+        self._left_on = True
+        self._right_on = True
+        self._car_phase = 0.0
+        self._mod_phase = 0.0
+        self._click_phase = 0.0
+
+    @property
+    def is_playing(self) -> bool:
+        return self._stream is not None and self._stream.active
+
+    def configure(
+        self,
+        *,
+        carrier_hz: float,
+        modulation_hz: float,
+        depth: float,
+        amplitude: float,
+        stimulus: str = "am",
+        ear: str = "stereo",
+    ) -> None:
+        with self._lock:
+            self._carrier_hz = max(20.0, float(carrier_hz))
+            self._mod_hz = max(1.0, float(modulation_hz))
+            self._depth = float(np.clip(depth, 0.0, 1.0))
+            self._amplitude = float(np.clip(amplitude, 0.0, MAX_AMPLITUDE))
+            self._stimulus = "click" if str(stimulus).lower() == "click" else "am"
+            mode = str(ear).lower()
+            self._left_on = mode in {"stereo", "left", "both"}
+            self._right_on = mode in {"stereo", "right", "both"}
+            self._car_phase = 0.0
+            self._mod_phase = 0.0
+            self._click_phase = 0.0
+
+    def start(self) -> None:
+        if self.is_playing:
+            return
+        stream = sd.OutputStream(
+            samplerate=self._sample_rate,
+            channels=2,
+            dtype="float32",
+            blocksize=self._blocksize,
+            device=self._device,
+            callback=self._audio_callback,
+        )
+        stream.start()
+        with self._lock:
+            self._stream = stream
+
+    def stop(self) -> None:
+        with self._lock:
+            stream = self._stream
+            self._stream = None
+        if stream is not None:
+            stream.stop()
+            stream.close()
+
+    def _render_am(self, frames: int) -> np.ndarray:
+        n = np.arange(frames, dtype=np.float64)
+        car_w = 2.0 * np.pi * self._carrier_hz / self._sample_rate
+        mod_w = 2.0 * np.pi * self._mod_hz / self._sample_rate
+        car = np.sin(self._car_phase + car_w * n)
+        mod = np.sin(self._mod_phase + mod_w * n)
+        env = 1.0 + self._depth * mod
+        scale = 1.0 + self._depth if self._depth > 0 else 1.0
+        mono = (self._amplitude * env * car / scale).astype(np.float32)
+        self._car_phase = float((self._car_phase + car_w * frames) % (2.0 * np.pi))
+        self._mod_phase = float((self._mod_phase + mod_w * frames) % (2.0 * np.pi))
+        return mono
+
+    def _render_clicks(self, frames: int) -> np.ndarray:
+        period = self._sample_rate / self._mod_hz
+        click_len = max(2, int(round(self._sample_rate * 0.001)))
+        mono = np.zeros(frames, dtype=np.float32)
+        phase = self._click_phase
+        for i in range(frames):
+            if phase >= period:
+                phase -= period
+            if phase < click_len:
+                # 短矩形脉冲，带简单下降沿，减轻爆破音
+                mono[i] = np.float32(self._amplitude * (1.0 - phase / click_len))
+            phase += 1.0
+        self._click_phase = float(phase % period)
+        return mono
+
+    def _audio_callback(
+        self,
+        outdata: np.ndarray,
+        frames: int,
+        time_info: object,
+        status: sd.CallbackFlags,
+    ) -> None:
+        if status:
+            print(f"[audiio assr] {status}")
+        with self._lock:
+            if self._stimulus == "click":
+                mono = self._render_clicks(frames)
+            else:
+                mono = self._render_am(frames)
+            left_on = self._left_on
+            right_on = self._right_on
+        outdata[:, 0] = mono if left_on else 0.0
+        outdata[:, 1] = mono if right_on else 0.0
+
+
 def play_alert_chime(
     *,
     sample_rate: float = DEFAULT_SAMPLE_RATE,
