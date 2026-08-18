@@ -21,24 +21,35 @@ class BackgroundQueuePump(threading.Thread):
         idle_sleep_sec: float = 0.001,
     ) -> None:
         super().__init__(name=name, daemon=True)
-        self._drain = drain
+        self._drain: Optional[Callable[[], List[T]]] = drain
         self._queue: "queue.Queue[List[T]]" = queue.Queue()
-        self._stop = threading.Event()
+        # Do NOT name this `_stop`: threading.Thread already uses `_stop` as a method.
+        self._stop_event = threading.Event()
         self._paused = threading.Event()
         self._paused.set()
+        self._busy = threading.Event()
         self._idle_sleep_sec = float(idle_sleep_sec)
         self._error: Optional[BaseException] = None
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self._paused.is_set():
-                self._stop.wait(0.02)
+                if self._stop_event.wait(0.02):
+                    break
                 continue
+            drain = self._drain
+            if drain is None:
+                break
+            self._busy.set()
             try:
-                items = self._drain()
+                items = drain()
             except Exception as exc:
                 self._error = exc
+                items = []
                 time.sleep(0.02)
+            finally:
+                self._busy.clear()
+            if self._stop_event.is_set() or self._paused.is_set():
                 continue
             if items:
                 self._queue.put(items)
@@ -52,9 +63,21 @@ class BackgroundQueuePump(threading.Thread):
     def pause(self) -> None:
         self._paused.set()
 
-    def shutdown(self, timeout: float = 1.0) -> None:
-        self._stop.set()
-        self._paused.clear()
+    def wait_until_idle(self, timeout: float = 2.0) -> bool:
+        """Block until the current drain call finishes (or timeout)."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self._busy.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.005, remaining))
+        return True
+
+    def shutdown(self, timeout: float = 3.0) -> None:
+        self._paused.set()
+        self._stop_event.set()
+        self._drain = None
+        self.wait_until_idle(timeout=min(1.0, timeout))
         if self.is_alive():
             self.join(timeout=timeout)
 

@@ -141,6 +141,7 @@ class RhythmStreamProcessor:
             )
             self._band_zi[name] = sosfilt_zi(self._band_sos[name])
         self._initialized = False
+        self._primed_bands: set[str] = set()
 
     @property
     def sample_rate(self) -> float:
@@ -156,31 +157,34 @@ class RhythmStreamProcessor:
         for name in EEG_BANDS:
             self._band_zi[name] = sosfilt_zi(self._band_sos[name])
         self._initialized = False
+        self._primed_bands.clear()
+
+    def note_received(self, count: int = 1) -> None:
+        """Count incoming samples without filtering (e.g. skipped display backlog)."""
+        if count > 0:
+            self._estimator.add(int(count))
 
     def push(self, adc: int, band: Optional[str] = None) -> float:
-        """band=None returns raw ADC; otherwise returns the selected rhythm band."""
+        """band=None returns raw ADC; otherwise returns only the selected rhythm band."""
         self._estimator.add(1)
         x = float(adc)
-        if band is not None and band not in self._band_zi:
+        if band is None:
+            return x
+        if band not in self._band_zi:
             raise ValueError(f"未知节律: {band!r}")
 
         if not self._initialized:
             self._base_zi = sosfilt_zi(self._base_sos) * x
+            self._initialized = True
         y_base, self._base_zi = sosfilt(self._base_sos, [x], zi=self._base_zi)
         base_value = float(y_base[0])
-        if not self._initialized:
-            for name in EEG_BANDS:
-                self._band_zi[name] = sosfilt_zi(self._band_sos[name]) * base_value
-            self._initialized = True
-
-        selected_value = x
-        for name in EEG_BANDS:
-            y_band, self._band_zi[name] = sosfilt(
-                self._band_sos[name], [base_value], zi=self._band_zi[name]
-            )
-            if name == band:
-                selected_value = float(y_band[0])
-        return selected_value
+        if band not in self._primed_bands:
+            self._band_zi[band] = sosfilt_zi(self._band_sos[band]) * base_value
+            self._primed_bands.add(band)
+        y_band, self._band_zi[band] = sosfilt(
+            self._band_sos[band], [base_value], zi=self._band_zi[band]
+        )
+        return float(y_band[0])
 
 
 @dataclass(frozen=True)

@@ -136,6 +136,7 @@ RAW_PLOT_WINDOW_SECONDS = 60.0  ## 波形时间窗 (s)
 RAW_PLOT_MAX_POINTS = int(RAW_DISPLAY_RATE * RAW_PLOT_WINDOW_SECONDS)  ## 缓冲约 200 点
 SERIAL_POLL_INTERVAL_MS = 20  ## UI 取队列；串口由后台线程抽空
 MAX_PLOT_POINTS_PER_TICK = 250  ## 单次刷新最多画这么多显示点，记录仍处理全部
+MAX_DISPLAY_PROCESS_SAMPLES = MAX_PLOT_POINTS_PER_TICK * RAW_DECIM_FACTOR  ## 显示最多处理约 2.5 s，避免积压把线条拖慢
 EEG_DUAL_CHANNEL_COUNT = 2  ## two-channel EEG protocol: CH1~CH2
 EEG_MULTI_CHANNEL_COUNT = 6  ## six-channel EEG protocol: CH1~CH6
 MIN_PLOT_WIDTH = 200  ## 绘图区最小宽度
@@ -4754,33 +4755,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "不画 FFT/波形/段对比；波形仅显示开测后 5 分钟，可用「波形唤醒」"
         )
         self.ui.pushButton_wave_wake.setToolTip(
-            "长时记录模式下，每次点击将动态波形再显示 5 分钟"
+            "切回 EEG 实时波形；长时记录时再显示 5 分钟动态波形"
         )
         self.ui.pushButton_wave_wake.clicked.connect(self.on_waveform_wake)
-        self.ui.checkBox_long_record.toggled.connect(self._on_long_record_toggled)
-        self._refresh_wave_wake_button()
-
-    def _on_long_record_toggled(self, _checked: bool) -> None:
-        self._refresh_wave_wake_button()
-
-    def _refresh_wave_wake_button(self) -> None:
-        enabled = bool(self.ui.checkBox_long_record.isChecked())
-        self.ui.pushButton_wave_wake.setEnabled(enabled)
 
     @QtCore.pyqtSlot()
     def on_waveform_wake(self) -> None:
-        """长时记录：将动态波形再唤醒 WAVEFORM_WAKE_SEC 秒。"""
-        if not self.ui.checkBox_long_record.isChecked():
-            self._log("请先勾选「长时记录」再唤醒波形")
-            return
-        if not self._running or self._test_duration_sec is None:
-            self._log("请先启动定时记录后再唤醒波形")
-            return
-        if not self._long_record_active:
-            self._log("本次采集未以长时记录模式启动，无法唤醒波形窗口")
-            return
-        self._arm_waveform_display(WAVEFORM_WAKE_SEC, clear=True)
-        self._log(f"波形显示已唤醒 {WAVEFORM_WAKE_SEC / 60.0:.0f} 分钟")
+        """切回 EEG 实时显示；长时记录时再唤醒动态波形。"""
+        self._force_live_eeg_display()
+        if (
+            self.ui.checkBox_long_record.isChecked()
+            and self._running
+            and self._test_duration_sec is not None
+            and self._long_record_active
+        ):
+            self._arm_waveform_display(WAVEFORM_WAKE_SEC, clear=True)
+            self._log(f"波形显示已唤醒 {WAVEFORM_WAKE_SEC / 60.0:.0f} 分钟")
 
     def _arm_waveform_display(self, duration_sec: float, *, clear: bool = False) -> None:
         self._waveform_display_until = time.monotonic() + float(duration_sec)
@@ -6008,6 +5998,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._assr_button = self.ui.pushButton_assr
         self._assr_button.clicked.connect(self._show_assr_dialog)
 
+    def _force_live_eeg_display(self) -> None:
+        """不论当前是结果图、离线查看还是振子页，都切回 EEG 实时波形。"""
+        self._analysis_plot_active = False
+        self._offline_view_active = False
+        self._analysis_plot.hide()
+        self._offline_view.hide()
+        self._offline_view.scroll_panel.hide()
+        self._switch_to_eeg_view()
+        self._update_status_bar()
+
     @QtCore.pyqtSlot()
     def _show_assr_dialog(self) -> None:
         self._refresh_assr_status()
@@ -6689,17 +6689,23 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         eeg_open = isinstance(self._link, Ks1082Serial) and self._link.is_open
         osc_open = self._osc_link is not None and self._osc_link.is_open
         if eeg_open or osc_open:
-            self._stop_eeg_pump()
-            self._stop_osc_pump()
-            if self._link is not None:
-                self._link.close()
-            if self._osc_link is not None:
-                self._osc_link.close()
+            # Stop timer first to avoid re-entrant poll while joining reader threads.
+            self._poll_timer.stop()
             self._running = False
             self._refresh_capture_button()
-            self._refresh_serial_button()
-            self._update_status_bar()
-            self._log("串口已关闭")
+            try:
+                self._halt_serial_readers()
+                if self._link is not None:
+                    self._link.close()
+                if self._osc_link is not None:
+                    self._osc_link.close()
+                self._log("串口已关闭")
+            except Exception as exc:
+                self._log(f"关闭串口异常: {exc}")
+            finally:
+                self._refresh_serial_button()
+                self._update_status_bar()
+                self._poll_timer.start()
             return
 
         eeg_ok = self._open_serial()
@@ -6709,6 +6715,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log("串口已打开，可点击启动开始采集")
         else:
             self._log("串口打开失败，请检查端口与参数")
+        self._poll_timer.start()
 
     def _ui_serial_port(self) -> str:
         """从 lineEdit_5 读取 EEG 串口号。"""
@@ -6743,30 +6750,46 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._osc_pump.resume()
 
     def _stop_eeg_pump(self) -> None:
-        if self._eeg_pump is not None:
-            self._eeg_pump.shutdown()
-            self._eeg_pump = None
+        pump = self._eeg_pump
+        self._eeg_pump = None
+        if pump is not None:
+            pump.shutdown()
 
     def _stop_osc_pump(self) -> None:
-        if self._osc_pump is not None:
-            self._osc_pump.shutdown()
-            self._osc_pump = None
+        pump = self._osc_pump
+        self._osc_pump = None
+        if pump is not None:
+            pump.shutdown()
 
     def _pause_serial_pumps(self) -> None:
         if self._eeg_pump is not None:
             self._eeg_pump.pause()
+            self._eeg_pump.wait_until_idle(timeout=2.0)
             self._eeg_pump.clear()
         if self._osc_pump is not None:
             self._osc_pump.pause()
+            self._osc_pump.wait_until_idle(timeout=2.0)
             self._osc_pump.clear()
 
     def _resume_serial_pumps(self) -> None:
-        if self._eeg_pump is not None:
-            self._eeg_pump.clear()
-            self._eeg_pump.resume()
-        if self._osc_pump is not None:
-            self._osc_pump.clear()
-            self._osc_pump.resume()
+        if self._link is not None and self._link.is_open:
+            if self._eeg_pump is None or not self._eeg_pump.is_alive():
+                self._start_eeg_pump()
+            else:
+                self._eeg_pump.clear()
+                self._eeg_pump.resume()
+        if self._osc_link is not None and self._osc_link.is_open:
+            if self._osc_pump is None or not self._osc_pump.is_alive():
+                self._start_osc_pump()
+            else:
+                self._osc_pump.clear()
+                self._osc_pump.resume()
+
+    def _halt_serial_readers(self) -> None:
+        """Pause, wait for in-flight drain, then tear down reader threads."""
+        self._pause_serial_pumps()
+        self._stop_eeg_pump()
+        self._stop_osc_pump()
 
     def _open_serial(self) -> bool:
         """打开 EEG 串口。"""
@@ -6779,7 +6802,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 and self._link.port == port
                 and self._serial_settings_match(self._link, serial_settings)
             ):
-                if self._eeg_pump is None or not self._eeg_pump.is_alive():
+                if self._running and (self._eeg_pump is None or not self._eeg_pump.is_alive()):
                     self._start_eeg_pump()
                 return True
             if self._link is not None:
@@ -6788,7 +6811,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._link = Ks1082Serial(port, timeout=0.0, **serial_settings)
             self._link.open()
             self._link.set_channel_count(self._eeg_protocol_channel_count())
-            self._start_eeg_pump()
+            if self._running:
+                self._start_eeg_pump()
             self._port = port
             self._log(f"EEG 串口已连接: {self._port} @ {self._format_serial_settings(serial_settings)}")
             self._log(f"EEG 采样率 {self._rhythm.sample_rate:.0f} Hz，显示 {RAW_DISPLAY_RATE} Hz")
@@ -6796,6 +6820,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return True
         except Exception as exc:
             self._stop_eeg_pump()
+            if self._link is not None:
+                try:
+                    self._link.close()
+                except Exception:
+                    pass
             self._link = None
             self._log(f"EEG 串口打开失败 ({port}): {exc}")
             self._refresh_serial_button()
@@ -6812,7 +6841,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 and self._osc_link.port == port
                 and self._serial_settings_match(self._osc_link, serial_settings)
             ):
-                if self._osc_pump is None or not self._osc_pump.is_alive():
+                if self._running and (self._osc_pump is None or not self._osc_pump.is_alive()):
                     self._start_osc_pump()
                 return True
             if self._osc_link is not None:
@@ -6820,7 +6849,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._osc_link.close()
             self._osc_link = OscillatorSerial(port, timeout=0.0, **serial_settings)
             self._osc_link.open()
-            self._start_osc_pump()
+            if self._running:
+                self._start_osc_pump()
             self._osc_port = port
             self._log(f"振子串口已连接: {self._osc_port} @ {self._format_serial_settings(serial_settings)}")
             self._log(
@@ -6837,6 +6867,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return True
         except Exception as exc:
             self._stop_osc_pump()
+            if self._osc_link is not None:
+                try:
+                    self._osc_link.close()
+                except Exception:
+                    pass
             self._osc_link = None
             self._log(f"振子串口打开失败 ({port}): {exc}")
             self._refresh_serial_button()
@@ -6903,11 +6938,49 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def on_toggle_capture(self) -> None:
         """启动/停止采集。"""
         stopping = self._running
-        if stopping:
-            self._poll_eeg_serial()
-            self._poll_osc_serial()
-        self._running = not self._running
-        if self._running:
+        self._poll_timer.stop()
+        try:
+            if stopping:
+                # 先取尽已入队样本，再暂停读线程；不停掉线程，便于再次启动。
+                self._poll_eeg_serial()
+                self._poll_osc_serial()
+                self._running = False
+                self._pause_serial_pumps()
+                if self._link is not None:
+                    self._link.discard_pending_input()
+                if self._osc_link is not None:
+                    self._osc_link.discard_pending_input()
+                if self._assr_recording or (
+                    self._assr_controller is not None and self._assr_controller.is_playing
+                ):
+                    if self._assr_controller is not None:
+                        self._assr_controller.stop()
+                    self._finish_assr_recording(analyze=True)
+                if self._test_duration_sec is not None:
+                    if self._long_record_active:
+                        session_dir = self._long_session_dir
+                        self._flush_long_record_buffer(final=True)
+                        if session_dir is not None:
+                            self._run_long_record_postprocess(session_dir)
+                        self._reset_timed_test_state()
+                        if session_dir is not None:
+                            self._last_eeg_session_dir = session_dir
+                            self._log(
+                                f"手动停止长时记录：已保存剩余数据至 {session_dir}"
+                            )
+                        else:
+                            self._log("手动停止长时记录：无数据可保存")
+                    else:
+                        self._clear_eeg_raw_records()
+                        self._reset_timed_test_state()
+                        self._log("手动停止测试：未保存任何记录")
+                self._refresh_capture_button()
+                self._update_status_bar()
+                view_label = "振子" if self._active_view == "osc" else "EEG"
+                self._log(f"采集状态: 暂停 ({view_label})")
+                return
+
+            self._running = True
             eeg_ok = self._open_serial()
             osc_ok = self._open_osc_serial()
             if not eeg_ok and not osc_ok:
@@ -6915,9 +6988,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._refresh_capture_button()
                 self.ui.statusbar.showMessage("串口未连接")
                 return
-        self._pause_serial_pumps()
-        if self._link is not None:
-            if self._running:
+            self._pause_serial_pumps()
+            if self._link is not None:
+                self._link.ensure_io_enabled()
                 flushed = self._link.flush_input_buffer()
                 self._link.bytes_received = 0
                 self._sample_count = 0
@@ -6930,10 +7003,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._clear_eeg_waveforms()
                 if flushed:
                     self._log(f"EEG 已丢弃暂停期间积压的 {flushed} 字节")
-            else:
-                self._link.discard_pending_input()
-        if self._osc_link is not None:
-            if self._running:
+            if self._osc_link is not None:
+                self._osc_link.ensure_io_enabled()
                 flushed = self._osc_link.flush_input_buffer()
                 self._osc_link.bytes_received = 0
                 self._osc_sample_count = 0
@@ -6943,40 +7014,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._osc_waveform.clear()
                 if flushed:
                     self._log(f"振子已丢弃暂停期间积压的 {flushed} 字节")
-            else:
-                self._osc_link.discard_pending_input()
-        if self._running:
             self._resume_serial_pumps()
             self._begin_timed_test_if_configured()
-        elif stopping:
-            if self._assr_recording or (
-                self._assr_controller is not None and self._assr_controller.is_playing
-            ):
-                if self._assr_controller is not None:
-                    self._assr_controller.stop()
-                self._finish_assr_recording(analyze=True)
-            if self._test_duration_sec is not None:
-                if self._long_record_active:
-                    session_dir = self._long_session_dir
-                    self._flush_long_record_buffer(final=True)
-                    if session_dir is not None:
-                        self._run_long_record_postprocess(session_dir)
-                    self._reset_timed_test_state()
-                    if session_dir is not None:
-                        self._last_eeg_session_dir = session_dir
-                        self._log(
-                            f"手动停止长时记录：已保存剩余数据至 {session_dir}"
-                        )
-                    else:
-                        self._log("手动停止长时记录：无数据可保存")
-                else:
-                    self._clear_eeg_raw_records()
-                    self._reset_timed_test_state()
-                    self._log("手动停止测试：未保存任何记录")
-        self._refresh_capture_button()
-        self._update_status_bar()
-        view_label = "振子" if self._active_view == "osc" else "EEG"
-        self._log(f"采集状态: {'运行' if self._running else '暂停'} ({view_label})")
+            self._refresh_capture_button()
+            self._update_status_bar()
+            view_label = "振子" if self._active_view == "osc" else "EEG"
+            self._log(f"采集状态: 运行 ({view_label})")
+        finally:
+            self._poll_timer.start()
 
     def _poll_eeg_serial(self) -> None:
         """从后台队列取 EEG 样本：全部记入/滤波，显示抽稀。"""
@@ -6992,11 +7037,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         got_bytes = self._link.bytes_received
 
         if samples:
-            if len(samples) >= MCU_SAMPLE_RATE:
+            incoming = len(samples)
+            for sample in samples:
+                self._record_eeg_sample_for_timed_test(sample)
+                self._record_assr_sample(sample.channel1)
+                self._sample_count += 1
+            skipped = 0
+            if incoming > MAX_DISPLAY_PROCESS_SAMPLES:
+                skipped = incoming - MAX_DISPLAY_PROCESS_SAMPLES
+                samples = samples[-MAX_DISPLAY_PROCESS_SAMPLES:]
+                self._rhythm.note_received(skipped)
+            if skipped or incoming >= MCU_SAMPLE_RATE:
                 now = time.monotonic()
                 if now - self._last_backlog_log >= 2.0:
                     self._last_backlog_log = now
-                    self._log(f"EEG 处理积压 {len(samples)} 点（已全部记入，显示抽稀）")
+                    extra = f"，显示跳过 {skipped} 点" if skipped else ""
+                    self._log(f"EEG 处理积压 {incoming} 点（已全部记入{extra}）")
             if self._is_multi_eeg_mode() and not (self._offline_view_active or self._analysis_plot_active):
                 mode = self._current_display_mode()
                 self._apply_display_mode(mode)
@@ -7007,9 +7063,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     channels = sample.channels[:expected_channels]
                     if len(channels) < expected_channels:
                         continue
-                    self._record_eeg_sample_for_timed_test(sample)
-                    self._record_assr_sample(sample.channel1)
-                    self._sample_count += 1
                     self._decim_counter += 1
                     if band is None:
                         values = [float(value) for value in channels]
@@ -7038,9 +7091,6 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             decim_rejected = False
 
             for sample in samples:
-                self._record_eeg_sample_for_timed_test(sample)
-                self._record_assr_sample(sample.channel1)
-                self._sample_count += 1
                 self._decim_counter += 1
                 value = self._rhythm.push(sample.channel1, band)
                 rejected = False
@@ -7200,10 +7250,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._poll_timer.stop()
-        self._pause_serial_pumps()
+        self._running = False
+        self._halt_serial_readers()
         self._close_long_record_writer(final=True)
-        self._stop_eeg_pump()
-        self._stop_osc_pump()
         self._audio_controller.shutdown()
         if getattr(self, "_assr_controller", None) is not None:
             self._assr_controller.shutdown()

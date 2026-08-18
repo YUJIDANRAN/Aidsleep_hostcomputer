@@ -539,22 +539,6 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                  </layout>
                 </item>
                 <item>
-                 <widget class="QPushButton" name="pushButton_assr">
-                  <property name="minimumSize">
-                   <size>
-                    <width>0</width>
-                    <height>32</height>
-                   </size>
-                  </property>
-                  <property name="toolTip">
-                   <string>打开听觉稳态反应（40 Hz AM）测试</string>
-                  </property>
-                  <property name="text">
-                   <string>ASSR 测试...</string>
-                  </property>
-                 </widget>
-                </item>
-                <item>
                  <spacer name="verticalSpacer_eeg_display">
                   <property name="orientation">
                    <enum>Qt::Vertical</enum>
@@ -1326,6 +1310,22 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                 </property>
                 <property name="text">
                  <string>音频</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pushButton_assr">
+                <property name="minimumSize">
+                 <size>
+                  <width>92</width>
+                  <height>40</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>打开听觉稳态反应（40 Hz AM）测试</string>
+                </property>
+                <property name="text">
+                 <string>ASSR 测试...</string>
                 </property>
                </widget>
               </item>

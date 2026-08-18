@@ -211,12 +211,14 @@ class Ks1082Serial:
         self._ser: Optional[Serial] = None
         self._parser = AdcStreamParser()
         self._io_lock = threading.Lock()
+        self._io_enabled = False
         self.on_sample: Optional[Callable[[AdcSample], None]] = None
         self.bytes_received = 0
         self._recent_raw = bytearray()
 
     def open(self) -> None:
         if self._ser and self._ser.is_open:
+            self._io_enabled = True
             return
         self._ser = Serial(
             port=self.port,
@@ -235,11 +237,41 @@ class Ks1082Serial:
         self._parser.reset()
         self.bytes_received = 0
         self._recent_raw.clear()
+        self._io_enabled = True
 
     def close(self) -> None:
-        if self._ser and self._ser.is_open:
-            self._ser.close()
-        self._ser = None
+        # Disable I/O first so any in-flight drain exits quickly, then close under lock.
+        self._io_enabled = False
+        with self._io_lock:
+            ser = self._ser
+            self._ser = None
+            if ser is not None:
+                try:
+                    cancel_read = getattr(ser, "cancel_read", None)
+                    if callable(cancel_read):
+                        cancel_read()
+                except Exception:
+                    pass
+                try:
+                    if ser.is_open:
+                        ser.reset_input_buffer()
+                except Exception:
+                    pass
+                try:
+                    if ser.is_open:
+                        ser.close()
+                except Exception:
+                    pass
+            self._parser.reset()
+
+    def ensure_io_enabled(self) -> None:
+        """Re-enable reads while the port remains open (e.g. after stop→start)."""
+        if self._ser is not None:
+            try:
+                if self._ser.is_open:
+                    self._io_enabled = True
+            except Exception:
+                pass
 
     def __enter__(self) -> Ks1082Serial:
         self.open()
@@ -250,7 +282,13 @@ class Ks1082Serial:
 
     @property
     def is_open(self) -> bool:
-        return self._ser is not None and self._ser.is_open
+        ser = self._ser
+        if ser is None:
+            return False
+        try:
+            return bool(ser.is_open)
+        except Exception:
+            return False
 
     def _require_open(self) -> Serial:
         if not self.is_open or self._ser is None:
@@ -259,12 +297,16 @@ class Ks1082Serial:
 
     def flush_input_buffer(self) -> int:
         """丢弃串口接收缓冲中的待发字节，避免暂停期间积压。"""
-        if not self.is_open or self._ser is None:
-            return 0
         with self._io_lock:
-            waiting = self._ser.in_waiting
-            if waiting:
-                self._ser.read(waiting)
+            ser = self._ser
+            if ser is None or not ser.is_open or not self._io_enabled:
+                return 0
+            try:
+                waiting = ser.in_waiting
+                if waiting:
+                    ser.read(waiting)
+            except Exception:
+                waiting = 0
             self._parser.reset()
             return waiting
 
@@ -292,20 +334,32 @@ class Ks1082Serial:
         return samples
 
     def drain_available(self) -> List[AdcSample]:
-        """Read every waiting byte without blocking. Safe to call from a worker thread."""
-        ser = self._require_open()
+        """Read a bounded amount of waiting bytes. Safe to call from a worker thread."""
+        if not self._io_enabled:
+            return []
+        max_bytes = 65536
         with self._io_lock:
+            if not self._io_enabled or self._ser is None or not self._ser.is_open:
+                return []
+            ser = self._ser
             chunks: List[bytes] = []
-            while True:
-                waiting = ser.in_waiting
-                if not waiting:
-                    break
-                chunk = ser.read(waiting)
-                if not chunk:
-                    break
-                chunks.append(chunk)
+            total = 0
+            try:
+                while total < max_bytes:
+                    waiting = ser.in_waiting
+                    if not waiting:
+                        break
+                    to_read = min(waiting, max_bytes - total)
+                    chunk = ser.read(to_read)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+            except Exception:
+                return []
             if not chunks:
                 return []
+            # Parse under the same lock so flush/close cannot race the parser.
             return self.feed_bytes(b"".join(chunks))
 
     def poll_once(self, max_reads: int = 4) -> List[AdcSample]:
