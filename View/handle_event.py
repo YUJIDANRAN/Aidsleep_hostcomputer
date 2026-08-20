@@ -74,7 +74,11 @@ from analysis_plot_view import (
     CHANNEL_ORDER,
     AnalysisPlotView,
     OfflineRhythmStackView,
+    _MatplotlibHostView,
+    is_openbci_brainflow_eeg_file,
     load_eeg_file_channel,
+    load_eeg_file_channels_window,
+    load_eeg_file_channel_window,
     load_eeg_file_info,
     load_eeg_csv_with_rate,
 )
@@ -168,6 +172,52 @@ MIN_X_TIME_ZOOM = 0.2  ## X 最小缩放（时间窗最长）
 MIN_X_VISIBLE_POINTS = 50  ## X 至少显示点数，过少会连成三角折线
 MIN_Y_AMP = 20.0  ## Y 半幅下限
 MAX_Y_AMP = 200000.0  ## Y 半幅上限
+
+
+class YasaSleepStagingWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object, object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        raw_mne,
+        *,
+        eeg_name: str,
+        eog_name: Optional[str],
+        emg_name: Optional[str],
+        metadata: Dict[str, object],
+        model: str,
+    ) -> None:
+        super().__init__()
+        self._raw_mne = raw_mne
+        self._eeg_name = eeg_name
+        self._eog_name = eog_name
+        self._emg_name = emg_name
+        self._metadata = metadata
+        self._model = model
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            import yasa  # type: ignore
+
+            sls = yasa.SleepStaging(
+                self._raw_mne,
+                eeg_name=self._eeg_name,
+                eog_name=self._eog_name,
+                emg_name=self._emg_name,
+                metadata=self._metadata,
+            )
+            prediction = sls.predict(path_to_model=self._model)
+            fallback_proba = None
+            if not hasattr(prediction, "proba") and hasattr(sls, "predict_proba"):
+                try:
+                    fallback_proba = sls.predict_proba(path_to_model=self._model)
+                except Exception:
+                    fallback_proba = None
+            self.finished.emit(prediction, fallback_proba)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 def _make_wave_pen(color: str) -> QtGui.QPen:
@@ -1044,6 +1094,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_bad_segments: Dict[Tuple[str, int], List[Tuple[float, float, str]]] = {}
         self._offline_view_active = False  ## 离线分层波形查看中
         self._analysis_plot_active = False  ## 功率对比图显示中
+        self._yasa_thread: Optional[QtCore.QThread] = None
+        self._yasa_worker: Optional[YasaSleepStagingWorker] = None
+        self._yasa_pending_context: Optional[Dict[str, object]] = None
         self._assr_raw: List[int] = []
         self._assr_params: Optional[AssrParams] = None
         self._assr_recording = False
@@ -1354,19 +1407,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """Bind Designer-defined offline viewer controls."""
         edit = self.ui.lineEdit_offline_path
         if not edit.text().strip():
-            edit.setPlaceholderText("选 CSV/EDF：CSV *_full=完整，无full=剔坏后；EDF 默认读第1通道")
+            edit.setPlaceholderText("选 CSV/EDF/BDF；OpenBCI 请选择 BrainFlow-RAW_*.csv")
         edit.setToolTip(
             "选 eeg_chunk_XXX_full.csv -> 完整原始；选 eeg_chunk_XXX.csv -> 剔坏后；"
-            "EDF/BDF 默认读取第1个信号通道。"
+            "EDF/BDF 和 BrainFlow-RAW_*.csv 支持通道和窗口浏览；OpenBCI-RAW-*.txt 不作为分析输入。"
         )
         self.ui.lineEdit_offline_min_start.setToolTip(
-            "CSV 按第 1 分钟起计；EDF/BDF 按 0.0 分钟起计。"
+            "本机 CSV 按第 1 分钟起计；EDF/BDF/BrainFlow-RAW 按 0.0 分钟起计；"
+            "BrainFlow-RAW 留空表示加载当前通道完整时间轴。"
         )
         self.ui.lineEdit_offline_min_end.setToolTip(
-            "CSV 例如 1 与 25；EDF/BDF 支持一位小数，例如 0.0 与 0.5。"
+            "本机 CSV 例如 1 与 25；EDF/BDF/BrainFlow-RAW 支持一位小数，例如 0.0 与 0.5；"
+            "BrainFlow-RAW 留空表示加载当前通道完整时间轴。"
         )
         self.ui.pushButton_load_offline.setToolTip(
-            "*_full -> 完整；无 _full -> 剔坏后；EDF/BDF 支持通道和窗口浏览"
+            "*_full -> 完整；无 _full -> 剔坏后；OpenBCI 请选 BrainFlow-RAW_*.csv"
         )
         self.ui.pushButton_clear_offline.setToolTip("退出离线查看，回到实时波形")
 
@@ -1375,6 +1430,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_y_label = self.ui.label_offline_y_axis
         self._offline_y_min_edit = self.ui.lineEdit_offline_y_min
         self._offline_y_max_edit = self.ui.lineEdit_offline_y_max
+        self._sync_offline_y_axis_controls()
 
         self._offline_prev_button = self._offline_view.prev_button
         self._offline_next_button = self._offline_view.next_button
@@ -1636,6 +1692,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._yasa_csv_baseline_value_edit = self._sleep_feature_ui.lineEdit_yasa_csv_baseline_value
         self._yasa_csv_uv_per_count_edit = self._sleep_feature_ui.lineEdit_yasa_csv_uv_per_count
         self._yasa_sync_features_check = self._sleep_feature_ui.checkBox_yasa_sync_features
+        self._yasa_hypnogram_button = QtWidgets.QPushButton("刷新睡眠阶段图", self._sleep_feature_ui.tab_yasa_sleep_staging)
+        self._yasa_hypnogram_view = _MatplotlibHostView(
+            self._sleep_feature_ui.tab_yasa_sleep_staging,
+            empty_message="运行 YASA 后显示睡眠阶段图",
+        )
+        self._yasa_hypnogram_view.setMinimumHeight(220)
+        yasa_layout = self._sleep_feature_ui.verticalLayout_yasa_staging
+        insert_at = max(0, yasa_layout.count() - 1)
+        yasa_layout.insertWidget(insert_at, self._yasa_hypnogram_button)
+        yasa_layout.insertWidget(insert_at + 1, self._yasa_hypnogram_view, stretch=1)
         self._setup_spindle_sigma_runtime_ui()
         self._setup_slow_wave_runtime_ui()
         self._sleep_feature_ui.pushButton_sleep_plot_band_power_trend.clicked.connect(
@@ -1650,6 +1716,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._sleep_feature_ui.pushButton_yasa_run_staging.clicked.connect(
             self._run_yasa_sleep_staging
         )
+        self._yasa_eeg_combo.currentIndexChanged.connect(
+            self._plot_yasa_hypnogram_from_current_rows
+        )
+        self._yasa_hypnogram_button.clicked.connect(self._plot_yasa_hypnogram_from_current_rows)
         self._sleep_feature_ui.pushButton_spindle_sigma_mark.clicked.connect(
             self._run_yasa_spindle_refinement
         )
@@ -1822,6 +1892,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def _show_sleep_feature_analysis_dialog(self) -> None:
         self._refresh_sleep_feature_dialog()
+        self._plot_yasa_hypnogram_from_current_rows()
         self._sleep_feature_dialog.show()
         self._sleep_feature_dialog.raise_()
         self._sleep_feature_dialog.activateWindow()
@@ -1830,7 +1901,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._sleep_channel_combo.blockSignals(True)
         self._sleep_channel_combo.clear()
         path = getattr(self, "_offline_csv_path", None)
-        if path is not None and self._is_edf_like_file(path) and self._offline_file_info is not None:
+        if path is not None and self._supports_offline_channel_browse(path) and self._offline_file_info is not None:
             for index, label in enumerate(self._offline_file_info.channel_labels):
                 unit = (
                     self._offline_file_info.channel_units[index]
@@ -1846,7 +1917,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             label = getattr(self, "_offline_full_label", "CH1") or "CH1"
             self._sleep_channel_combo.addItem(label, 0)
         self._sleep_channel_combo.blockSignals(False)
-        if path is not None and self._is_edf_like_file(path):
+        if path is not None and self._supports_offline_channel_browse(path):
             duration_s = (
                 float(self._offline_full_raw.size / self._offline_full_fs)
                 if self._offline_full_fs > 0
@@ -1863,6 +1934,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sleep_end_sec_edit.setPlaceholderText(f"{end_s:.1f}")
         self._refresh_yasa_channel_combos()
         self._refresh_sleep_epoch_feature_tabs()
+        self._plot_yasa_hypnogram_from_current_rows()
 
     def _current_sleep_channel_index(self) -> int:
         try:
@@ -1880,7 +1952,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _sleep_feature_channel_items(self) -> List[Tuple[int, str]]:
         items: List[Tuple[int, str]] = []
         path = getattr(self, "_offline_csv_path", None)
-        if path is not None and self._is_edf_like_file(path) and self._offline_file_info is not None:
+        if path is not None and self._supports_offline_channel_browse(path) and self._offline_file_info is not None:
             for index, label in enumerate(self._offline_file_info.channel_labels):
                 items.append((index, self._clean_channel_tab_label(label, f"CH{index + 1}")))
         else:
@@ -1938,6 +2010,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         for idx in range(self._sleep_epoch_feature_tabs.count()):
             if self._sleep_epoch_feature_tabs.widget(idx) is table:
                 self._sleep_epoch_feature_tabs.setCurrentIndex(idx)
+                self._plot_yasa_hypnogram_from_current_rows()
                 return
 
     def _refresh_yasa_channel_combos(self) -> None:
@@ -1947,7 +2020,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             combo.blockSignals(True)
             combo.clear()
         try:
-            if path is not None and self._is_edf_like_file(path) and self._offline_file_info is not None:
+            if path is not None and self._supports_offline_channel_browse(path) and self._offline_file_info is not None:
                 labels = list(self._offline_file_info.channel_labels)
                 for index, label in enumerate(labels):
                     self._yasa_eeg_combo.addItem(label, index)
@@ -1981,12 +2054,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         path = getattr(self, "_offline_csv_path", None)
         channel_index = int(self._sleep_channel_combo.currentData() or 0)
         try:
-            if path is not None and self._is_edf_like_file(path):
+            if path is not None and self._supports_offline_channel_browse(path):
                 if channel_index == self._offline_loaded_channel:
                     raw = np.asarray(self._offline_full_raw, dtype=np.float64)
                     fs = float(self._offline_full_fs)
                     if raw.size < 8 or fs <= 0:
-                        self._log("睡眠特征分析：当前 EDF 通道完整数据无效")
+                        self._log("睡眠特征分析：当前离线通道完整数据无效")
                         return None
                     return raw, fs, 0.0, self._offline_full_label, self._offline_full_unit
                 raw, fs, label, unit = load_eeg_file_channel(path, channel_index)
@@ -2155,6 +2228,102 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return [float(v) for v in np.nanmax(arr, axis=1)]
         return []
 
+    def _current_yasa_eeg_channel_index(self) -> int:
+        try:
+            data = self._yasa_eeg_combo.currentData()
+            if data is not None:
+                return int(data)
+        except Exception:
+            pass
+        return self._current_sleep_channel_index()
+
+    @staticmethod
+    def _stage_to_hypnogram_y(stage: object) -> Optional[int]:
+        text = str(stage or "").strip().upper()
+        mapping = {
+            "R": 0,
+            "REM": 0,
+            "N3": 1,
+            "N2": 2,
+            "N1": 3,
+            "W": 4,
+            "WAKE": 4,
+        }
+        return mapping.get(text)
+
+    def _plot_yasa_hypnogram_from_current_rows(self, *_args) -> None:
+        channel_index = self._current_yasa_eeg_channel_index()
+        rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+        if not rows:
+            rows = list(getattr(self, "_sleep_epoch_feature_rows", []) or [])
+        label = self._sleep_epoch_feature_labels_by_channel.get(
+            channel_index,
+            self._clean_channel_tab_label(getattr(self, "_offline_full_label", "EEG"), f"CH{channel_index + 1}"),
+        )
+        self._plot_yasa_hypnogram(rows, str(label or "EEG"))
+
+    def _plot_yasa_hypnogram(self, rows: List[Dict[str, object]], label: str) -> None:
+        view = getattr(self, "_yasa_hypnogram_view", None)
+        if view is None:
+            return
+        segments: List[Tuple[float, float, int, float]] = []
+        for row in rows:
+            y = self._stage_to_hypnogram_y(row.get("stage_yasa", ""))
+            if y is None:
+                continue
+            try:
+                start_s = float(row.get("start_s", np.nan))
+                end_s = float(row.get("end_s", np.nan))
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(start_s) and np.isfinite(end_s)) or end_s <= start_s:
+                continue
+            try:
+                confidence = float(row.get("yasa_confidence", np.nan))
+            except (TypeError, ValueError):
+                confidence = np.nan
+            segments.append((start_s, end_s, int(y), confidence))
+        if not segments:
+            view._draw_empty("暂无 YASA 睡眠阶段结果")
+            return
+        segments.sort(key=lambda item: item[0])
+        t0 = min(start for start, _end, _y, _conf in segments)
+        t1 = max(end for _start, end, _y, _conf in segments)
+        scale = 3600.0 if (t1 - t0) >= 7200.0 else 60.0
+        x_label = "Time (h)" if scale == 3600.0 else "Time (min)"
+        fig = view.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        color = "#3F6FD8"
+        previous: Optional[Tuple[float, int]] = None
+        confidences: List[float] = []
+        for start_s, end_s, y, confidence in segments:
+            x0 = (start_s - t0) / scale
+            x1 = (end_s - t0) / scale
+            alpha = 0.9
+            if np.isfinite(confidence):
+                confidences.append(float(confidence))
+                alpha = max(0.35, min(0.95, 0.25 + 0.75 * float(confidence)))
+            ax.hlines(y, x0, x1, color=color, linewidth=2.0, alpha=alpha)
+            if previous is not None:
+                prev_x, prev_y = previous
+                if abs(prev_x - x0) < 1e-6 and prev_y != y:
+                    ax.vlines(x0, min(prev_y, y), max(prev_y, y), color=color, linewidth=0.8, alpha=0.25)
+            previous = (x1, y)
+        ax.set_yticks([0, 1, 2, 3, 4])
+        ax.set_yticklabels(["REM", "N3", "N2", "N1", "Wake"])
+        ax.set_ylim(-0.5, 4.5)
+        ax.set_xlim(0.0, max((t1 - t0) / scale, 1e-6))
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Stage")
+        ax.grid(True, axis="x", alpha=0.25)
+        ax.grid(True, axis="y", alpha=0.12)
+        mean_conf = float(np.nanmean(confidences)) if confidences else np.nan
+        conf_tip = f" | mean confidence {mean_conf:.3f}" if np.isfinite(mean_conf) else ""
+        ax.set_title(f"YASA hypnogram · {label} · {len(segments)} epochs{conf_tip}", fontsize=10)
+        fig.tight_layout()
+        view.refresh()
+
     def _sync_sleep_channel_to_yasa_eeg(self) -> None:
         eeg_index = self._yasa_eeg_combo.currentData()
         if eeg_index is None:
@@ -2214,10 +2383,40 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         ch_types: List[str] = []
         data_rows: List[np.ndarray] = []
         fs_values: List[float] = []
+        window_loaded = False
+        preloaded_channels: Dict[int, tuple[np.ndarray, float, str, str, float]] = {}
+        if path is not None and self._supports_offline_channel_browse(path):
+            if not self._is_edf_like_file(path) and is_openbci_brainflow_eeg_file(path):
+                selected_indices = [int(eeg_index or 0)]
+                if eog_index is not None:
+                    selected_indices.append(int(eog_index))
+                if emg_index is not None:
+                    selected_indices.append(int(emg_index))
+                unique_indices = list(dict.fromkeys(selected_indices))
+                loaded = load_eeg_file_channels_window(
+                    path,
+                    unique_indices,
+                    start_s=float(start_s),
+                    duration_s=max(0.0, float(end_s - start_s)),
+                )
+                preloaded_channels = dict(zip(unique_indices, loaded))
+                window_loaded = True
 
         def _append_channel(index: int, ch_type: str, fallback_label: str) -> str:
-            if path is not None and self._is_edf_like_file(path):
-                raw_i, fs_i, label_i, unit_i = load_eeg_file_channel(path, int(index))
+            nonlocal window_loaded
+            if path is not None and self._supports_offline_channel_browse(path):
+                if int(index) in preloaded_channels:
+                    raw_i, fs_i, label_i, unit_i, _actual_start_s = preloaded_channels[int(index)]
+                elif not self._is_edf_like_file(path) and is_openbci_brainflow_eeg_file(path):
+                    raw_i, fs_i, label_i, unit_i, _actual_start_s = load_eeg_file_channel_window(
+                        path,
+                        int(index),
+                        start_s=float(start_s),
+                        duration_s=max(0.0, float(end_s - start_s)),
+                    )
+                    window_loaded = True
+                else:
+                    raw_i, fs_i, label_i, unit_i = load_eeg_file_channel(path, int(index))
                 label = str(label_i or fallback_label)
             else:
                 raw_i = np.asarray(getattr(self, "_offline_current_raw", np.zeros(0)), dtype=np.float64)
@@ -2227,6 +2426,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             arr = np.asarray(raw_i, dtype=np.float64)
             fs_values.append(float(fs_i))
             unit_text = str(unit_i)
+            issue = self._offline_signal_quality_issue(
+                arr,
+                float(fs_i),
+                unit_text,
+                purpose=f"YASA {label}",
+            )
+            if issue:
+                raise ValueError(issue)
             if (
                 path is not None
                 and not self._is_edf_like_file(path)
@@ -2279,12 +2486,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         data = np.vstack([row[:n] for row in resampled_rows])
         info = mne.create_info(names, sfreq=target_fs, ch_types=ch_types)
         raw_mne = mne.io.RawArray(data, info, verbose="ERROR")
-        tmax = max(start_s, min(end_s, raw_mne.times[-1]))
-        raw_mne = raw_mne.crop(tmin=float(start_s), tmax=tmax, include_tmax=False)
+        if window_loaded:
+            tmax = max(0.0, min(float(end_s - start_s), raw_mne.times[-1]))
+            raw_mne = raw_mne.crop(tmin=0.0, tmax=tmax, include_tmax=False)
+        else:
+            tmax = max(start_s, min(end_s, raw_mne.times[-1]))
+            raw_mne = raw_mne.crop(tmin=float(start_s), tmax=tmax, include_tmax=False)
         return raw_mne, eeg_name, eog_name, emg_name, target_fs
 
     @QtCore.pyqtSlot()
     def _run_yasa_sleep_staging(self) -> None:
+        if self._yasa_thread is not None:
+            self._log("YASA 自动睡眠分期仍在后台运行，请等待当前任务完成")
+            return
         self._sync_sleep_channel_to_yasa_eeg()
         data = self._sleep_feature_data()
         if data is None:
@@ -2299,39 +2513,109 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
             if abs(epoch_s - 30.0) > 1e-6 or abs(hop_s - 30.0) > 1e-6:
                 raise ValueError("YASA SleepStaging 官方输出固定 30 秒 epoch；请将 epoch=30、hop=30 后再运行")
-            try:
-                import yasa  # type: ignore
-            except ImportError:
-                self._log("未安装 yasa，请先运行：python -m pip install yasa==0.6.5")
-                return
+            yasa_duration_s = float(end_s - start_s)
+            if yasa_duration_s > 14400.0:
+                self._log(
+                    "当前 YASA 范围超过 4 小时，计算期间界面可能短暂无响应；"
+                    "如需更稳可在睡眠特征页填写起止秒/分钟分段运行"
+                )
             channel_index = self._current_sleep_channel_index()
             current_rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
             if not current_rows and self._yasa_sync_features_check.isChecked():
-                self._generate_sleep_epoch_feature_table()
-                current_rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+                if yasa_duration_s <= 1800.0:
+                    self._generate_sleep_epoch_feature_table()
+                    current_rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+                else:
+                    self._log(
+                        "YASA 范围超过 30 分钟，已跳过自动生成 MNE epoch 特征表；"
+                        "先写入基础 stage_yasa 行，避免主线程长时间卡死"
+                    )
+            self._log(
+                f"YASA 正在准备数据: {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s"
+            )
+            QtWidgets.QApplication.processEvents()
             raw_mne, eeg_name, eog_name, emg_name, _fs = self._make_yasa_raw_from_ui(
                 start_s=start_s,
                 end_s=end_s,
             )
             metadata = self._yasa_metadata_from_ui()
-            sls = yasa.SleepStaging(
+            model = self._yasa_model_edit.text().strip() or "auto"
+            self._yasa_pending_context = {
+                "channel_index": channel_index,
+                "current_rows": list(current_rows),
+                "label": label,
+                "offset_s": float(offset_s),
+                "start_s": float(start_s),
+                "end_s": float(end_s),
+            }
+            thread = QtCore.QThread(self)
+            worker = YasaSleepStagingWorker(
                 raw_mne,
                 eeg_name=eeg_name,
                 eog_name=eog_name,
                 emg_name=emg_name,
                 metadata=metadata,
+                model=model,
             )
-            model = self._yasa_model_edit.text().strip() or "auto"
-            prediction = sls.predict(path_to_model=model)
-            fallback_proba = None
-            if not hasattr(prediction, "proba") and hasattr(sls, "predict_proba"):
-                try:
-                    fallback_proba = sls.predict_proba(path_to_model=model)
-                except Exception:
-                    fallback_proba = None
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.finished.connect(self._finish_yasa_sleep_staging)
+            worker.failed.connect(self._fail_yasa_sleep_staging)
+            worker.finished.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            worker.failed.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._clear_yasa_worker_refs)
+            self._yasa_thread = thread
+            self._yasa_worker = worker
+            self._set_yasa_running(True)
+            thread.start()
+            self._log(
+                f"YASA 后台分期已启动: EEG={eeg_name}"
+                f"{', EOG=' + eog_name if eog_name else ''}"
+                f"{', EMG=' + emg_name if emg_name else ''}"
+            )
+        except Exception as exc:
+            self._yasa_pending_context = None
+            self._set_yasa_running(False)
+            self._log(f"YASA 自动睡眠分期失败: {exc}")
+
+    def _set_yasa_running(self, running: bool) -> None:
+        button = getattr(self._sleep_feature_ui, "pushButton_yasa_run_staging", None)
+        if button is None:
+            return
+        button.setEnabled(not running)
+        button.setText("YASA运行中..." if running else "运行YASA自动分期并更新特征表")
+
+    @QtCore.pyqtSlot()
+    def _clear_yasa_worker_refs(self) -> None:
+        self._yasa_thread = None
+        self._yasa_worker = None
+        self._set_yasa_running(False)
+
+    @QtCore.pyqtSlot(str)
+    def _fail_yasa_sleep_staging(self, message: str) -> None:
+        self._yasa_pending_context = None
+        self._log(f"YASA 自动睡眠分期失败: {message}")
+
+    @QtCore.pyqtSlot(object, object)
+    def _finish_yasa_sleep_staging(self, prediction: object, fallback_proba: object) -> None:
+        context = self._yasa_pending_context
+        self._yasa_pending_context = None
+        if not context:
+            self._log("YASA 自动睡眠分期完成，但上下文已失效，未写回特征表")
+            return
+        try:
             stages = self._yasa_hypnogram_labels(prediction)
             confidence = self._yasa_prediction_confidence(prediction, fallback_proba)
-            rows = list(current_rows)
+            channel_index = int(context.get("channel_index", 0))
+            current_rows = context.get("current_rows", [])
+            rows = list(current_rows) if isinstance(current_rows, list) else []
+            label = str(context.get("label", "EEG"))
+            offset_s = float(context.get("offset_s", 0.0))
+            start_s = float(context.get("start_s", 0.0))
+            end_s = float(context.get("end_s", start_s + len(stages) * 30.0))
             if not rows:
                 rows = [
                     {
@@ -2363,12 +2647,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
             self._sleep_epoch_feature_rows = rows
             self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            self._plot_yasa_hypnogram(rows, self._sleep_epoch_feature_labels_by_channel[channel_index])
             self._log(f"YASA 分期写回特征表: {matched_count}/{len(rows)} 行")
             self._log(
                 f"YASA 自动睡眠分期完成: {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s | {len(stages)} 个 30s epoch"
             )
         except Exception as exc:
-            self._log(f"YASA 自动睡眠分期失败: {exc}")
+            self._log(f"YASA 分期结果写回失败: {exc}")
 
     @staticmethod
     def _stage_to_yasa_code(stage: object) -> int:
@@ -2525,6 +2810,94 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                 table.setItem(idx, col, item)
         table.resizeColumnsToContents()
+
+    def _log_spindle_zero_diagnostics(
+        self,
+        data_uv: np.ndarray,
+        fs: float,
+        rows: List[Dict[str, object]],
+        *,
+        origin_abs_s: float,
+        freq_sp: Tuple[float, float],
+        freq_broad: Tuple[float, float],
+    ) -> None:
+        arr = np.asarray(data_uv, dtype=np.float64).reshape(-1)
+        if arr.size < max(8, int(round(float(fs) * 2.0))):
+            return
+        epoch_stats: List[Dict[str, object]] = []
+        for row in rows:
+            try:
+                start_abs = float(row.get("start_s", 0.0))
+                end_abs = float(row.get("end_s", start_abs))
+            except (TypeError, ValueError):
+                continue
+            i0 = max(0, int(round((start_abs - origin_abs_s) * fs)))
+            i1 = min(arr.size, int(round((end_abs - origin_abs_s) * fs)))
+            seg = arr[i0:i1]
+            finite = seg[np.isfinite(seg)]
+            if finite.size < max(8, int(round(float(fs) * 2.0))):
+                continue
+            finite = finite - float(np.median(finite))
+            nperseg = min(finite.size, max(8, int(round(min(4.0, finite.size / float(fs)) * fs))))
+            freqs, psd = welch(finite, fs=float(fs), nperseg=nperseg, detrend="constant")
+
+            def _band_power(low: float, high: float) -> float:
+                mask = (freqs >= low) & (freqs <= high)
+                return float(np.trapz(psd[mask], freqs[mask])) if np.any(mask) else 0.0
+
+            broad = _band_power(float(freq_broad[0]), float(freq_broad[1]))
+            sigma = _band_power(float(freq_sp[0]), float(freq_sp[1]))
+            rel_pct = sigma / broad * 100.0 if broad > 0 else np.nan
+            rms_uv = float(np.sqrt(max(0.0, sigma * (float(freq_sp[1]) - float(freq_sp[0])))))
+            epoch_stats.append(
+                {
+                    "epoch": row.get("epoch", ""),
+                    "start_s": start_abs,
+                    "stage": str(row.get("stage_yasa", "") or ""),
+                    "rel_pct": rel_pct,
+                    "rms_uv": rms_uv,
+                }
+            )
+        if not epoch_stats:
+            return
+        rel = np.asarray([float(item["rel_pct"]) for item in epoch_stats], dtype=np.float64)
+        rms = np.asarray([float(item["rms_uv"]) for item in epoch_stats], dtype=np.float64)
+        finite_rel = rel[np.isfinite(rel)]
+        finite_rms = rms[np.isfinite(rms)]
+        if finite_rel.size == 0 or finite_rms.size == 0:
+            return
+        self._log(
+            f"spindle诊断: sigma {freq_sp[0]:g}-{freq_sp[1]:g}Hz 相对功率 "
+            f"median={np.nanmedian(finite_rel):.2f}%, p90={np.nanpercentile(finite_rel, 90):.2f}%, "
+            f"max={np.nanmax(finite_rel):.2f}%; sigma RMS median={np.nanmedian(finite_rms):.3g} uV, "
+            f"p90={np.nanpercentile(finite_rms, 90):.3g} uV"
+        )
+        for stage in ("N2", "N3"):
+            vals = [
+                item
+                for item in epoch_stats
+                if str(item.get("stage", "")).upper() == stage and np.isfinite(float(item["rel_pct"]))
+            ]
+            if vals:
+                stage_rel = np.asarray([float(item["rel_pct"]) for item in vals], dtype=np.float64)
+                stage_rms = np.asarray([float(item["rms_uv"]) for item in vals], dtype=np.float64)
+                self._log(
+                    f"spindle诊断 {stage}: rel median={np.nanmedian(stage_rel):.2f}%, "
+                    f"max={np.nanmax(stage_rel):.2f}%; RMS median={np.nanmedian(stage_rms):.3g} uV, "
+                    f"max={np.nanmax(stage_rms):.3g} uV"
+                )
+        top = sorted(
+            epoch_stats,
+            key=lambda item: float(item["rel_pct"]) if np.isfinite(float(item["rel_pct"])) else -1.0,
+            reverse=True,
+        )[:5]
+        top_text = "; ".join(
+            f"#{item['epoch']} {float(item['start_s']):.0f}s {item['stage']} "
+            f"rel={float(item['rel_pct']):.1f}% rms={float(item['rms_uv']):.2g}uV"
+            for item in top
+        )
+        if top_text:
+            self._log(f"spindle诊断 top sigma epoch: {top_text}")
 
     def _detect_kcomplex_candidates(
         self,
@@ -2994,9 +3367,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
             summary = result.summary() if result is not None else None
             events = self._spindle_events_from_summary(summary)
+            data_uv = np.asarray(raw_crop.get_data(picks=[0])[0], dtype=np.float64) * 1e6
             k_events: List[Dict[str, float]] = []
             if self._kcomplex_enable_check.isChecked():
-                data_uv = np.asarray(raw_crop.get_data(picks=[0])[0], dtype=np.float64) * 1e6
                 k_events = self._detect_kcomplex_candidates(
                     data_uv,
                     float(raw_crop.info["sfreq"]),
@@ -3018,6 +3391,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"Spindle/K-complex 检测完成: {label} | {origin_abs_s:.1f}-{offset_s + end_s:.1f}s | "
                 f"spindle {len(events)} 个, K-complex {len(k_events)} 个 | 修正 {refined} 个 epoch"
             )
+            if not events:
+                self._log(
+                    "未检出 spindle：请确认输入是原始 BrainFlow-RAW_*.csv 波形而不是 sleep_epoch_features 表；"
+                    "若输入无误，优先尝试 C3/C4 或 F3/F4，或临时关闭 stage_yasa 约束、放宽频段到 11-16 Hz/降低阈值后复核"
+                )
+                self._log_spindle_zero_diagnostics(
+                    data_uv,
+                    float(raw_crop.info["sfreq"]),
+                    rows,
+                    origin_abs_s=origin_abs_s,
+                    freq_sp=freq_sp,
+                    freq_broad=freq_broad,
+                )
         except Exception as exc:
             self._log(f"Spindle/K-complex 检测/分期修正失败: {exc}")
 
@@ -3092,6 +3478,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         raw, fs, offset_s, label, unit = data
         try:
+            issue = self._offline_signal_quality_issue(
+                raw,
+                fs,
+                unit,
+                purpose="睡眠Epoch特征表",
+            )
+            if issue:
+                self._log(issue)
+                return
             start_s, end_s, epoch_s, hop_s, bands = self._read_sleep_trend_params(
                 raw,
                 fs,
@@ -3215,6 +3610,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         raw, fs, offset_s, label, _unit = data
         try:
+            issue = self._offline_signal_quality_issue(
+                raw,
+                fs,
+                _unit,
+                purpose="睡眠频段功率趋势",
+            )
+            if issue:
+                self._log(issue)
+                return
             start_s, end_s, epoch_s, hop_s, bands = self._read_sleep_trend_params(raw, fs, offset_s)
             if self._sleep_exclude_bad_check.isChecked():
                 mask = self._bad_mask_for_data(raw, fs, offset_s)
@@ -3309,10 +3713,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log("请先加载离线文件，再选择完整文件/当前通道 PSD")
             return None
         try:
-            if self._is_edf_like_file(path):
+            if self._supports_offline_channel_browse(path):
                 raw = np.asarray(self._offline_full_raw, dtype=np.float64)
                 fs = float(self._offline_full_fs)
-                title = f"{path.name} | {self._offline_full_label} | full"
+                title_suffix = "full" if self._is_edf_like_file(path) else "current window"
+                title = f"{path.name} | {self._offline_full_label} | {title_suffix}"
                 y_label = self._offline_full_unit
             else:
                 raw, fs = load_eeg_csv_with_rate(path)
@@ -3626,7 +4031,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         data = self._current_psd_data(self._custom_psd_source_combo.currentIndex())
         if data is None:
             return
-        raw, fs, offset_s, title, _y_label = data
+        raw, fs, offset_s, title, y_label = data
         try:
             duration_s = raw.size / fs
             start_s, end_s = self._read_relative_seconds_range(
@@ -3652,6 +4057,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     segment = segment[~segment_mask]
             if segment.size < 8:
                 raise ValueError("排除坏段后有效样本过少")
+            issue = self._offline_signal_quality_issue(
+                segment,
+                fs,
+                y_label,
+                purpose="自定义PSD",
+            )
+            if issue:
+                self._log(issue)
+                return
             analysis = compute_band_powers(segment, sample_rate=fs, welch_seconds=welch_seconds)
             plot_band_powers(
                 analysis,
@@ -3696,6 +4110,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     duration_s=duration_s,
                 )
             mne_tmax = max(start_s, min(end_s, duration_s - 1.0 / fs))
+            i0 = max(0, int(round(start_s * fs)))
+            i1 = min(int(raw.size), int(round(end_s * fs)))
+            issue = self._offline_signal_quality_issue(
+                raw[i0:i1],
+                fs,
+                y_label,
+                purpose="MNE PSD",
+            )
+            if issue:
+                self._log(issue)
+                return
             scale = self._mne_unit_scale(y_label)
             data_v = (raw.astype(np.float64, copy=False) * scale).reshape(1, -1)
             info = mne.create_info(["EEG"], sfreq=fs, ch_types=["eeg"])
@@ -3722,8 +4147,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             if fmax <= fmin or n_fft_sec <= 0:
                 raise ValueError("fmax必须大于fmin，n_fft秒必须大于0")
             if method == "welch":
-                n_fft = max(8, int(round(n_fft_sec * fs)))
-                n_overlap = int(round(n_fft * max(0.0, min(overlap_pct, 95.0)) / 100.0))
+                selected_samples = max(8, int(round((mne_tmax - start_s) * fs)) + 1)
+                requested_n_fft = max(8, int(round(n_fft_sec * fs)))
+                n_per_seg = max(8, min(requested_n_fft, selected_samples))
+                n_fft = n_per_seg
+                overlap_ratio = max(0.0, min(overlap_pct, 95.0)) / 100.0
+                n_overlap = int(round(n_per_seg * overlap_ratio))
+                n_overlap = max(0, min(n_overlap, n_per_seg - 1))
+                reject_by_annotation = self._mne_psd_reject_annot_check.isChecked()
+                if reject_by_annotation and n_overlap > 0:
+                    n_overlap = 0
+                    self._log(
+                        "MNE PSD 排除坏段时检测到分段好数据，已自动将 Welch overlap 设为 0，"
+                        "避免短好段触发 noverlap >= nperseg"
+                    )
                 spectrum = raw_mne.compute_psd(
                     method="welch",
                     fmin=fmin,
@@ -3731,11 +4168,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     tmin=start_s,
                     tmax=mne_tmax,
                     n_fft=n_fft,
-                    n_per_seg=n_fft,
+                    n_per_seg=n_per_seg,
                     n_overlap=n_overlap,
                     average=average,
                     remove_dc=self._mne_psd_remove_dc_check.isChecked(),
-                    reject_by_annotation=self._mne_psd_reject_annot_check.isChecked(),
+                    reject_by_annotation=reject_by_annotation,
                     verbose="ERROR",
                 )
             else:
@@ -3783,6 +4220,83 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if unit == "mv":
             return 1e-3
         return 1.0
+
+    @staticmethod
+    def _openbci_quality_stats(raw: np.ndarray, unit: str) -> Optional[Dict[str, float]]:
+        unit_text = str(unit or "").strip().lower().replace("μ", "u")
+        if unit_text not in {"uv", "µv", "microv"}:
+            return None
+        arr = np.asarray(raw, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        if finite.size < 8:
+            return None
+        rail_uv = 187500.02235174447
+        rail_mask = np.isclose(np.abs(finite), rail_uv, rtol=0.0, atol=1.0)
+        zero_mask = np.isclose(finite, 0.0, rtol=0.0, atol=1e-12)
+        return {
+            "rail_pct": float(np.count_nonzero(rail_mask) / finite.size * 100.0),
+            "zero_pct": float(np.count_nonzero(zero_mask) / finite.size * 100.0),
+            "ptp": float(np.ptp(finite)),
+            "median": float(np.median(finite)),
+        }
+
+    def _offline_signal_quality_issue(
+        self,
+        raw: np.ndarray,
+        fs: float,
+        unit: str,
+        *,
+        purpose: str,
+    ) -> Optional[str]:
+        arr = np.asarray(raw, dtype=np.float64)
+        if arr.size < 8 or fs <= 0:
+            return f"{purpose}: 有效样本过少或采样率无效"
+        finite = arr[np.isfinite(arr)]
+        if finite.size < 8:
+            return f"{purpose}: 有限样本过少"
+        nonfinite_pct = (1.0 - finite.size / max(1, arr.size)) * 100.0
+        if nonfinite_pct > 5.0:
+            return f"{purpose}: 非有限值占比 {nonfinite_pct:.1f}%，请先处理坏段"
+        stats = self._openbci_quality_stats(finite, unit)
+        if stats is not None:
+            rail_pct = stats["rail_pct"]
+            zero_pct = stats["zero_pct"]
+            if rail_pct >= 20.0:
+                return (
+                    f"{purpose}: OpenBCI rail 饱和值占比 {rail_pct:.1f}%"
+                    f"（约 ±187500 uV），电极/参考/增益可能异常，当前段不适合 PSD 或睡眠分析"
+                )
+            if rail_pct + zero_pct >= 50.0 and stats["ptp"] < 5.0:
+                return (
+                    f"{purpose}: OpenBCI rail/zero 样本占比 {rail_pct + zero_pct:.1f}%，"
+                    "当前段近似无有效 EEG 波动"
+                )
+        if float(np.ptp(finite)) <= 1e-12:
+            return f"{purpose}: 信号动态范围近似为 0，无法进行频谱分析"
+        return None
+
+    def _log_offline_signal_quality_summary(
+        self,
+        raw: np.ndarray,
+        fs: float,
+        label: str,
+        unit: str,
+    ) -> None:
+        issue = self._offline_signal_quality_issue(
+            raw,
+            fs,
+            unit,
+            purpose=f"{label} 数据质量",
+        )
+        if issue:
+            self._log(issue)
+            return
+        stats = self._openbci_quality_stats(np.asarray(raw, dtype=np.float64), unit)
+        if stats is not None and (stats["rail_pct"] > 0.0 or stats["zero_pct"] > 0.0):
+            self._log(
+                f"{label} OpenBCI 质量提示: rail {stats['rail_pct']:.1f}%, "
+                f"zero {stats['zero_pct']:.1f}%, ptp {stats['ptp']:.3g} {unit}"
+            )
 
     def _make_mne_raw_from_current(self):
         current = self._current_offline_raw_for_mne()
@@ -4243,6 +4757,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _is_edf_like_file(path: Path) -> bool:
         return path.suffix.lower() in {".edf", ".bdf"}
 
+    def _supports_offline_channel_browse(self, path: Path) -> bool:
+        if self._is_edf_like_file(path):
+            return True
+        info = getattr(self, "_offline_file_info", None)
+        loaded_path = getattr(self, "_offline_csv_path", None)
+        if loaded_path == path and info is not None and len(getattr(info, "channel_labels", [])) > 1:
+            return True
+        try:
+            return len(load_eeg_file_info(path).channel_labels) > 1
+        except Exception:
+            return False
+
     def _populate_offline_channels(self, path: Path) -> None:
         info = load_eeg_file_info(path)
         self._offline_file_info = info
@@ -4257,7 +4783,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
         self._offline_channel_combo.setCurrentIndex(0)
         self._offline_channel_combo.setEnabled(
-            self._is_edf_like_file(path) and self._offline_channel_combo.count() > 1
+            self._supports_offline_channel_browse(path)
+            and self._offline_channel_combo.count() > 1
         )
         self._offline_channel_combo.blockSignals(False)
 
@@ -4269,6 +4796,155 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_full_fs = float(fs)
         self._offline_full_label = label
         self._offline_full_unit = unit
+
+    def _load_offline_text_channel_window(
+        self,
+        path: Path,
+        channel_index: int,
+        start_s: float,
+        end_s: Optional[float],
+    ) -> None:
+        duration_s = (
+            None
+            if end_s is None
+            else max(1.0 / max(float(DEFAULT_SAMPLE_RATE), 1.0), float(end_s - start_s))
+        )
+        raw, fs, label, unit, actual_start_s = load_eeg_file_channel_window(
+            path,
+            channel_index,
+            start_s=float(start_s),
+            duration_s=duration_s,
+        )
+        self._offline_loaded_path = path
+        self._offline_loaded_channel = int(channel_index)
+        self._offline_full_raw = np.asarray(raw, dtype=np.float64)
+        self._offline_full_fs = float(fs)
+        self._offline_full_label = label
+        self._offline_full_unit = unit
+        self._offline_text_window_start_s = float(actual_start_s)
+        self._offline_text_window_end_s = float(actual_start_s + self._offline_full_raw.size / max(self._offline_full_fs, 1.0))
+        self._offline_text_full_channel = end_s is None
+
+    def _openbci_display_raw_args(
+        self,
+        raw: np.ndarray,
+        unit: str,
+    ) -> tuple[np.ndarray, str, str, float]:
+        arr = np.asarray(raw, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        baseline = float(np.median(finite)) if finite.size else 0.0
+        display = arr - baseline
+        hidden = 0
+        clip_limit = 0.0
+        finite_display = display[np.isfinite(display)]
+        if finite_display.size >= 32:
+            mad = float(np.median(np.abs(finite_display - np.median(finite_display))))
+            robust_sigma = 1.4826 * mad if mad > 0 else float(np.std(finite_display))
+            p99 = float(np.nanpercentile(np.abs(finite_display), 99.0))
+            clip_limit = max(300.0, p99 * 1.5, robust_sigma * 12.0)
+            outlier_mask = np.isfinite(display) & (np.abs(display) > clip_limit)
+            hidden = int(np.count_nonzero(outlier_mask))
+            if hidden:
+                display = display.copy()
+                display[outlier_mask] = np.nan
+        unit_text = str(unit or "uV")
+        y_label = f"{unit_text} (AC)"
+        note = f"AC display, median removed {baseline:.3g} {unit_text}"
+        if hidden:
+            note += f", display outliers hidden {hidden} pts > {clip_limit:.3g} {unit_text}"
+        return display, y_label, note, baseline
+
+    def _offline_display_raw_kwargs(self, path: Path) -> tuple[str, Optional[np.ndarray], str, Optional[float]]:
+        if not is_openbci_brainflow_eeg_file(path):
+            return self._offline_full_unit, None, "", None
+        display_raw, display_label, display_note, baseline = self._openbci_display_raw_args(
+            self._offline_full_raw,
+            self._offline_full_unit,
+        )
+        return display_label, display_raw, display_note, baseline
+
+    def _load_offline_text_window_file(self, path: Path) -> None:
+        self._offline_csv_path = path
+        self._populate_offline_channels(path)
+        channel_index = max(0, self._offline_channel_combo.currentIndex())
+        start_s, end_s = self._parse_offline_text_window_seconds()
+        self._load_offline_text_channel_window(path, channel_index, start_s, end_s)
+        start_s = float(getattr(self, "_offline_text_window_start_s", 0.0))
+        end_s = float(getattr(self, "_offline_text_window_end_s", start_s))
+        title = f"{path.name} | {self._offline_full_label} | {start_s:.1f}-{end_s:.1f}s"
+        remove_mask = self._offline_bad_mask_for_window(
+            n_samples=self._offline_full_raw.size,
+            fs=self._offline_full_fs,
+            time_offset_s=start_s,
+        )
+        display_label, display_raw, display_note, baseline = self._offline_display_raw_kwargs(path)
+        self._offline_view.load_raw(
+            self._offline_full_raw,
+            self._offline_full_fs,
+            source_name=title,
+            time_offset_s=start_s,
+            remove_mask=remove_mask,
+            y_label=display_label,
+            display_raw=display_raw,
+            display_note=display_note,
+        )
+        self._offline_current_raw = np.asarray(self._offline_full_raw, dtype=np.float64)
+        self._offline_current_fs = float(self._offline_full_fs)
+        self._offline_current_time_offset_s = start_s
+        self._offline_current_title = title
+        self._offline_current_y_label = self._offline_full_unit
+        is_full_channel = bool(getattr(self, "_offline_text_full_channel", False))
+        self._offline_time_slider.blockSignals(True)
+        self._offline_time_slider.setRange(0, 0)
+        self._offline_time_slider.setValue(0)
+        self._offline_time_slider.setEnabled(False)
+        self._offline_time_slider.blockSignals(False)
+        self._offline_prev_button.setEnabled(False)
+        self._offline_next_button.setEnabled(False)
+        self._offline_time_status.setText(
+            (
+                f"{start_s:.1f}-{end_s:.1f} s（完整通道）"
+                if is_full_channel
+                else f"{start_s:.1f}-{end_s:.1f} s（按窗口读取，未整文件载入）"
+            )
+        )
+        self._offline_view.scroll_panel.hide()
+        self._apply_offline_y_limits()
+        self._set_offline_minute_edits(float(start_s), float(end_s))
+        self._finish_show_offline_view(path.name)
+        self._log(
+            f"BrainFlow CSV {'完整通道' if is_full_channel else '窗口'}已加载: {path.name} | "
+            f"通道 {self._offline_full_label} | {self._offline_full_raw.size} 点 @ "
+            f"{self._offline_full_fs:.0f} Hz | {start_s:.1f}-{end_s:.1f}s"
+        )
+        if baseline is not None:
+            self._log(
+                f"BrainFlow CSV 显示已自动去中位数: baseline={baseline:.6g} {self._offline_full_unit}；"
+                "分析仍使用原始数值"
+            )
+        self._log_offline_signal_quality_summary(
+            self._offline_full_raw,
+            self._offline_full_fs,
+            self._offline_full_label,
+            self._offline_full_unit,
+        )
+
+    def _parse_offline_text_window_seconds(self) -> tuple[float, Optional[float]]:
+        start_m = self._parse_one_decimal_minutes(
+            self.ui.lineEdit_offline_min_start.text(), "起始分钟"
+        )
+        end_m = self._parse_one_decimal_minutes(
+            self.ui.lineEdit_offline_min_end.text(), "结束分钟"
+        )
+        if start_m is None and end_m is None:
+            return 0.0, None
+        if start_m is None or end_m is None:
+            raise ValueError("BrainFlow CSV 请同时填写起始分钟和结束分钟；都留空则加载当前通道完整时间轴")
+        start_s = float(start_m) * 60.0
+        end_s = float(end_m) * 60.0
+        if end_s <= start_s:
+            raise ValueError("结束分钟必须大于起始分钟")
+        return start_s, end_s
 
     def _configure_offline_time_slider(self, reset_start: bool) -> None:
         duration_s = (
@@ -4356,7 +5032,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if start_m is None and end_m is None:
             return 0.0, min(float(OFFLINE_EDF_WINDOW_SEC), duration_s)
         if start_m is None or end_m is None:
-            raise ValueError("EDF 离线查看请同时填写起始分钟和结束分钟，或都留空")
+            raise ValueError("多通道离线查看请同时填写起始分钟和结束分钟，或都留空")
         start_s = float(start_m) * 60.0
         end_s = float(end_m) * 60.0
         if end_s <= start_s:
@@ -4365,7 +5041,28 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raise ValueError(f"起始分钟超出文件时长（约 {duration_s / 60.0:.1f} 分钟）")
         return start_s, min(end_s, duration_s)
 
+    def _sync_offline_y_axis_controls(self) -> None:
+        unit = str(
+            getattr(
+                self._offline_view,
+                "_raw_y_label",
+                getattr(self, "_offline_current_y_label", "raw"),
+            )
+            or "raw"
+        ).strip()
+        label = f"Y轴 ({unit})" if unit else "Y轴"
+        self._offline_y_label.setText(label)
+        self._offline_y_min_edit.setPlaceholderText(f"下限 ({unit})" if unit else "下限")
+        self._offline_y_max_edit.setPlaceholderText(f"上限 ({unit})" if unit else "上限")
+        tip = (
+            "按当前离线波形的纵坐标显示单位填写；"
+            f"当前单位为 {unit or '自动'}。两个框都留空则自动缩放。"
+        )
+        self._offline_y_min_edit.setToolTip(tip)
+        self._offline_y_max_edit.setToolTip(tip)
+
     def _apply_offline_y_limits(self) -> None:
+        self._sync_offline_y_axis_controls()
         y_min_text = self._offline_y_min_edit.text().strip()
         y_max_text = self._offline_y_max_edit.text().strip()
         if not y_min_text and not y_max_text:
@@ -4395,6 +5092,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self.ui.lineEdit_offline_min_start.blockSignals(False)
         self.ui.lineEdit_offline_min_end.blockSignals(False)
 
+    def _set_offline_minute_edits(self, start_s: float, end_s: float) -> None:
+        self.ui.lineEdit_offline_min_start.blockSignals(True)
+        self.ui.lineEdit_offline_min_end.blockSignals(True)
+        self.ui.lineEdit_offline_min_start.setText(f"{float(start_s) / 60.0:.1f}")
+        self.ui.lineEdit_offline_min_end.setText(f"{float(end_s) / 60.0:.1f}")
+        self.ui.lineEdit_offline_min_start.blockSignals(False)
+        self.ui.lineEdit_offline_min_end.blockSignals(False)
+
     def _load_offline_edf_file(self, path: Path) -> None:
         self._offline_csv_path = path
         self._populate_offline_channels(path)
@@ -4412,17 +5117,69 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._render_offline_edf_window()
         self._set_offline_minute_edits_from_window()
         self._finish_show_offline_view(path.name)
+        source_kind = "EDF/BDF" if self._is_edf_like_file(path) else "多通道离线文件"
         self._log(
-            f"EDF/BDF 已加载: {path.name} | 通道 {self._offline_full_label} | "
+            f"{source_kind} 已加载: {path.name} | 通道 {self._offline_full_label} | "
             f"{self._offline_full_raw.size} 点 @ {self._offline_full_fs:.0f} Hz"
+        )
+        self._log_offline_signal_quality_summary(
+            self._offline_full_raw,
+            self._offline_full_fs,
+            self._offline_full_label,
+            self._offline_full_unit,
         )
 
     @QtCore.pyqtSlot(int)
     def _on_offline_channel_changed(self, index: int) -> None:
         path = self._offline_csv_path
-        if path is None or not self._offline_view_active or not self._is_edf_like_file(path):
+        if path is None or not self._offline_view_active or not self._supports_offline_channel_browse(path):
             return
         try:
+            if not self._is_edf_like_file(path):
+                start_s = float(getattr(self, "_offline_text_window_start_s", 0.0))
+                end_s = float(getattr(self, "_offline_text_window_end_s", start_s + float(OFFLINE_EDF_WINDOW_SEC)))
+                requested_end_s: Optional[float] = (
+                    None
+                    if bool(getattr(self, "_offline_text_full_channel", False))
+                    else end_s
+                )
+                self._load_offline_text_channel_window(path, max(0, int(index)), start_s, requested_end_s)
+                start_s = float(getattr(self, "_offline_text_window_start_s", 0.0))
+                end_s = float(getattr(self, "_offline_text_window_end_s", start_s))
+                is_full_channel = bool(getattr(self, "_offline_text_full_channel", False))
+                title = f"{path.name} | {self._offline_full_label} | {start_s:.1f}-{end_s:.1f}s"
+                remove_mask = self._offline_bad_mask_for_window(
+                    n_samples=self._offline_full_raw.size,
+                    fs=self._offline_full_fs,
+                    time_offset_s=start_s,
+                )
+                display_label, display_raw, display_note, _baseline = self._offline_display_raw_kwargs(path)
+                self._offline_view.load_raw(
+                    self._offline_full_raw,
+                    self._offline_full_fs,
+                    source_name=title,
+                    time_offset_s=start_s,
+                    remove_mask=remove_mask,
+                    y_label=display_label,
+                    display_raw=display_raw,
+                    display_note=display_note,
+                )
+                self._offline_current_raw = np.asarray(self._offline_full_raw, dtype=np.float64)
+                self._offline_current_fs = float(self._offline_full_fs)
+                self._offline_current_time_offset_s = start_s
+                self._offline_current_title = title
+                self._offline_current_y_label = self._offline_full_unit
+                self._offline_time_status.setText(
+                    (
+                        f"{start_s:.1f}-{end_s:.1f} s（完整通道）"
+                        if is_full_channel
+                        else f"{start_s:.1f}-{end_s:.1f} s（按窗口读取，未整文件载入）"
+                    )
+                )
+                self._apply_offline_y_limits()
+                self._refresh_offline_visible_channels()
+                self._update_status_bar()
+                return
             self._load_offline_edf_channel(path, max(0, int(index)))
             self._configure_offline_time_slider(reset_start=True)
             self._render_offline_edf_window()
@@ -4430,12 +5187,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._update_status_bar()
             return
         except Exception as exc:
-            self._log(f"切换 EDF 通道失败: {exc}")
+            self._log(f"切换离线通道失败: {exc}")
             return
     @QtCore.pyqtSlot(int)
     def _on_offline_scroll_changed(self, _value: int) -> None:
         path = self._offline_csv_path
-        if path is None or not self._offline_view_active or not self._is_edf_like_file(path):
+        if path is None or not self._offline_view_active or not self._supports_offline_channel_browse(path):
             return
         try:
             self._render_offline_edf_window()
@@ -4443,7 +5200,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._refresh_offline_visible_channels()
             self._update_status_bar()
         except Exception as exc:
-            self._log(f"刷新 EDF 窗口失败: {exc}")
+            self._log(f"刷新离线窗口失败: {exc}")
 
     def _step_offline_window(self, direction: int) -> None:
         slider = self._offline_time_slider
@@ -4538,7 +5295,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self,
             "选择 EEG 文件",
             str((_ROOT / "Result").resolve()),
-            "EEG Files (*.csv *.txt *.edf *.bdf);;CSV Files (*.csv *.txt);;EDF/BDF Files (*.edf *.bdf);;All Files (*)",
+            "EEG Files (*.csv *.edf *.bdf);;OpenBCI BrainFlow CSV (BrainFlow-RAW_*.csv);;CSV Files (*.csv);;EDF/BDF Files (*.edf *.bdf);;All Files (*)",
         )
         if path:
             self.ui.lineEdit_offline_path.setText(path)
@@ -4567,6 +5324,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._analysis_plot_active = False
         self._analysis_plot.hide()
         self._offline_view_active = True
+        self._sync_offline_y_axis_controls()
         for mode, checkbox in self._display_checkboxes.items():
             checkbox.blockSignals(True)
             checkbox.setChecked(mode == "raw")
@@ -4585,13 +5343,19 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _load_offline_eeg_csv(self) -> None:
         path = self._resolve_offline_eeg_csv_path(self._ui_offline_eeg_csv_path())
         if path is None:
-            self._log("请先选择有效的 EEG CSV/EDF/BDF 文件")
+            self._log("请先选择有效的 EEG CSV/EDF/BDF 文件；OpenBCI 请选 BrainFlow-RAW_*.csv")
             return
         if self._is_edf_like_file(path):
             try:
                 self._load_offline_edf_file(path)
             except Exception as exc:
                 self._log(f"EDF/BDF 加载失败 ({path.name}): {exc}")
+            return
+        if self._supports_offline_channel_browse(path):
+            try:
+                self._load_offline_text_window_file(path)
+            except Exception as exc:
+                self._log(f"BrainFlow CSV 窗口加载失败 ({path.name}): {exc}")
             return
         self._offline_csv_path = path
         self._offline_loaded_channel = 0
@@ -4651,6 +5415,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"离线加载失败 ({path.name}): {exc}")
             return
+        self._log_offline_signal_quality_summary(
+            self._offline_current_raw,
+            self._offline_current_fs,
+            title,
+            self._offline_current_y_label,
+        )
         self._offline_csv_path = path
         self._offline_channel_combo.blockSignals(True)
         self._offline_channel_combo.clear()

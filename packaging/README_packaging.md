@@ -40,6 +40,18 @@ pip install pyinstaller pyinstaller-hooks-contrib
 .\dist\HostComputer6\HostComputer6.exe
 ```
 
+## 拷贝/发布命令
+
+目录版不能只复制 `HostComputer6.exe`，也不要把新包覆盖合并到旧目录上；否则容易出现 exe 和 `_internal` 不是同一批产物，启动时报 `Failed to start embedded python interpreter!`。
+
+推荐使用镜像同步脚本发布：
+
+```powershell
+.\packaging\sync_dist.ps1 -Destination E:\HostComputer6
+```
+
+这个命令会让目标目录与 `dist\HostComputer6` 完全一致。
+
 如果 exe 双击无响应，可临时把 `packaging/HostComputer6.spec` 里的 `console=False` 改为 `console=True`，重新打包后从 PowerShell 启动 exe 查看异常。
 
 ## 常见补充

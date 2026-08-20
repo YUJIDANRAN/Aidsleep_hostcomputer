@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence
@@ -53,8 +54,261 @@ class OfflineEegFileInfo(NamedTuple):
     channel_units: List[str]
 
 
+class _TabularEegFile(NamedTuple):
+    frame: pd.DataFrame
+    channel_columns: List[object]
+    channel_labels: List[str]
+    sample_rate: float
+    unit: str
+
+
 # Higher cap for short windows so local EDF browsing keeps detail.
 MAX_PLOT_POINTS_SHORT = 200000
+
+
+def _read_openbci_sample_rate_from_comments(path: Path) -> Optional[float]:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(32):
+                line = handle.readline()
+                if not line:
+                    break
+                text = line.strip()
+                if not text.startswith("%"):
+                    break
+                match = re.search(r"Sample\s+Rate\s*=\s*([0-9.]+)\s*Hz", text, re.I)
+                if match:
+                    rate = float(match.group(1))
+                    if rate > 0:
+                        return rate
+    except OSError:
+        return None
+    return None
+
+
+def _read_sibling_openbci_sample_rate(path: Path) -> Optional[float]:
+    for sibling in sorted(path.parent.glob("OpenBCI-RAW-*.txt")):
+        rate = _read_openbci_sample_rate_from_comments(sibling)
+        if rate is not None:
+            return rate
+    return None
+
+
+def _looks_like_openbci_raw(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(8):
+                line = handle.readline()
+                if not line:
+                    break
+                text = line.strip()
+                if text.startswith("%OpenBCI") or text.startswith("%Sample Rate"):
+                    return True
+                if text and not text.startswith("%"):
+                    return "EXG Channel" in text and "Sample Index" in text
+    except OSError:
+        return False
+    return False
+
+
+def _looks_like_brainflow_raw(path: Path) -> bool:
+    if path.name.lower().startswith("brainflow-raw"):
+        return True
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            line = handle.readline()
+    except OSError:
+        return False
+    return "\t" in line and "," not in line
+
+
+def _looks_like_openbci_console_log(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            head = "".join(handle.readline() for _ in range(12))
+    except OSError:
+        return False
+    lowered = head.lower()
+    return (
+        "[board_logger]" in lowered
+        or "[brainflow_logger]" in lowered
+        or "incoming json:" in lowered
+        or "failed to establish connection" in lowered
+    )
+
+
+def _raise_openbci_console_log_error(path: Path) -> None:
+    raise ValueError(
+        f"{path.name} 是 OpenBCI/BrainFlow 控制台日志，不是 EEG 数据文件；"
+        "本上位机的 OpenBCI 离线分析请改选 "
+        "Recordings/OpenBCISession_*/BrainFlow-RAW_*.csv。"
+    )
+
+
+def is_openbci_brainflow_eeg_file(path: Path) -> bool:
+    """Return True for BrainFlow RAW matrices used as OpenBCI EEG input."""
+    return _looks_like_brainflow_raw(path)
+
+
+def _raise_openbci_text_unsupported(path: Path) -> None:
+    raise ValueError(
+        f"{path.name} 是 OpenBCI GUI 文本导出，不作为本上位机离线分析输入；"
+        "请改选同一会话目录下的 BrainFlow-RAW_*.csv。"
+    )
+
+
+def _timestamp_sample_rate(frame: pd.DataFrame, column: object) -> Optional[float]:
+    if column not in frame.columns or len(frame) < 2:
+        return None
+    values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(dtype=np.float64)
+    if values.size < 2:
+        return None
+    dt = np.diff(values)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if not dt.size:
+        return None
+    median_dt = float(np.median(dt))
+    if median_dt > 1000.0:
+        median_dt /= 1000.0
+    elif median_dt > 10.0:
+        median_dt /= 1000.0
+    if median_dt <= 0:
+        return None
+    rate = 1.0 / median_dt
+    if 1.0 <= rate <= 5000.0:
+        return float(rate)
+    return None
+
+
+def _load_openbci_text_table(path: Path) -> _TabularEegFile:
+    sample_rate = _read_openbci_sample_rate_from_comments(path) or float(DEFAULT_SAMPLE_RATE)
+    frame = pd.read_csv(path, comment="%", skipinitialspace=True)
+    exg_columns = [col for col in frame.columns if str(col).strip().startswith("EXG Channel")]
+    if not exg_columns:
+        raise ValueError(f"OpenBCI 文件未找到 EXG Channel 列: {path.name}")
+    labels = []
+    for index, col in enumerate(exg_columns):
+        match = re.search(r"EXG Channel\s+(\d+)", str(col), re.I)
+        labels.append(f"EXG {int(match.group(1))}" if match else f"EXG {index}")
+    return _TabularEegFile(frame, exg_columns, labels, float(sample_rate), "uV")
+
+
+def _openbci_columns_and_labels(path: Path) -> tuple[List[str], List[str]]:
+    frame = pd.read_csv(path, comment="%", skipinitialspace=True, nrows=0)
+    exg_columns = [str(col) for col in frame.columns if str(col).strip().startswith("EXG Channel")]
+    labels = []
+    for index, col in enumerate(exg_columns):
+        match = re.search(r"EXG Channel\s+(\d+)", str(col), re.I)
+        labels.append(f"EXG {int(match.group(1))}" if match else f"EXG {index}")
+    return exg_columns, labels
+
+
+def _openbci_header_line_index(path: Path) -> int:
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for index, line in enumerate(handle):
+            text = line.strip()
+            if text and not text.startswith("%"):
+                return index
+    raise ValueError(f"OpenBCI 文件未找到表头: {path.name}")
+
+
+def _estimate_openbci_data_rows(path: Path) -> int:
+    header_index = _openbci_header_line_index(path)
+    with path.open("rb") as handle:
+        for _ in range(header_index + 1):
+            handle.readline()
+        line = handle.readline()
+        while line and not line.strip():
+            line = handle.readline()
+    line_len = max(1, len(line))
+    data_bytes = max(0, path.stat().st_size - len(line) * 0 - 1)
+    return max(0, int(data_bytes / line_len))
+
+
+def _load_brainflow_raw_table(path: Path) -> _TabularEegFile:
+    frame = pd.read_csv(path, sep="\t", header=None)
+    if frame.shape[1] < 9:
+        raise ValueError(f"BrainFlow RAW 列数不足，无法解析 EXG 通道: {path.name}")
+    exg_columns = list(range(1, min(9, int(frame.shape[1]))))
+    labels = [f"EXG {index}" for index in range(len(exg_columns))]
+    sample_rate = (
+        _read_sibling_openbci_sample_rate(path)
+        or _timestamp_sample_rate(frame, 22)
+        or float(DEFAULT_SAMPLE_RATE)
+    )
+    return _TabularEegFile(frame, exg_columns, labels, float(sample_rate), "uV")
+
+
+def _brainflow_columns_and_labels(path: Path) -> tuple[List[int], List[str], int]:
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        first = handle.readline().strip()
+    n_columns = len(first.split()) if first else 0
+    if n_columns < 9:
+        raise ValueError(f"BrainFlow RAW 列数不足，无法解析 EXG 通道: {path.name}")
+    columns = list(range(1, min(9, n_columns)))
+    labels = [f"EXG {index}" for index in range(len(columns))]
+    return columns, labels, n_columns
+
+
+def _count_nonempty_rows(path: Path) -> int:
+    with path.open("rb") as handle:
+        line = handle.readline()
+    line_len = max(1, len(line))
+    return max(0, int(path.stat().st_size / line_len))
+
+
+def _load_generic_eeg_table(path: Path) -> _TabularEegFile:
+    frame = pd.read_csv(path)
+    lower_columns = {str(col).strip().lower() for col in frame.columns}
+    feature_required = {"epoch", "start_s", "end_s", "duration_s"}
+    if feature_required.issubset(lower_columns) and (
+        "stage_yasa" in lower_columns
+        or "yasa_confidence" in lower_columns
+        or "spindle_count" in lower_columns
+    ):
+        raise ValueError(
+            f"{path.name} 是睡眠 epoch 特征/分期结果表，不是原始 EEG 波形；"
+            "纺锤波检测请加载同一会话目录下的 BrainFlow-RAW_*.csv，并选择对应 EXG 通道。"
+        )
+    if "ch1_raw" in frame.columns:
+        columns = ["ch1_raw"]
+        labels = ["CH1"]
+    elif "ch1" in frame.columns:
+        columns = ["ch1"]
+        labels = ["CH1"]
+    else:
+        raw_columns = [
+            col for col in frame.columns if str(col).lower().endswith("_raw")
+        ]
+        if raw_columns:
+            columns = raw_columns
+            labels = [
+                (str(col)[: -len("_raw")] or f"CH{index + 1}").upper()
+                for index, col in enumerate(raw_columns)
+            ]
+        else:
+            skip_names = {"index", "time_s", "time", "timestamp"}
+            data_columns = [
+                col for col in frame.columns if str(col).lower() not in skip_names
+            ]
+            columns = [data_columns[0] if data_columns else frame.columns[0]]
+            labels = ["CH1"]
+    sample_rate = float(DEFAULT_SAMPLE_RATE)
+    if "time_s" in frame.columns:
+        rate = _timestamp_sample_rate(frame, "time_s")
+        if rate is not None:
+            sample_rate = rate
+    return _TabularEegFile(frame, list(columns), labels, sample_rate, "raw")
+
+
+def _load_tabular_eeg_file(path: Path) -> _TabularEegFile:
+    if _looks_like_openbci_console_log(path):
+        _raise_openbci_console_log_error(path)
+    if _looks_like_openbci_raw(path):
+        _raise_openbci_text_unsupported(path)
+    if _looks_like_brainflow_raw(path):
+        return _load_brainflow_raw_table(path)
+    return _load_generic_eeg_table(path)
 
 
 def _adaptive_max_plot_points(n_samples: int, sample_rate: float) -> int:
@@ -92,50 +346,28 @@ def _time_tick_step_seconds(span_s: float) -> float:
 
 def _load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
     """Read EEG CSV/TXT and return (raw, sample_rate)."""
-    frame = pd.read_csv(path)
-    if "ch1_raw" in frame.columns:
-        series = frame["ch1_raw"]
-    elif "ch1" in frame.columns:
-        series = frame["ch1"]
-    else:
-        raw_columns = [
-            col for col in frame.columns if str(col).lower().endswith("_raw")
-        ]
-        if raw_columns:
-            series = frame[raw_columns[0]]
-        else:
-            skip_names = {"index", "time_s", "time", "timestamp"}
-            data_columns = [
-                col for col in frame.columns if str(col).lower() not in skip_names
-            ]
-            series = frame[data_columns[0] if data_columns else frame.columns[0]]
+    if _looks_like_openbci_console_log(path):
+        _raise_openbci_console_log_error(path)
+    if _looks_like_openbci_raw(path):
+        _raise_openbci_text_unsupported(path)
+    if _looks_like_brainflow_raw(path):
+        raw, sample_rate, _label, _unit = load_eeg_file_channel(path, 0)
+        return raw, sample_rate
+    table = _load_tabular_eeg_file(path)
+    series = table.frame[table.channel_columns[0]]
     raw = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=np.float64)
     if raw.size < 8:
         raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
-
-    sample_rate = float(DEFAULT_SAMPLE_RATE)
-    if "time_s" in frame.columns and len(frame) >= 2:
-        dt = np.diff(pd.to_numeric(frame["time_s"], errors="coerce").dropna().to_numpy())
-        dt = dt[dt > 0]
-        if dt.size:
-            sample_rate = float(1.0 / np.median(dt))
-    return raw, sample_rate
+    return raw, float(table.sample_rate)
 
 
 def _csv_channel_label(path: Path) -> str:
     """Return the first EEG-like CSV column label, e.g. ch2_raw -> CH2."""
     try:
-        columns = list(pd.read_csv(path, nrows=0).columns)
+        table = _load_tabular_eeg_file(path)
     except Exception:
         return "CH1"
-    if "ch1_raw" in columns or "ch1" in columns:
-        return "CH1"
-    for col in columns:
-        name = str(col)
-        if name.lower().endswith("_raw"):
-            prefix = name[: -len("_raw")]
-            return prefix.upper() if prefix else name
-    return "CH1"
+    return table.channel_labels[0] if table.channel_labels else "CH1"
 
 
 def _load_eeg_edf_with_rate(path: Path) -> tuple[np.ndarray, float]:
@@ -199,9 +431,34 @@ def load_eeg_file_info(path: Path) -> OfflineEegFileInfo:
     """Return channel labels/rates/sample counts for CSV/TXT/EDF/BDF."""
     suffix = path.suffix.lower()
     if suffix not in {".edf", ".bdf"}:
-        raw, sample_rate = _load_eeg_csv_with_rate(path)
-        label = _csv_channel_label(path)
-        return OfflineEegFileInfo([label], [float(sample_rate)], [int(raw.size)], ["raw"])
+        if _looks_like_openbci_console_log(path):
+            _raise_openbci_console_log_error(path)
+        if _looks_like_openbci_raw(path):
+            _raise_openbci_text_unsupported(path)
+        if _looks_like_brainflow_raw(path):
+            _columns, labels, _n_columns = _brainflow_columns_and_labels(path)
+            n_rows = _count_nonempty_rows(path)
+            rate = _read_sibling_openbci_sample_rate(path) or float(DEFAULT_SAMPLE_RATE)
+            return OfflineEegFileInfo(
+                labels,
+                [float(rate) for _ in labels],
+                [int(n_rows) for _ in labels],
+                ["uV" for _ in labels],
+            )
+        table = _load_tabular_eeg_file(path)
+        samples: List[int] = []
+        labels: List[str] = []
+        for index, column in enumerate(table.channel_columns):
+            raw = pd.to_numeric(table.frame[column], errors="coerce").dropna()
+            samples.append(int(raw.size))
+            labels.append(
+                table.channel_labels[index]
+                if index < len(table.channel_labels)
+                else f"CH{index + 1}"
+            )
+        rates = [float(table.sample_rate) for _ in labels]
+        units = [str(table.unit or "raw") for _ in labels]
+        return OfflineEegFileInfo(labels, rates, samples, units)
 
     reader = _open_pyedflib_reader(path)
     try:
@@ -238,8 +495,36 @@ def load_eeg_file_channel(path: Path, channel_index: int = 0) -> tuple[np.ndarra
     """Read one EEG channel and return (values, sample_rate, label, y_unit)."""
     suffix = path.suffix.lower()
     if suffix not in {".edf", ".bdf"}:
-        raw, sample_rate = _load_eeg_csv_with_rate(path)
-        return raw, sample_rate, _csv_channel_label(path), "raw"
+        if _looks_like_openbci_console_log(path):
+            _raise_openbci_console_log_error(path)
+        if _looks_like_openbci_raw(path):
+            _raise_openbci_text_unsupported(path)
+        if _looks_like_brainflow_raw(path):
+            columns, labels, _n_columns = _brainflow_columns_and_labels(path)
+            index = max(0, min(int(channel_index), len(columns) - 1))
+            frame = pd.read_csv(
+                path,
+                sep=r"\s+",
+                header=None,
+                usecols=[columns[index]],
+                engine="python",
+            )
+            raw = pd.to_numeric(frame[columns[index]], errors="coerce").dropna().to_numpy(dtype=np.float64)
+            if raw.size < 8:
+                raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
+            sample_rate = _read_sibling_openbci_sample_rate(path) or float(DEFAULT_SAMPLE_RATE)
+            return raw, float(sample_rate), labels[index], "uV"
+        table = _load_tabular_eeg_file(path)
+        n_channels = len(table.channel_columns)
+        if n_channels <= 0:
+            raise ValueError(f"文件未找到可用 EEG 通道: {path.name}")
+        index = max(0, min(int(channel_index), n_channels - 1))
+        column = table.channel_columns[index]
+        raw = pd.to_numeric(table.frame[column], errors="coerce").dropna().to_numpy(dtype=np.float64)
+        if raw.size < 8:
+            raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
+        label = table.channel_labels[index] if index < len(table.channel_labels) else f"CH{index + 1}"
+        return raw, float(table.sample_rate), label, str(table.unit or "raw")
 
     reader = _open_pyedflib_reader(path)
     try:
@@ -269,6 +554,105 @@ def load_eeg_file_channel(path: Path, channel_index: int = 0) -> tuple[np.ndarra
     return raw, sample_rate, label, unit
 
 
+def load_eeg_file_channel_window(
+    path: Path,
+    channel_index: int = 0,
+    *,
+    start_s: float = 0.0,
+    duration_s: Optional[float] = None,
+) -> tuple[np.ndarray, float, str, str, float]:
+    """Read a time window from a large text EEG file when possible."""
+    if _looks_like_openbci_console_log(path):
+        _raise_openbci_console_log_error(path)
+    start_s = max(0.0, float(start_s))
+    if duration_s is not None:
+        duration_s = max(0.0, float(duration_s))
+
+    if _looks_like_openbci_raw(path):
+        _raise_openbci_text_unsupported(path)
+
+    if _looks_like_brainflow_raw(path):
+        columns, labels, _n_columns = _brainflow_columns_and_labels(path)
+        index = max(0, min(int(channel_index), len(columns) - 1))
+        sample_rate = _read_sibling_openbci_sample_rate(path) or float(DEFAULT_SAMPLE_RATE)
+        start_row = max(0, int(round(start_s * sample_rate)))
+        n_rows = None if duration_s is None else max(8, int(round(duration_s * sample_rate)))
+        frame = pd.read_csv(
+            path,
+            sep="\t",
+            header=None,
+            usecols=[columns[index]],
+            skiprows=start_row,
+            nrows=n_rows,
+        )
+        raw = pd.to_numeric(frame[columns[index]], errors="coerce").dropna().to_numpy(dtype=np.float64)
+        if raw.size < 8:
+            raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
+        return raw, float(sample_rate), labels[index], "uV", start_row / float(sample_rate)
+
+    raw, sample_rate, label, unit = load_eeg_file_channel(path, channel_index)
+    if duration_s is None:
+        return raw, sample_rate, label, unit, 0.0
+    i0 = max(0, int(round(start_s * sample_rate)))
+    i1 = min(int(raw.size), i0 + max(8, int(round(duration_s * sample_rate))))
+    sliced = raw[i0:i1]
+    if sliced.size < 8:
+        raise ValueError(f"有效样本过少 ({sliced.size}): {path.name}")
+    return sliced, sample_rate, label, unit, i0 / float(sample_rate)
+
+
+def load_eeg_file_channels_window(
+    path: Path,
+    channel_indices: Sequence[int],
+    *,
+    start_s: float = 0.0,
+    duration_s: Optional[float] = None,
+) -> List[tuple[np.ndarray, float, str, str, float]]:
+    """Read several channels from the same time window with one BrainFlow CSV scan."""
+    if _looks_like_openbci_console_log(path):
+        _raise_openbci_console_log_error(path)
+    if _looks_like_openbci_raw(path):
+        _raise_openbci_text_unsupported(path)
+    indices = [int(index) for index in channel_indices]
+    if not indices:
+        return []
+    if not _looks_like_brainflow_raw(path):
+        return [
+            load_eeg_file_channel_window(
+                path,
+                index,
+                start_s=start_s,
+                duration_s=duration_s,
+            )
+            for index in indices
+        ]
+
+    columns, labels, _n_columns = _brainflow_columns_and_labels(path)
+    clamped = [max(0, min(index, len(columns) - 1)) for index in indices]
+    sample_rate = _read_sibling_openbci_sample_rate(path) or float(DEFAULT_SAMPLE_RATE)
+    start_s = max(0.0, float(start_s))
+    duration = None if duration_s is None else max(0.0, float(duration_s))
+    start_row = max(0, int(round(start_s * sample_rate)))
+    n_rows = None if duration is None else max(8, int(round(duration * sample_rate)))
+    read_columns = sorted({columns[index] for index in clamped})
+    frame = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        usecols=read_columns,
+        skiprows=start_row,
+        nrows=n_rows,
+    )
+    result: List[tuple[np.ndarray, float, str, str, float]] = []
+    for index in clamped:
+        column = columns[index]
+        raw = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(dtype=np.float64)
+        if raw.size < 8:
+            raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
+        result.append((raw, float(sample_rate), labels[index], "uV", start_row / float(sample_rate)))
+    return result
+
+
 def load_eeg_csv_with_rate(path: Path) -> tuple[np.ndarray, float]:
     """Read an offline EEG file (CSV/TXT/EDF/BDF) and return (raw, sample_rate)."""
     suffix = path.suffix.lower()
@@ -293,8 +677,12 @@ def _downsample_pair(
         end = min(n, start + bin_size)
         segment = values[start:end]
         t_seg = time_s[start:end]
-        i_min = int(np.argmin(segment))
-        i_max = int(np.argmax(segment))
+        finite_idx = np.flatnonzero(np.isfinite(segment))
+        if finite_idx.size == 0:
+            continue
+        finite_segment = segment[finite_idx]
+        i_min = int(finite_idx[int(np.argmin(finite_segment))])
+        i_max = int(finite_idx[int(np.argmax(finite_segment))])
         if i_min <= i_max:
             out_t.extend((float(t_seg[i_min]), float(t_seg[i_max])))
             out_y.extend((float(segment[i_min]), float(segment[i_max])))
@@ -393,6 +781,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._remove_mask: Optional[np.ndarray] = None
         self._y_limits: Optional[tuple[float, float]] = None
         self._raw_y_label = "raw"
+        self._display_note = ""
         super().__init__(parent, empty_message="选择 CSV/EDF 后点击加载")
 
     @property
@@ -415,6 +804,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._remove_mask = None
         self._y_limits = None
         self._raw_y_label = "raw"
+        self._display_note = ""
         self._draw_empty("选择 CSV/EDF 后点击加载")
 
     def set_y_limits(self, y_min: Optional[float], y_max: Optional[float]) -> None:
@@ -436,20 +826,28 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         time_offset_s: float = 0.0,
         remove_mask: Optional[np.ndarray] = None,
         y_label: str = "raw",
+        display_raw: Optional[np.ndarray] = None,
+        display_note: str = "",
     ) -> tuple[int, float]:
         """Load a raw segment into the waveform view."""
         raw_arr = np.asarray(raw, dtype=np.float64)
         if raw_arr.size < 8:
             raise ValueError(f"鏈夋晥鏍锋湰杩囧皯 ({raw_arr.size})")
+        display_arr = raw_arr
+        if display_raw is not None:
+            display_arr = np.asarray(display_raw, dtype=np.float64)
+            if display_arr.shape != raw_arr.shape:
+                raise ValueError("display_raw length does not match raw length")
         fs = float(sample_rate)
         bands = extract_band_waveforms(raw_arr, fs)
         n = int(raw_arr.size)
         time_s = float(time_offset_s) + np.arange(n, dtype=np.float64) / fs
         self._sample_rate = fs
         self._time_s = time_s
-        self._channels = {"raw": raw_arr, **bands}
+        self._channels = {"raw": display_arr, **bands}
         self._source_name = source_name or "offline"
         self._raw_y_label = y_label or "raw"
+        self._display_note = str(display_note or "")
         self._visible = ["raw"]
         if remove_mask is None:
             self._remove_mask = None
@@ -541,6 +939,14 @@ class OfflineRhythmStackView(_MatplotlibHostView):
             ax.set_ylabel(y_label, fontsize=9)
             if self._y_limits is not None:
                 ax.set_ylim(*self._y_limits)
+            elif name == "raw":
+                finite_y = y[np.isfinite(y)]
+                if finite_y.size:
+                    y0 = float(np.min(finite_y))
+                    y1 = float(np.max(finite_y))
+                    if y1 > y0:
+                        pad = max((y1 - y0) * 0.05, 1.0)
+                        ax.set_ylim(y0 - pad, y1 + pad)
             ax.grid(True, which="major", alpha=0.25)
             ax.tick_params(labelsize=8)
             self._axes.append(ax)
@@ -548,8 +954,9 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._bind_time_axis_ticks(self._axes)
         title = self._source_name or "offline"
         mark_tip = " | bad segments marked" if reject_spans else ""
+        display_tip = f" | {self._display_note}" if self._display_note else ""
         self._figure.suptitle(
-            f"{title} | {self._sample_rate:.0f} Hz | waveform always shown{mark_tip}",
+            f"{title} | {self._sample_rate:.0f} Hz | waveform always shown{mark_tip}{display_tip}",
             fontsize=10,
         )
         self._figure.tight_layout()
