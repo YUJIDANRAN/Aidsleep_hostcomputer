@@ -33,6 +33,7 @@ from power_cal import (  # noqa: E402
     BAND_LABELS,
     DEFAULT_SAMPLE_RATE,
     EEG_BANDS,
+    bandpass_filter,
     extract_band_waveforms,
 )
 
@@ -46,6 +47,38 @@ CHANNEL_COLORS = {
     **BAND_COLORS,
 }
 MAX_PLOT_POINTS = 25000
+MULTI_CHANNEL_COLORS = [
+    "#D32F2F",
+    "#1976D2",
+    "#388E3C",
+    "#F57C00",
+    "#7B1FA2",
+    "#0097A7",
+    "#C2185B",
+    "#5D4037",
+    "#455A64",
+    "#689F38",
+    "#512DA8",
+    "#E64A19",
+]
+COMPARE_WAVEFORM_MODES = [
+    ("raw", "raw data"),
+    ("delta", "Delta"),
+    ("theta", "theta"),
+    ("alpha", "Alpha"),
+    ("beta", "Beta"),
+    ("gamma", "gamma"),
+    ("sigma", "Sigma"),
+]
+COMPARE_BAND_LABELS = {
+    "raw": "raw data",
+    **{name: BAND_LABELS.get(name, name) for name in EEG_BANDS},
+    "sigma": "σ",
+}
+COMPARE_BAND_RANGES = {
+    **EEG_BANDS,
+    "sigma": (12.0, 16.0),
+}
 
 class OfflineEegFileInfo(NamedTuple):
     channel_labels: List[str]
@@ -766,6 +799,601 @@ class AnalysisPlotView(_MatplotlibHostView):
 
     def clear(self) -> None:
         self._draw_empty("填写时间段后点击功率对比")
+
+
+class OfflineMultiChannelCompareDialog(QtWidgets.QDialog):
+    """Overlay several offline channels in one shared time/value axis."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("多通道波形比较")
+        self.resize(980, 680)
+        self._time_s = np.zeros(0, dtype=np.float64)
+        self._channels: List[tuple[str, np.ndarray, np.ndarray, str]] = []
+        self._sample_rate = float(DEFAULT_SAMPLE_RATE)
+        self._source_name = ""
+        self._y_label = "raw"
+        self._y_limits: Optional[tuple[float, float]] = None
+        self._checks: List[QtWidgets.QCheckBox] = []
+        self._mode_checks: Dict[str, QtWidgets.QCheckBox] = {}
+        self._mode_group = QtWidgets.QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._band_cache: Dict[str, List[np.ndarray]] = {}
+        self._current_index = 0
+        self._source_path: Optional[Path] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        mode_box = QtWidgets.QGroupBox("比较波形")
+        mode_layout = QtWidgets.QHBoxLayout(mode_box)
+        mode_layout.setContentsMargins(10, 18, 10, 10)
+        mode_layout.setSpacing(14)
+        for mode, label in COMPARE_WAVEFORM_MODES:
+            check = QtWidgets.QCheckBox(label, self)
+            check.setChecked(mode == "raw")
+            check.toggled.connect(self.redraw)
+            self._mode_group.addButton(check)
+            self._mode_checks[mode] = check
+            mode_layout.addWidget(check)
+        self._offset_display_check = QtWidgets.QCheckBox("错开显示", self)
+        self._offset_display_check.setToolTip("将可见通道按幅值间隔上下错开，便于观察峰谷位置")
+        self._offset_display_check.toggled.connect(self.redraw)
+        mode_layout.addWidget(self._offset_display_check)
+        self._phase_button = QtWidgets.QPushButton("同相分析...", self)
+        self._phase_button.setToolTip("计算可见通道相对参考通道的相关系数和最佳滞后")
+        self._phase_button.clicked.connect(self._show_phase_analysis)
+        mode_layout.addWidget(self._phase_button)
+        mode_layout.addStretch(1)
+        layout.addWidget(mode_box, stretch=0)
+
+        controls_box = QtWidgets.QGroupBox("通道曲线")
+        controls_layout = QtWidgets.QGridLayout(controls_box)
+        controls_layout.setContentsMargins(10, 18, 10, 10)
+        controls_layout.setHorizontalSpacing(14)
+        controls_layout.setVerticalSpacing(6)
+        self._controls_layout = controls_layout
+        layout.addWidget(controls_box, stretch=0)
+
+        self._plot = _MatplotlibHostView(self, empty_message="点击多通道比较加载当前窗口")
+        layout.addWidget(self._plot, stretch=1)
+
+    def load_channels(
+        self,
+        channels: Sequence[tuple],
+        sample_rate: float,
+        *,
+        start_s: float,
+        source_name: str,
+        y_label: str,
+        y_limits: Optional[tuple[float, float]] = None,
+        current_index: int = 0,
+        source_path: Optional[Path] = None,
+    ) -> None:
+        self._sample_rate = float(sample_rate)
+        self._channels = []
+        self._band_cache = {}
+        for item in channels:
+            if len(item) == 4:
+                label, raw_values, display_values, note = item
+            else:
+                label, display_values, note = item
+                raw_values = display_values
+            raw_arr = np.asarray(raw_values, dtype=np.float64)
+            display_arr = np.asarray(display_values, dtype=np.float64)
+            if raw_arr.size >= 8 and display_arr.size >= 8:
+                self._channels.append(
+                    (str(label), raw_arr, display_arr, str(note or ""))
+                )
+        self._source_name = str(source_name or "offline")
+        self._y_label = str(y_label or "raw")
+        self._y_limits = y_limits
+        self._current_index = max(0, int(current_index))
+        self._source_path = Path(source_path) if source_path is not None else None
+        n = min(
+            (
+                min(raw_values.size, display_values.size)
+                for _label, raw_values, display_values, _note in self._channels
+            ),
+            default=0,
+        )
+        if n <= 0:
+            self._time_s = np.zeros(0, dtype=np.float64)
+        else:
+            self._channels = [
+                (label, raw_values[:n], display_values[:n], note)
+                for label, raw_values, display_values, note in self._channels
+            ]
+            self._time_s = float(start_s) + np.arange(n, dtype=np.float64) / max(
+                self._sample_rate, 1.0
+            )
+        self._rebuild_checkboxes(current_index=current_index)
+        self.redraw()
+
+    def _rebuild_checkboxes(self, *, current_index: int) -> None:
+        while self._controls_layout.count():
+            item = self._controls_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._checks = []
+        for index, (label, _raw_values, _display_values, _note) in enumerate(self._channels):
+            check = QtWidgets.QCheckBox(label, self)
+            check.setChecked(True)
+            color = MULTI_CHANNEL_COLORS[index % len(MULTI_CHANNEL_COLORS)]
+            weight = "font-weight: 600;" if index == int(current_index) else ""
+            check.setStyleSheet(f"QCheckBox {{ color: {color}; {weight} }}")
+            check.toggled.connect(self.redraw)
+            row = index // 4
+            col = index % 4
+            self._controls_layout.addWidget(check, row, col, 1, 1)
+            self._checks.append(check)
+
+    def _current_mode(self) -> str:
+        for mode, check in self._mode_checks.items():
+            if check.isChecked():
+                return mode
+        return "raw"
+
+    def _mode_values(self, mode: str) -> List[np.ndarray]:
+        if mode == "raw":
+            return [display_values for _label, _raw_values, display_values, _note in self._channels]
+        cached = self._band_cache.get(mode)
+        if cached is not None:
+            return cached
+        if mode not in COMPARE_BAND_RANGES:
+            return [display_values for _label, _raw_values, display_values, _note in self._channels]
+        low, high = COMPARE_BAND_RANGES[mode]
+        values: List[np.ndarray] = []
+        for _label, raw_values, _display_values, _note in self._channels:
+            base = bandpass_filter(raw_values, self._sample_rate)
+            values.append(
+                bandpass_filter(base, self._sample_rate, low_hz=low, high_hz=high)
+            )
+        self._band_cache[mode] = values
+        return values
+
+    def _visible_channel_items(self) -> List[tuple[int, str]]:
+        return [
+            (index, item[0])
+            for index, item in enumerate(self._channels)
+            if index < len(self._checks) and self._checks[index].isChecked()
+        ]
+
+    @staticmethod
+    def _prepare_corr_array(values: np.ndarray) -> Optional[np.ndarray]:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if arr.size < 8:
+            return None
+        finite = np.isfinite(arr)
+        if int(np.count_nonzero(finite)) < 8:
+            return None
+        mean = float(np.nanmean(arr[finite]))
+        arr = arr.copy()
+        arr[~finite] = mean
+        arr -= float(np.mean(arr))
+        std = float(np.std(arr))
+        if not np.isfinite(std) or std <= 1e-12:
+            return None
+        return arr / std
+
+    @staticmethod
+    def _zero_corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
+        mask = np.isfinite(a) & np.isfinite(b)
+        if int(np.count_nonzero(mask)) < 8:
+            return None
+        aa = np.asarray(a[mask], dtype=np.float64)
+        bb = np.asarray(b[mask], dtype=np.float64)
+        aa -= float(np.mean(aa))
+        bb -= float(np.mean(bb))
+        denom = float(np.std(aa) * np.std(bb))
+        if denom <= 1e-12:
+            return None
+        return float(np.mean(aa * bb) / denom)
+
+    @staticmethod
+    def _phase_comment(zero_corr: Optional[float], best_corr: Optional[float], lag_ms: float) -> str:
+        z = -2.0 if zero_corr is None else float(zero_corr)
+        b = -2.0 if best_corr is None else float(best_corr)
+        lag = abs(float(lag_ms))
+        if z >= 0.80 and lag <= 50.0:
+            return "同步较好"
+        if z >= 0.50 and lag <= 120.0:
+            return "部分同步"
+        if b >= 0.50:
+            return "形状相似但有滞后"
+        if z <= -0.30:
+            return "可能反相/错位"
+        return "同步性弱"
+
+    def _phase_metrics(
+        self,
+        ref: np.ndarray,
+        values: np.ndarray,
+        max_lag: int,
+    ) -> tuple[Optional[float], Optional[float], float]:
+        n = min(int(ref.size), int(values.size))
+        if n < 8:
+            return None, None, 0.0
+        ref = np.asarray(ref[:n], dtype=np.float64)
+        values = np.asarray(values[:n], dtype=np.float64)
+        zero = self._zero_corr(ref, values)
+        ref_norm = self._prepare_corr_array(ref)
+        arr_norm = self._prepare_corr_array(values)
+        if ref_norm is None or arr_norm is None:
+            return zero, None, 0.0
+        lag_limit = min(int(max_lag), n - 2)
+        corr = np.correlate(arr_norm, ref_norm, mode="full") / float(n)
+        lags = np.arange(-n + 1, n)
+        mask = np.abs(lags) <= lag_limit
+        if not np.any(mask):
+            return zero, None, 0.0
+        masked_corr = corr[mask]
+        masked_lags = lags[mask]
+        best_pos = int(np.argmax(masked_corr))
+        best = float(masked_corr[best_pos])
+        lag_ms = float(masked_lags[best_pos] / max(self._sample_rate, 1.0) * 1000.0)
+        return zero, best, lag_ms
+
+    def _phase_rows_for_current_window(
+        self,
+        visible: Sequence[tuple[int, str]],
+        mode_values: Sequence[np.ndarray],
+        ref_index: int,
+        max_n: int,
+    ) -> List[List[str]]:
+        ref = np.asarray(mode_values[ref_index][:max_n], dtype=np.float64)
+        max_lag = min(int(round(max(self._sample_rate, 1.0) * 1.0)), max_n - 2)
+        rows: List[List[str]] = []
+        for index, label in visible:
+            zero, best, lag_ms = self._phase_metrics(
+                ref,
+                np.asarray(mode_values[index][:max_n], dtype=np.float64),
+                max_lag,
+            )
+            rows.append(
+                [
+                    label,
+                    "-" if zero is None else f"{zero:.3f}",
+                    "-" if best is None else f"{best:.3f}",
+                    f"{lag_ms:.0f}",
+                    "-",
+                    self._phase_comment(zero, best, lag_ms),
+                ]
+            )
+        return rows
+
+    @staticmethod
+    def _stage_key(text: object) -> str:
+        value = str(text or "").strip().upper()
+        if value in {"R", "REM"}:
+            return "REM"
+        return value
+
+    def _stage_file_for_channel(self, index: int) -> Optional[Path]:
+        if self._source_path is None:
+            return None
+        candidates = [
+            self._source_path.parent / f"sleep_epoch_features_mne_EXG_{index}_Full.csv",
+            self._source_path.parent / f"sleep_epoch_features_mne_EXG_{index}.csv",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return path
+        return None
+
+    def _common_stage_epochs(
+        self,
+        channel_indices: Sequence[int],
+        stages: Sequence[str],
+    ) -> List[tuple[int, float, float]]:
+        selected = {self._stage_key(stage) for stage in stages}
+        common: Optional[set[int]] = None
+        epoch_times: Dict[int, tuple[float, float]] = {}
+        for index in channel_indices:
+            path = self._stage_file_for_channel(index)
+            if path is None:
+                raise ValueError(f"未找到 EXG {index} 的睡眠分期文件")
+            frame = pd.read_csv(path)
+            required = {"epoch", "start_s", "end_s", "stage_yasa"}
+            if not required.issubset(set(frame.columns)):
+                raise ValueError(f"{path.name} 缺少睡眠分期列")
+            epochs: set[int] = set()
+            for row in frame.itertuples(index=False):
+                stage = self._stage_key(getattr(row, "stage_yasa"))
+                if stage not in selected:
+                    continue
+                epoch = int(getattr(row, "epoch"))
+                epochs.add(epoch)
+                if epoch not in epoch_times:
+                    epoch_times[epoch] = (
+                        float(getattr(row, "start_s")),
+                        float(getattr(row, "end_s")),
+                    )
+            common = epochs if common is None else common.intersection(epochs)
+        return [
+            (epoch, epoch_times[epoch][0], epoch_times[epoch][1])
+            for epoch in sorted(common or set())
+            if epoch in epoch_times and epoch_times[epoch][1] > epoch_times[epoch][0]
+        ]
+
+    def _values_for_loaded_window(
+        self,
+        loaded: Sequence[tuple[np.ndarray, float, str, str, float]],
+        mode: str,
+    ) -> List[np.ndarray]:
+        raw_values: List[np.ndarray] = []
+        display_values: List[np.ndarray] = []
+        for raw, _fs, _label, unit, _actual_start in loaded:
+            arr = np.asarray(raw, dtype=np.float64)
+            finite = arr[np.isfinite(arr)]
+            baseline = float(np.nanmedian(finite)) if finite.size else 0.0
+            if self._source_path is not None and is_openbci_brainflow_eeg_file(self._source_path):
+                raw_arr = arr - baseline
+                display_arr = raw_arr
+            else:
+                raw_arr = arr
+                display_arr = arr
+            raw_values.append(raw_arr)
+            display_values.append(display_arr)
+        if mode == "raw":
+            return display_values
+        if mode not in COMPARE_BAND_RANGES:
+            return display_values
+        low, high = COMPARE_BAND_RANGES[mode]
+        filtered: List[np.ndarray] = []
+        for values in raw_values:
+            base = bandpass_filter(values, self._sample_rate)
+            filtered.append(
+                bandpass_filter(base, self._sample_rate, low_hz=low, high_hz=high)
+            )
+        return filtered
+
+    def _phase_rows_for_sleep_stages(
+        self,
+        visible: Sequence[tuple[int, str]],
+        mode: str,
+        ref_index: int,
+        stages: Sequence[str],
+    ) -> tuple[List[List[str]], int]:
+        if self._source_path is None:
+            raise ValueError("当前比较窗口没有关联原始文件路径")
+        channel_indices = [index for index, _label in visible]
+        epochs = self._common_stage_epochs(channel_indices, stages)
+        if not epochs:
+            raise ValueError("未找到可见通道共同属于所选睡眠阶段的 epoch")
+        max_lag = int(round(max(self._sample_rate, 1.0) * 1.0))
+        labels = {index: label for index, label in visible}
+        metrics: Dict[int, List[tuple[Optional[float], Optional[float], float]]] = {
+            index: [] for index, _label in visible
+        }
+        ref_pos = channel_indices.index(ref_index) if ref_index in channel_indices else 0
+        if float(epochs[-1][2] - epochs[0][1]) <= 3600.0:
+            blocks: List[List[tuple[int, float, float]]] = [epochs]
+        else:
+            blocks = []
+            for epoch in epochs:
+                if not blocks or epoch[1] > blocks[-1][-1][2] + 1e-6:
+                    blocks.append([epoch])
+                else:
+                    blocks[-1].append(epoch)
+        for block in blocks:
+            block_start = float(block[0][1])
+            block_end = float(block[-1][2])
+            loaded = load_eeg_file_channels_window(
+                self._source_path,
+                channel_indices,
+                start_s=block_start,
+                duration_s=float(block_end - block_start),
+            )
+            block_values = self._values_for_loaded_window(loaded, mode)
+            if ref_pos >= len(block_values):
+                continue
+            for _epoch, start_s, end_s in block:
+                i0 = max(0, int(round((float(start_s) - block_start) * self._sample_rate)))
+                i1 = max(i0 + 1, int(round((float(end_s) - block_start) * self._sample_rate)))
+                ref = block_values[ref_pos][i0:i1]
+                for pos, index in enumerate(channel_indices):
+                    if pos >= len(block_values):
+                        continue
+                    values = block_values[pos][i0:i1]
+                    metrics[index].append(self._phase_metrics(ref, values, max_lag))
+                if QtWidgets.QApplication.instance() is not None:
+                    QtWidgets.QApplication.processEvents()
+            if QtWidgets.QApplication.instance() is not None:
+                QtWidgets.QApplication.processEvents()
+        rows: List[List[str]] = []
+        for index, _label in visible:
+            vals = metrics.get(index, [])
+            zeros = [zero for zero, _best, _lag in vals if zero is not None]
+            bests = [best for _zero, best, _lag in vals if best is not None]
+            lags = [lag for _zero, best, lag in vals if best is not None]
+            zero_med = float(np.median(zeros)) if zeros else None
+            best_med = float(np.median(bests)) if bests else None
+            lag_med = float(np.median(lags)) if lags else 0.0
+            rows.append(
+                [
+                    labels[index],
+                    "-" if zero_med is None else f"{zero_med:.3f}",
+                    "-" if best_med is None else f"{best_med:.3f}",
+                    f"{lag_med:.0f}",
+                    str(len(vals)),
+                    self._phase_comment(zero_med, best_med, lag_med),
+                ]
+            )
+        return rows, len(epochs)
+
+    @QtCore.pyqtSlot()
+    def _show_phase_analysis(self) -> None:
+        if not self._channels or self._time_s.size == 0:
+            QtWidgets.QMessageBox.information(self, "同相分析", "当前没有可分析的数据")
+            return
+        visible = self._visible_channel_items()
+        if len(visible) < 2:
+            QtWidgets.QMessageBox.information(self, "同相分析", "请至少勾选两个通道")
+            return
+        mode = self._current_mode()
+        mode_values = self._mode_values(mode)
+        ref_index = self._current_index if any(i == self._current_index for i, _ in visible) else visible[0][0]
+        if ref_index >= len(mode_values):
+            QtWidgets.QMessageBox.information(self, "同相分析", "参考通道数据无效")
+            return
+        n_total = min(len(values) for values in mode_values if len(values) > 0)
+        max_n = min(n_total, int(round(max(self._sample_rate, 1.0) * 20.0)), 10000)
+        if max_n < 8:
+            QtWidgets.QMessageBox.information(self, "同相分析", "有效样本过少")
+            return
+        ref_label = self._channels[ref_index][0]
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("同相分析")
+        dialog.resize(780, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        mode_label = COMPARE_BAND_LABELS.get(mode, mode)
+        duration_s = max_n / max(self._sample_rate, 1.0)
+        clipped = "，长窗口仅分析开头片段" if max_n < n_total else ""
+        hint = QtWidgets.QLabel(
+            f"参考通道：{ref_label}；波形：{mode_label}；分析时长：{duration_s:.1f}s{clipped}"
+        )
+        layout.addWidget(hint)
+
+        stage_box = QtWidgets.QGroupBox("分析范围")
+        stage_layout = QtWidgets.QHBoxLayout(stage_box)
+        stage_layout.setContentsMargins(10, 18, 10, 10)
+        stage_layout.setSpacing(12)
+        current_check = QtWidgets.QCheckBox("当前窗口", stage_box)
+        current_check.setChecked(True)
+        stage_layout.addWidget(current_check)
+        stage_checks: Dict[str, QtWidgets.QCheckBox] = {}
+        for stage in ("W", "N1", "N2", "N3", "REM"):
+            check = QtWidgets.QCheckBox(stage, stage_box)
+            check.toggled.connect(lambda checked, c=current_check: c.setChecked(False) if checked else None)
+            stage_layout.addWidget(check)
+            stage_checks[stage] = check
+        current_check.toggled.connect(
+            lambda checked: [check.setChecked(False) for check in stage_checks.values()] if checked else None
+        )
+        analyze_button = QtWidgets.QPushButton("重新分析", stage_box)
+        stage_layout.addWidget(analyze_button)
+        stage_layout.addStretch(1)
+        layout.addWidget(stage_box)
+
+        table = QtWidgets.QTableWidget(dialog)
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(
+            ["通道", "零滞后相关", "最佳相关", "最佳滞后(ms)", "epoch数", "判断"]
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table, stretch=1)
+
+        def _fill_table(rows: Sequence[Sequence[str]]) -> None:
+            table.setRowCount(len(rows))
+            for row, cells in enumerate(rows):
+                for col, text in enumerate(cells):
+                    item = QtWidgets.QTableWidgetItem(str(text))
+                    if col:
+                        item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    table.setItem(row, col, item)
+            table.resizeColumnsToContents()
+
+        def _run_analysis() -> None:
+            try:
+                selected_stages = [
+                    stage for stage, check in stage_checks.items() if check.isChecked()
+                ]
+                if selected_stages:
+                    current_check.blockSignals(True)
+                    current_check.setChecked(False)
+                    current_check.blockSignals(False)
+                    rows, epoch_count = self._phase_rows_for_sleep_stages(
+                        visible,
+                        mode,
+                        ref_index,
+                        selected_stages,
+                    )
+                    hint.setText(
+                        f"参考通道：{ref_label}；波形：{mode_label}；阶段：{','.join(selected_stages)}；"
+                        f"共同 epoch：{epoch_count}；表内为各 epoch 指标中位数"
+                    )
+                    _fill_table(rows)
+                    return
+                current_check.setChecked(True)
+                rows = self._phase_rows_for_current_window(
+                    visible,
+                    mode_values,
+                    ref_index,
+                    max_n,
+                )
+                hint.setText(
+                    f"参考通道：{ref_label}；波形：{mode_label}；分析时长：{duration_s:.1f}s{clipped}"
+                )
+                _fill_table(rows)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dialog, "同相分析失败", str(exc))
+
+        analyze_button.clicked.connect(_run_analysis)
+        _run_analysis()
+        close_button = QtWidgets.QPushButton("关闭", dialog)
+        close_button.clicked.connect(dialog.close)
+        layout.addWidget(close_button, alignment=QtCore.Qt.AlignRight)
+        dialog.exec_()
+
+    @QtCore.pyqtSlot()
+    def redraw(self) -> None:
+        self._plot.figure.clear()
+        if not self._channels or self._time_s.size == 0:
+            self._plot._draw_empty("当前窗口没有可比较的多通道数据")
+            return
+        visible = [(index, self._channels[index]) for index, _label in self._visible_channel_items()]
+        if not visible:
+            self._plot._draw_empty("请至少勾选一个通道")
+            return
+        ax = self._plot.figure.add_subplot(111)
+        max_pts = _adaptive_max_plot_points(int(self._time_s.size), self._sample_rate)
+        mode = self._current_mode()
+        mode_values = self._mode_values(mode)
+        plot_values: List[np.ndarray] = []
+        for index, _item in visible:
+            if index < len(mode_values):
+                plot_values.append(np.asarray(mode_values[index], dtype=np.float64))
+        offsets: Dict[int, float] = {}
+        if self._offset_display_check.isChecked() and plot_values:
+            spans = []
+            for values in plot_values:
+                finite = values[np.isfinite(values)]
+                if finite.size:
+                    spans.append(float(np.nanpercentile(finite, 95.0) - np.nanpercentile(finite, 5.0)))
+            spacing = max(float(np.median(spans)) if spans else 1.0, 1.0) * 1.25
+            for order, (index, _item) in enumerate(visible):
+                offsets[index] = (len(visible) - 1 - order) * spacing
+        for index, (label, _raw_values, _display_values, _note) in visible:
+            if index >= len(mode_values):
+                continue
+            values = np.asarray(mode_values[index], dtype=np.float64)
+            if offsets:
+                values = values + offsets.get(index, 0.0)
+            t, y = _downsample_pair(self._time_s, values, max_points=max_pts)
+            color = MULTI_CHANNEL_COLORS[index % len(MULTI_CHANNEL_COLORS)]
+            ax.plot(t, y, color=color, linewidth=0.85, label=label)
+        ax.set_xlabel("Time (s)", fontsize=9)
+        mode_label = COMPARE_BAND_LABELS.get(mode, mode)
+        ylabel = self._y_label if mode == "raw" else f"{mode_label} ({self._y_label})"
+        if offsets:
+            ylabel = f"{ylabel} + offset"
+        ax.set_ylabel(ylabel, fontsize=9)
+        if self._y_limits is not None and mode == "raw" and not offsets:
+            ax.set_ylim(*self._y_limits)
+        ax.grid(True, which="major", alpha=0.25)
+        ax.tick_params(labelsize=8)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.85, ncol=2)
+        start = float(self._time_s[0])
+        end = float(self._time_s[-1] + 1.0 / max(self._sample_rate, 1.0))
+        self._plot.figure.suptitle(
+            f"{self._source_name} | {mode_label} | {start:.1f}-{end:.1f}s | {self._sample_rate:.0f} Hz",
+            fontsize=10,
+        )
+        self._plot.refresh()
 
 
 class OfflineRhythmStackView(_MatplotlibHostView):

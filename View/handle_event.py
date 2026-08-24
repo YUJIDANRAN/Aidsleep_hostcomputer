@@ -73,6 +73,7 @@ from ks1082_serial import (
 from analysis_plot_view import (
     CHANNEL_ORDER,
     AnalysisPlotView,
+    OfflineMultiChannelCompareDialog,
     OfflineRhythmStackView,
     _MatplotlibHostView,
     is_openbci_brainflow_eeg_file,
@@ -174,19 +175,245 @@ MIN_Y_AMP = 20.0  ## Y 半幅下限
 MAX_Y_AMP = 200000.0  ## Y 半幅上限
 
 
+def _mne_unit_scale_value(y_label: str) -> float:
+    unit = str(y_label or "").strip().lower().replace("μ", "u")
+    if unit in {"uv", "µv", "microv"}:
+        return 1e-6
+    if unit == "mv":
+        return 1e-3
+    return 1.0
+
+
+def _openbci_quality_stats_value(raw: np.ndarray, unit: str) -> Optional[Dict[str, float]]:
+    unit_text = str(unit or "").strip().lower().replace("μ", "u")
+    if unit_text not in {"uv", "µv", "microv"}:
+        return None
+    arr = np.asarray(raw, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 8:
+        return None
+    rail_uv = 187500.02235174447
+    rail_mask = np.isclose(np.abs(finite), rail_uv, rtol=0.0, atol=1.0)
+    zero_mask = np.isclose(finite, 0.0, rtol=0.0, atol=1e-12)
+    return {
+        "rail_pct": float(np.count_nonzero(rail_mask) / finite.size * 100.0),
+        "zero_pct": float(np.count_nonzero(zero_mask) / finite.size * 100.0),
+        "ptp": float(np.ptp(finite)),
+        "median": float(np.median(finite)),
+    }
+
+
+def _offline_signal_quality_issue_value(
+    raw: np.ndarray,
+    fs: float,
+    unit: str,
+    *,
+    purpose: str,
+) -> Optional[str]:
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.size < 8 or fs <= 0:
+        return f"{purpose}: 有效样本过少或采样率无效"
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 8:
+        return f"{purpose}: 有限样本过少"
+    nonfinite_pct = (1.0 - finite.size / max(1, arr.size)) * 100.0
+    if nonfinite_pct > 5.0:
+        return f"{purpose}: 非有限值占比 {nonfinite_pct:.1f}%，请先处理坏段"
+    stats = _openbci_quality_stats_value(finite, unit)
+    if stats is not None:
+        rail_pct = stats["rail_pct"]
+        zero_pct = stats["zero_pct"]
+        if rail_pct >= 20.0:
+            return (
+                f"{purpose}: OpenBCI rail 饱和值占比 {rail_pct:.1f}%"
+                f"（约 ±187500 uV），电极/参考/增益可能异常，当前段不适合 PSD 或睡眠分析"
+            )
+        if rail_pct + zero_pct >= 50.0 and stats["ptp"] < 5.0:
+            return (
+                f"{purpose}: OpenBCI rail/zero 样本占比 {rail_pct + zero_pct:.1f}%，"
+                "当前段近似无有效 EEG 波动"
+            )
+    if float(np.ptp(finite)) <= 1e-12:
+        return f"{purpose}: 信号动态范围近似为 0，无法进行频谱分析"
+    return None
+
+
+def _csv_raw_to_yasa_volts_config(
+    raw: np.ndarray,
+    *,
+    uv_per_count: float,
+    baseline_method_index: int,
+    baseline_fixed_text: str,
+) -> tuple[np.ndarray, float, float]:
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.size < 8:
+        raise ValueError("CSV/raw 样本过少，无法估计 baseline")
+    if uv_per_count <= 0:
+        raise ValueError("CSV uV/count 必须大于 0")
+    if baseline_method_index == 0:
+        baseline = float(np.nanmedian(arr))
+    elif baseline_method_index == 1:
+        baseline = float(np.nanmean(arr))
+    else:
+        text = str(baseline_fixed_text or "").strip()
+        if not text:
+            raise ValueError("CSV baseline 选择固定值时必须填写固定值")
+        try:
+            baseline = float(text)
+        except ValueError as exc:
+            raise ValueError("CSV baseline 固定值必须是数字") from exc
+    if not np.isfinite(baseline):
+        raise ValueError("CSV baseline 估计失败，请检查 raw 数据")
+    data_v = (arr - baseline) * uv_per_count * 1e-6
+    return data_v, baseline, uv_per_count
+
+
+def _prepare_yasa_raw_from_config(config: Dict[str, object]):
+    import mne  # type: ignore
+
+    path_text = config.get("path")
+    path = Path(str(path_text)) if path_text else None
+    start_s = float(config.get("start_s", 0.0))
+    end_s = float(config.get("end_s", start_s))
+    eeg_index = int(config.get("eeg_index", 0) or 0)
+    eog_index_obj = config.get("eog_index")
+    emg_index_obj = config.get("emg_index")
+    eog_index = int(eog_index_obj) if eog_index_obj is not None else None
+    emg_index = int(emg_index_obj) if emg_index_obj is not None else None
+    is_edf_like = bool(config.get("is_edf_like", False))
+    supports_browse = bool(config.get("supports_browse", False))
+    csv_raw_to_uv = bool(config.get("csv_raw_to_uv", False))
+    baseline_method_index = int(config.get("baseline_method_index", 0) or 0)
+    baseline_fixed_text = str(config.get("baseline_fixed_text", "") or "")
+    uv_per_count = float(config.get("uv_per_count", 1.0) or 1.0)
+
+    names: List[str] = []
+    ch_types: List[str] = []
+    data_rows: List[np.ndarray] = []
+    fs_values: List[float] = []
+    window_loaded = False
+    preloaded_channels: Dict[int, tuple[np.ndarray, float, str, str, float]] = {}
+    if path is not None and supports_browse and not is_edf_like and is_openbci_brainflow_eeg_file(path):
+        selected_indices = [eeg_index]
+        if eog_index is not None:
+            selected_indices.append(eog_index)
+        if emg_index is not None:
+            selected_indices.append(emg_index)
+        unique_indices = list(dict.fromkeys(selected_indices))
+        loaded = load_eeg_file_channels_window(
+            path,
+            unique_indices,
+            start_s=start_s,
+            duration_s=max(0.0, float(end_s - start_s)),
+        )
+        preloaded_channels = dict(zip(unique_indices, loaded))
+        window_loaded = True
+
+    def _append_channel(index: int, ch_type: str, fallback_label: str) -> str:
+        nonlocal window_loaded
+        if path is not None and supports_browse:
+            if int(index) in preloaded_channels:
+                raw_i, fs_i, label_i, unit_i, _actual_start_s = preloaded_channels[int(index)]
+            elif not is_edf_like and is_openbci_brainflow_eeg_file(path):
+                raw_i, fs_i, label_i, unit_i, _actual_start_s = load_eeg_file_channel_window(
+                    path,
+                    int(index),
+                    start_s=start_s,
+                    duration_s=max(0.0, float(end_s - start_s)),
+                )
+                window_loaded = True
+            else:
+                raw_i, fs_i, label_i, unit_i = load_eeg_file_channel(path, int(index))
+            label = str(label_i or fallback_label)
+        else:
+            raw_i = np.asarray(config.get("offline_current_raw", np.zeros(0)), dtype=np.float64)
+            fs_i = float(config.get("offline_current_fs", 0.0) or 0.0)
+            label = fallback_label
+            unit_i = str(config.get("offline_current_unit", "raw") or "raw")
+        arr = np.asarray(raw_i, dtype=np.float64)
+        fs_values.append(float(fs_i))
+        unit_text = str(unit_i)
+        issue = _offline_signal_quality_issue_value(
+            arr,
+            float(fs_i),
+            unit_text,
+            purpose=f"YASA {label}",
+        )
+        if issue:
+            raise ValueError(issue)
+        if (
+            path is not None
+            and not is_edf_like
+            and unit_text.strip().lower() == "raw"
+            and csv_raw_to_uv
+        ):
+            data_v, _baseline, _uv_per_count = _csv_raw_to_yasa_volts_config(
+                arr,
+                uv_per_count=uv_per_count,
+                baseline_method_index=baseline_method_index,
+                baseline_fixed_text=baseline_fixed_text,
+            )
+            data_rows.append(data_v)
+        else:
+            data_rows.append(arr * _mne_unit_scale_value(unit_text))
+        names.append(label)
+        ch_types.append(ch_type)
+        return label
+
+    eeg_name = _append_channel(eeg_index, "eeg", "EEG")
+    eog_name = _append_channel(eog_index, "eog", "EOG") if eog_index is not None else None
+    emg_name = _append_channel(emg_index, "emg", "EMG") if emg_index is not None else None
+    if not data_rows or min(row.size for row in data_rows) < 8:
+        raise ValueError("YASA 分期数据有效样本过少")
+    target_fs = float(fs_values[0])
+
+    def _resample_for_yasa(row: np.ndarray, src_fs: float, target: float) -> np.ndarray:
+        if abs(float(src_fs) - float(target)) <= 1e-6:
+            return row
+        from scipy.signal import resample_poly
+        from math import gcd
+
+        src_i = int(round(float(src_fs)))
+        target_i = int(round(float(target)))
+        if src_i <= 0 or target_i <= 0:
+            raise ValueError("YASA 通道采样率无效，无法重采样")
+        common = gcd(src_i, target_i)
+        up = target_i // common
+        down = src_i // common
+        return np.asarray(resample_poly(row, up, down), dtype=np.float64)
+
+    resampled_rows = [
+        _resample_for_yasa(row, float(fs_i), target_fs)
+        for row, fs_i in zip(data_rows, fs_values)
+    ]
+    n = min(row.size for row in resampled_rows)
+    data = np.vstack([row[:n] for row in resampled_rows])
+    info = mne.create_info(names, sfreq=target_fs, ch_types=ch_types)
+    raw_mne = mne.io.RawArray(data, info, verbose="ERROR")
+    if window_loaded:
+        tmax = max(0.0, min(float(end_s - start_s), raw_mne.times[-1]))
+        raw_mne = raw_mne.crop(tmin=0.0, tmax=tmax, include_tmax=False)
+    else:
+        tmax = max(start_s, min(end_s, raw_mne.times[-1]))
+        raw_mne = raw_mne.crop(tmin=start_s, tmax=tmax, include_tmax=False)
+    return raw_mne, eeg_name, eog_name, emg_name, target_fs
+
+
 class YasaSleepStagingWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object, object)
     failed = QtCore.pyqtSignal(str)
+    prepared = QtCore.pyqtSignal(str, str, str)
 
     def __init__(
         self,
-        raw_mne,
+        raw_mne=None,
         *,
         eeg_name: str,
         eog_name: Optional[str],
         emg_name: Optional[str],
         metadata: Dict[str, object],
         model: str,
+        prepare_config: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
         self._raw_mne = raw_mne
@@ -195,11 +422,26 @@ class YasaSleepStagingWorker(QtCore.QObject):
         self._emg_name = emg_name
         self._metadata = metadata
         self._model = model
+        self._prepare_config = prepare_config
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
             import yasa  # type: ignore
+
+            if self._prepare_config is not None:
+                (
+                    self._raw_mne,
+                    self._eeg_name,
+                    self._eog_name,
+                    self._emg_name,
+                    _target_fs,
+                ) = _prepare_yasa_raw_from_config(self._prepare_config)
+                self.prepared.emit(
+                    self._eeg_name,
+                    self._eog_name or "",
+                    self._emg_name or "",
+                )
 
             sls = yasa.SleepStaging(
                 self._raw_mne,
@@ -1091,6 +1333,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_current_time_offset_s = 0.0
         self._offline_current_title = ""
         self._offline_current_y_label = "raw"
+        self._offline_multi_compare_dialog: Optional[OfflineMultiChannelCompareDialog] = None
         self._offline_bad_segments: Dict[Tuple[str, int], List[Tuple[float, float, str]]] = {}
         self._offline_view_active = False  ## 离线分层波形查看中
         self._analysis_plot_active = False  ## 功率对比图显示中
@@ -1413,11 +1656,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "EDF/BDF 和 BrainFlow-RAW_*.csv 支持通道和窗口浏览；OpenBCI-RAW-*.txt 不作为分析输入。"
         )
         self.ui.lineEdit_offline_min_start.setToolTip(
-            "本机 CSV 按第 1 分钟起计；EDF/BDF/BrainFlow-RAW 按 0.0 分钟起计；"
+            "按秒填写起点，所有离线文件均从 0.0 秒起计；"
             "BrainFlow-RAW 留空表示加载当前通道完整时间轴。"
         )
         self.ui.lineEdit_offline_min_end.setToolTip(
-            "本机 CSV 例如 1 与 25；EDF/BDF/BrainFlow-RAW 支持一位小数，例如 0.0 与 0.5；"
+            "按秒填写终点，支持一位小数，例如 0.0 与 30.0；"
             "BrainFlow-RAW 留空表示加载当前通道完整时间轴。"
         )
         self.ui.pushButton_load_offline.setToolTip(
@@ -1427,6 +1670,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
         self._offline_channel_label = self.ui.label_offline_channel
         self._offline_channel_combo = self.ui.comboBox_offline_channel
+        self._offline_multi_compare_button = QtWidgets.QPushButton("比较...", self.ui.groupBox_offline)
+        self._offline_multi_compare_button.setEnabled(False)
+        self._offline_multi_compare_button.setToolTip(
+            "按当前离线查看时间窗和 Y 轴范围叠加比较多个通道波形"
+        )
+        self.ui.gridLayout_offline.removeWidget(self._offline_channel_combo)
+        self.ui.gridLayout_offline.addWidget(self._offline_channel_combo, 5, 1, 1, 1)
+        self.ui.gridLayout_offline.addWidget(self._offline_multi_compare_button, 5, 2, 1, 1)
         self._offline_y_label = self.ui.label_offline_y_axis
         self._offline_y_min_edit = self.ui.lineEdit_offline_y_min
         self._offline_y_max_edit = self.ui.lineEdit_offline_y_max
@@ -1439,6 +1690,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
         self._offline_channel_combo.currentIndexChanged.connect(
             self._on_offline_channel_changed
+        )
+        self._offline_multi_compare_button.clicked.connect(
+            self._show_offline_multi_channel_compare
         )
         self._offline_time_slider.valueChanged.connect(self._on_offline_scroll_changed)
         self._offline_prev_button.clicked.connect(lambda: self._step_offline_window(-1))
@@ -1856,6 +2110,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self._spindle_auto_stage_check, 7, 2, 1, 2)
         grid.addWidget(self._spindle_remove_outliers_check, 8, 0, 1, 2)
 
+        self._spindle_prefilter_check = QtWidgets.QCheckBox("YASA前去漂移滤波", ui.tab_spindle_sigma)
+        self._spindle_prefilter_check.setChecked(True)
+        self._spindle_prefilter_highpass_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_prefilter_highpass_edit.setText("0.5")
+        self._spindle_prefilter_lowpass_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
+        self._spindle_prefilter_lowpass_edit.setText("35")
+        grid.addWidget(self._spindle_prefilter_check, 9, 0, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("高/低通(Hz)", ui.tab_spindle_sigma), 9, 1, 1, 1)
+        grid.addWidget(self._spindle_prefilter_highpass_edit, 9, 2, 1, 1)
+        grid.addWidget(self._spindle_prefilter_lowpass_edit, 9, 3, 1, 1)
+
         self._kcomplex_enable_check = QtWidgets.QCheckBox("启用 K-complex 候选修正", ui.tab_spindle_sigma)
         self._kcomplex_enable_check.setChecked(True)
         self._kcomplex_band_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
@@ -1868,15 +2133,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._kcomplex_ptp_uv_edit.setText("75")
         self._kcomplex_neg_uv_edit = QtWidgets.QLineEdit(ui.tab_spindle_sigma)
         self._kcomplex_neg_uv_edit.setText("40")
-        grid.addWidget(self._kcomplex_enable_check, 9, 0, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("K低频带(Hz)", ui.tab_spindle_sigma), 9, 2, 1, 1)
-        grid.addWidget(self._kcomplex_band_edit, 9, 3, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("K持续时间(s)", ui.tab_spindle_sigma), 10, 0, 1, 1)
-        grid.addWidget(self._kcomplex_duration_min_edit, 10, 1, 1, 1)
-        grid.addWidget(self._kcomplex_duration_max_edit, 10, 2, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("K PTP/负峰(uV)", ui.tab_spindle_sigma), 11, 0, 1, 1)
-        grid.addWidget(self._kcomplex_ptp_uv_edit, 11, 1, 1, 1)
-        grid.addWidget(self._kcomplex_neg_uv_edit, 11, 2, 1, 1)
+        grid.addWidget(self._kcomplex_enable_check, 10, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("K低频带(Hz)", ui.tab_spindle_sigma), 10, 2, 1, 1)
+        grid.addWidget(self._kcomplex_band_edit, 10, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("K持续时间(s)", ui.tab_spindle_sigma), 11, 0, 1, 1)
+        grid.addWidget(self._kcomplex_duration_min_edit, 11, 1, 1, 1)
+        grid.addWidget(self._kcomplex_duration_max_edit, 11, 2, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("K PTP/负峰(uV)", ui.tab_spindle_sigma), 12, 0, 1, 1)
+        grid.addWidget(self._kcomplex_ptp_uv_edit, 12, 1, 1, 1)
+        grid.addWidget(self._kcomplex_neg_uv_edit, 12, 2, 1, 1)
 
         ui.pushButton_spindle_sigma_mark.setEnabled(True)
         ui.pushButton_spindle_sigma_mark.setText("运行 Spindle/K-complex 检测并修正分期")
@@ -2534,10 +2799,38 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"YASA 正在准备数据: {label} | {offset_s + start_s:.1f}-{offset_s + end_s:.1f}s"
             )
             QtWidgets.QApplication.processEvents()
-            raw_mne, eeg_name, eog_name, emg_name, _fs = self._make_yasa_raw_from_ui(
-                start_s=start_s,
-                end_s=end_s,
-            )
+            path = getattr(self, "_offline_csv_path", None)
+            eeg_index = self._yasa_eeg_combo.currentData()
+            eog_index = self._yasa_eog_combo.currentData()
+            emg_index = self._yasa_emg_combo.currentData()
+            uv_text = self._yasa_csv_uv_per_count_edit.text().strip()
+            try:
+                uv_per_count = float(uv_text)
+            except ValueError as exc:
+                raise ValueError("CSV uV/count 必须是数字") from exc
+            prepare_config: Dict[str, object] = {
+                "path": str(path) if path is not None else "",
+                "supports_browse": bool(path is not None and self._supports_offline_channel_browse(path)),
+                "is_edf_like": bool(path is not None and self._is_edf_like_file(path)),
+                "eeg_index": int(eeg_index or 0),
+                "eog_index": int(eog_index) if eog_index is not None else None,
+                "emg_index": int(emg_index) if emg_index is not None else None,
+                "start_s": float(start_s),
+                "end_s": float(end_s),
+                "csv_raw_to_uv": bool(self._yasa_csv_raw_to_uv_check.isChecked()),
+                "baseline_method_index": int(self._yasa_csv_baseline_method_combo.currentIndex()),
+                "baseline_fixed_text": self._yasa_csv_baseline_value_edit.text().strip(),
+                "uv_per_count": uv_per_count,
+                "offline_current_raw": np.asarray(
+                    getattr(self, "_offline_current_raw", np.zeros(0)),
+                    dtype=np.float64,
+                ).copy(),
+                "offline_current_fs": float(getattr(self, "_offline_current_fs", 0.0)),
+                "offline_current_unit": str(getattr(self, "_offline_current_y_label", "raw") or "raw"),
+            }
+            eeg_name_hint = self._yasa_eeg_combo.currentText().strip() or "EEG"
+            eog_name_hint = self._yasa_eog_combo.currentText().strip() if eog_index is not None else ""
+            emg_name_hint = self._yasa_emg_combo.currentText().strip() if emg_index is not None else ""
             metadata = self._yasa_metadata_from_ui()
             model = self._yasa_model_edit.text().strip() or "auto"
             self._yasa_pending_context = {
@@ -2550,15 +2843,23 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             }
             thread = QtCore.QThread(self)
             worker = YasaSleepStagingWorker(
-                raw_mne,
-                eeg_name=eeg_name,
-                eog_name=eog_name,
-                emg_name=emg_name,
+                None,
+                eeg_name=eeg_name_hint,
+                eog_name=eog_name_hint or None,
+                emg_name=emg_name_hint or None,
                 metadata=metadata,
                 model=model,
+                prepare_config=prepare_config,
             )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
+            worker.prepared.connect(
+                lambda eeg, eog, emg: self._log(
+                    f"YASA 后台数据准备完成: EEG={eeg}"
+                    f"{', EOG=' + eog if eog else ''}"
+                    f"{', EMG=' + emg if emg else ''}"
+                )
+            )
             worker.finished.connect(self._finish_yasa_sleep_staging)
             worker.failed.connect(self._fail_yasa_sleep_staging)
             worker.finished.connect(thread.quit)
@@ -2572,9 +2873,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._set_yasa_running(True)
             thread.start()
             self._log(
-                f"YASA 后台分期已启动: EEG={eeg_name}"
-                f"{', EOG=' + eog_name if eog_name else ''}"
-                f"{', EMG=' + emg_name if emg_name else ''}"
+                f"YASA 后台分期已启动: EEG={eeg_name_hint}"
+                f"{', EOG=' + eog_name_hint if eog_name_hint else ''}"
+                f"{', EMG=' + emg_name_hint if emg_name_hint else ''}"
             )
         except Exception as exc:
             self._yasa_pending_context = None
@@ -3279,6 +3580,36 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             row["refine_reason"] = reason
         return refined
 
+    def _preprocess_spindle_raw_for_yasa(self, mne, raw_crop):
+        check = getattr(self, "_spindle_prefilter_check", None)
+        if check is None or not check.isChecked():
+            return raw_crop
+        hp = self._read_spindle_float(self._spindle_prefilter_highpass_edit, "spindle预处理高通")
+        lp = self._read_spindle_float(self._spindle_prefilter_lowpass_edit, "spindle预处理低通")
+        fs = float(raw_crop.info["sfreq"])
+        nyq = fs * 0.5
+        if hp <= 0 or lp <= 0:
+            raise ValueError("spindle预处理高通/低通必须大于0")
+        if hp >= lp:
+            raise ValueError("spindle预处理高通必须小于低通")
+        if lp >= nyq:
+            raise ValueError(f"spindle预处理低通必须小于 Nyquist={nyq:g} Hz")
+        data = np.asarray(raw_crop.get_data(), dtype=np.float64)
+        if data.shape[-1] < max(16, int(round(fs * 2.0))):
+            raise ValueError("spindle预处理数据过短")
+        data = data - np.nanmedian(data, axis=1, keepdims=True)
+        try:
+            from scipy.signal import butter, sosfiltfilt
+        except ImportError as exc:
+            raise ValueError("spindle预处理需要 scipy.signal") from exc
+        sos = butter(4, [hp / nyq, lp / nyq], btype="bandpass", output="sos")
+        data = sosfiltfilt(sos, data, axis=-1)
+        info = raw_crop.info.copy()
+        filtered = mne.io.RawArray(data, info, verbose="ERROR")
+        filtered.set_annotations(raw_crop.annotations.copy())
+        self._log(f"spindle YASA输入预处理: 去中位数 + {hp:g}-{lp:g} Hz零相位带通")
+        return filtered
+
     @QtCore.pyqtSlot()
     def _run_yasa_spindle_refinement(self) -> None:
         data = self._sleep_feature_data()
@@ -3326,6 +3657,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 tmax=max(start_s, min(end_s, raw_mne.times[-1])),
                 include_tmax=False,
             )
+            raw_spindle = self._preprocess_spindle_raw_for_yasa(_mne, raw_crop)
             origin_abs_s = float(offset_s + start_s)
             hypno = None
             if self._spindle_use_yasa_stage_check.isChecked():
@@ -3354,7 +3686,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 "rms": self._read_spindle_float(self._spindle_thresh_rms_edit, "rms阈值"),
             }
             result = yasa.spindles_detect(
-                raw_crop,
+                raw_spindle,
                 hypno=hypno,
                 include=self._read_spindle_include_codes(),
                 freq_sp=freq_sp,
@@ -3368,6 +3700,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             summary = result.summary() if result is not None else None
             events = self._spindle_events_from_summary(summary)
             data_uv = np.asarray(raw_crop.get_data(picks=[0])[0], dtype=np.float64) * 1e6
+            spindle_data_uv = np.asarray(raw_spindle.get_data(picks=[0])[0], dtype=np.float64) * 1e6
             k_events: List[Dict[str, float]] = []
             if self._kcomplex_enable_check.isChecked():
                 k_events = self._detect_kcomplex_candidates(
@@ -3397,8 +3730,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     "若输入无误，优先尝试 C3/C4 或 F3/F4，或临时关闭 stage_yasa 约束、放宽频段到 11-16 Hz/降低阈值后复核"
                 )
                 self._log_spindle_zero_diagnostics(
-                    data_uv,
-                    float(raw_crop.info["sfreq"]),
+                    spindle_data_uv,
+                    float(raw_spindle.info["sfreq"]),
                     rows,
                     origin_abs_s=origin_abs_s,
                     freq_sp=freq_sp,
@@ -4691,44 +5024,24 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         ):
             self._load_offline_eeg_csv()
 
-    def _parse_offline_minute_range(self) -> Optional[Tuple[int, int]]:
-        """解析分钟起止；都空返回 None；只填一侧或非法则抛 ValueError。"""
+    def _parse_offline_second_range(self) -> Optional[Tuple[float, float]]:
+        """解析秒起止；都空返回 None；只填一侧或非法则抛 ValueError。"""
         start_text = self.ui.lineEdit_offline_min_start.text().strip()
         end_text = self.ui.lineEdit_offline_min_end.text().strip()
         if not start_text and not end_text:
             return None
         if not start_text or not end_text:
-            raise ValueError("请同时填写起始分钟与结束分钟，或都留空显示全部")
+            raise ValueError("请同时填写起始秒与结束秒，或都留空显示全部")
         try:
-            start_m = int(float(start_text))
-            end_m = int(float(end_text))
+            start_s = float(start_text)
+            end_s = float(end_text)
         except ValueError as exc:
-            raise ValueError("分钟须为数字，例如起 3、止 9") from exc
-        if start_m < 1 or end_m < 1:
-            raise ValueError("分钟从 1 开始计数")
-        if end_m < start_m:
-            raise ValueError(f"结束分钟 {end_m} 不能小于起始分钟 {start_m}")
-        return start_m, end_m
-
-    def _clear_zero_based_minutes_for_csv(self) -> bool:
-        """Clear EDF-style 0.x minute ranges before loading CSV files."""
-        start_text = self.ui.lineEdit_offline_min_start.text().strip()
-        end_text = self.ui.lineEdit_offline_min_end.text().strip()
-        if not start_text and not end_text:
-            return False
-        try:
-            values = [float(text) for text in (start_text, end_text) if text]
-        except ValueError:
-            return False
-        if values and min(values) < 1.0:
-            self.ui.lineEdit_offline_min_start.blockSignals(True)
-            self.ui.lineEdit_offline_min_end.blockSignals(True)
-            self.ui.lineEdit_offline_min_start.clear()
-            self.ui.lineEdit_offline_min_end.clear()
-            self.ui.lineEdit_offline_min_start.blockSignals(False)
-            self.ui.lineEdit_offline_min_end.blockSignals(False)
-            return True
-        return False
+            raise ValueError("秒数须为数字，例如起 360、止 1080") from exc
+        if start_s < 0 or end_s < 0:
+            raise ValueError("秒数不能小于 0")
+        if end_s <= start_s:
+            raise ValueError(f"结束秒 {end_s:g} 必须大于起始秒 {start_s:g}")
+        return start_s, end_s
 
     @staticmethod
     def _is_offline_full_csv(path: Path) -> bool:
@@ -4787,6 +5100,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             and self._offline_channel_combo.count() > 1
         )
         self._offline_channel_combo.blockSignals(False)
+        self._sync_offline_multi_compare_button_enabled()
 
     def _load_offline_edf_channel(self, path: Path, channel_index: int) -> None:
         raw, fs, label, unit = load_eeg_file_channel(path, channel_index)
@@ -4930,20 +5244,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
 
     def _parse_offline_text_window_seconds(self) -> tuple[float, Optional[float]]:
-        start_m = self._parse_one_decimal_minutes(
-            self.ui.lineEdit_offline_min_start.text(), "起始分钟"
+        start_s = self._parse_one_decimal_seconds(
+            self.ui.lineEdit_offline_min_start.text(), "起始秒"
         )
-        end_m = self._parse_one_decimal_minutes(
-            self.ui.lineEdit_offline_min_end.text(), "结束分钟"
+        end_s = self._parse_one_decimal_seconds(
+            self.ui.lineEdit_offline_min_end.text(), "结束秒"
         )
-        if start_m is None and end_m is None:
+        if start_s is None and end_s is None:
             return 0.0, None
-        if start_m is None or end_m is None:
-            raise ValueError("BrainFlow CSV 请同时填写起始分钟和结束分钟；都留空则加载当前通道完整时间轴")
-        start_s = float(start_m) * 60.0
-        end_s = float(end_m) * 60.0
+        if start_s is None or end_s is None:
+            raise ValueError("BrainFlow CSV 请同时填写起始秒和结束秒；都留空则加载当前通道完整时间轴")
         if end_s <= start_s:
-            raise ValueError("结束分钟必须大于起始分钟")
+            raise ValueError("结束秒必须大于起始秒")
         return start_s, end_s
 
     def _configure_offline_time_slider(self, reset_start: bool) -> None:
@@ -5003,42 +5315,40 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_current_y_label = self._offline_full_unit
         self._apply_offline_y_limits()
 
-    def _parse_one_decimal_minutes(self, text: str, field_name: str) -> Optional[float]:
+    def _parse_one_decimal_seconds(self, text: str, field_name: str) -> Optional[float]:
         value = text.strip()
         if not value:
             return None
         if "." in value and len(value.split(".", 1)[1]) > 1:
             raise ValueError(f"{field_name}最多支持一位小数")
         try:
-            minutes = float(value)
+            seconds = float(value)
         except ValueError as exc:
             raise ValueError(f"{field_name}必须是数字") from exc
-        if minutes < 0:
+        if seconds < 0:
             raise ValueError(f"{field_name}不能小于 0")
-        return minutes
+        return seconds
 
     def _parse_offline_edf_window_seconds(self) -> tuple[float, float]:
-        start_m = self._parse_one_decimal_minutes(
-            self.ui.lineEdit_offline_min_start.text(), "起始分钟"
+        start_s = self._parse_one_decimal_seconds(
+            self.ui.lineEdit_offline_min_start.text(), "起始秒"
         )
-        end_m = self._parse_one_decimal_minutes(
-            self.ui.lineEdit_offline_min_end.text(), "结束分钟"
+        end_s = self._parse_one_decimal_seconds(
+            self.ui.lineEdit_offline_min_end.text(), "结束秒"
         )
         duration_s = (
             float(self._offline_full_raw.size / self._offline_full_fs)
             if self._offline_full_fs > 0
             else 0.0
         )
-        if start_m is None and end_m is None:
+        if start_s is None and end_s is None:
             return 0.0, min(float(OFFLINE_EDF_WINDOW_SEC), duration_s)
-        if start_m is None or end_m is None:
-            raise ValueError("多通道离线查看请同时填写起始分钟和结束分钟，或都留空")
-        start_s = float(start_m) * 60.0
-        end_s = float(end_m) * 60.0
+        if start_s is None or end_s is None:
+            raise ValueError("多通道离线查看请同时填写起始秒和结束秒，或都留空")
         if end_s <= start_s:
-            raise ValueError("结束分钟必须大于起始分钟")
+            raise ValueError("结束秒必须大于起始秒")
         if start_s >= duration_s:
-            raise ValueError(f"起始分钟超出文件时长（约 {duration_s / 60.0:.1f} 分钟）")
+            raise ValueError(f"起始秒超出文件时长（约 {duration_s:.1f} 秒）")
         return start_s, min(end_s, duration_s)
 
     def _sync_offline_y_axis_controls(self) -> None:
@@ -5077,6 +5387,108 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raise ValueError("Y轴范围必须是数字") from exc
         self._offline_view.set_y_limits(y_min, y_max)
 
+    def _current_offline_y_limits(self) -> Optional[tuple[float, float]]:
+        limits = getattr(self._offline_view, "_y_limits", None)
+        if limits is None:
+            return None
+        return float(limits[0]), float(limits[1])
+
+    def _sync_offline_multi_compare_button_enabled(self) -> None:
+        button = getattr(self, "_offline_multi_compare_button", None)
+        if button is None:
+            return
+        path = getattr(self, "_offline_csv_path", None)
+        info = getattr(self, "_offline_file_info", None)
+        has_multi = bool(
+            path is not None
+            and self._offline_view_active
+            and self._supports_offline_channel_browse(path)
+            and info is not None
+            and len(getattr(info, "channel_labels", [])) > 1
+            and self._offline_current_raw.size >= 8
+        )
+        button.setEnabled(has_multi)
+
+    @QtCore.pyqtSlot()
+    def _show_offline_multi_channel_compare(self) -> None:
+        path = getattr(self, "_offline_csv_path", None)
+        info = getattr(self, "_offline_file_info", None)
+        if (
+            path is None
+            or info is None
+            or not self._offline_view_active
+            or not self._supports_offline_channel_browse(path)
+        ):
+            self._log("请先加载支持多通道的离线文件")
+            return
+        labels = list(getattr(info, "channel_labels", []))
+        if len(labels) <= 1:
+            self._log("当前离线文件只有一个可用通道，无法进行多通道比较")
+            return
+        start_s = float(getattr(self, "_offline_current_time_offset_s", 0.0))
+        fs_current = float(getattr(self, "_offline_current_fs", DEFAULT_SAMPLE_RATE))
+        duration_s = float(self._offline_current_raw.size / max(fs_current, 1.0))
+        if duration_s <= 0:
+            self._log("当前离线窗口没有有效波形数据")
+            return
+        try:
+            channel_indices = list(range(len(labels)))
+            loaded = load_eeg_file_channels_window(
+                path,
+                channel_indices,
+                start_s=start_s,
+                duration_s=duration_s,
+            )
+            channels: List[tuple[str, np.ndarray, np.ndarray, str]] = []
+            y_label = str(getattr(self._offline_view, "_raw_y_label", self._offline_full_unit) or self._offline_full_unit)
+            sample_rates: List[float] = []
+            actual_starts: List[float] = []
+            for raw, fs, label, unit, actual_start_s in loaded:
+                sample_rates.append(float(fs))
+                actual_starts.append(float(actual_start_s))
+                values = np.asarray(raw, dtype=np.float64)
+                raw_values = values
+                note = ""
+                if is_openbci_brainflow_eeg_file(path):
+                    display_values, display_label, note, baseline = self._openbci_display_raw_args(
+                        values,
+                        unit,
+                    )
+                    raw_values = values - float(baseline)
+                    values = np.asarray(display_values, dtype=np.float64)
+                    y_label = display_label
+                else:
+                    y_label = unit or y_label
+                channels.append((label, raw_values, values, note))
+            if not channels:
+                self._log("没有读取到可比较的通道数据")
+                return
+            fs = float(np.median(np.asarray(sample_rates, dtype=np.float64))) if sample_rates else fs_current
+            actual_start = min(actual_starts) if actual_starts else start_s
+            if self._offline_multi_compare_dialog is None:
+                self._offline_multi_compare_dialog = OfflineMultiChannelCompareDialog(self)
+            current_index = max(0, self._offline_channel_combo.currentIndex())
+            title = f"{path.name} | 多通道比较"
+            self._offline_multi_compare_dialog.load_channels(
+                channels,
+                fs,
+                start_s=actual_start,
+                source_name=title,
+                y_label=y_label,
+                y_limits=self._current_offline_y_limits(),
+                current_index=current_index,
+                source_path=path,
+            )
+            self._offline_multi_compare_dialog.show()
+            self._offline_multi_compare_dialog.raise_()
+            self._offline_multi_compare_dialog.activateWindow()
+            self._log(
+                f"多通道波形比较已加载: {path.name} | {len(channels)} 通道 | "
+                f"{actual_start:.1f}-{actual_start + duration_s:.1f}s"
+            )
+        except Exception as exc:
+            self._log(f"多通道波形比较失败: {exc}")
+
     def _set_offline_minute_edits_from_window(self) -> None:
         if self._offline_full_fs <= 0 or self._offline_full_raw.size == 0:
             return
@@ -5087,16 +5499,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         )
         self.ui.lineEdit_offline_min_start.blockSignals(True)
         self.ui.lineEdit_offline_min_end.blockSignals(True)
-        self.ui.lineEdit_offline_min_start.setText(f"{start_s / 60.0:.1f}")
-        self.ui.lineEdit_offline_min_end.setText(f"{end_s / 60.0:.1f}")
+        self.ui.lineEdit_offline_min_start.setText(f"{start_s:.1f}")
+        self.ui.lineEdit_offline_min_end.setText(f"{end_s:.1f}")
         self.ui.lineEdit_offline_min_start.blockSignals(False)
         self.ui.lineEdit_offline_min_end.blockSignals(False)
 
     def _set_offline_minute_edits(self, start_s: float, end_s: float) -> None:
         self.ui.lineEdit_offline_min_start.blockSignals(True)
         self.ui.lineEdit_offline_min_end.blockSignals(True)
-        self.ui.lineEdit_offline_min_start.setText(f"{float(start_s) / 60.0:.1f}")
-        self.ui.lineEdit_offline_min_end.setText(f"{float(end_s) / 60.0:.1f}")
+        self.ui.lineEdit_offline_min_start.setText(f"{float(start_s):.1f}")
+        self.ui.lineEdit_offline_min_end.setText(f"{float(end_s):.1f}")
         self.ui.lineEdit_offline_min_start.blockSignals(False)
         self.ui.lineEdit_offline_min_end.blockSignals(False)
 
@@ -5220,9 +5632,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _load_offline_selected_slice(
         self,
         path: Path,
-        minute_range: Optional[Tuple[int, int]],
+        second_range: Optional[Tuple[float, float]],
     ) -> tuple[np.ndarray, float, str, float]:
-        """按所选文件类型加载；分钟跨度超出单文件时向后拼接同类型 chunk。"""
+        """按所选文件类型加载；秒跨度超出单文件时向后拼接同类型 chunk。"""
         raw, fs = load_eeg_csv_with_rate(path)
         data = np.asarray(raw, dtype=np.float64)
         fs = float(fs)
@@ -5230,23 +5642,22 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         kind = "完整" if is_full else "剔坏后"
         used_names = [path.name]
 
-        if minute_range is None:
+        if second_range is None:
             if data.size < 8:
                 raise ValueError(f"{kind}数据有效样本过少")
             base_title = f"{kind}·{path.name}"
             return data, fs, base_title, 0.0
 
-        start_m, end_m = minute_range
-        n_per_min = max(1, int(round(fs * 60.0)))
-        i0 = (start_m - 1) * n_per_min
-        i1 = end_m * n_per_min
+        start_s, end_s = second_range
+        i0 = max(0, int(round(float(start_s) * fs)))
+        i1 = max(i0 + 1, int(round(float(end_s) * fs)))
 
         siblings = self._list_offline_sibling_chunks(path)
         need_concat = i1 > data.size or i0 >= data.size
         path_res = path.resolve()
         sibling_res = [p.resolve() for p in siblings]
         if need_concat and path_res in sibling_res:
-            # 从所选 chunk 起向后拼，直到覆盖结束分钟（或拼完）
+            # 从所选 chunk 起向后拼，直到覆盖结束秒（或拼完）
             start_idx = sibling_res.index(path_res)
             parts: List[np.ndarray] = []
             used_names = []
@@ -5263,21 +5674,20 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             data = np.concatenate(parts) if parts else data
             if rates:
                 fs = float(np.median(np.asarray(rates, dtype=np.float64)))
-                n_per_min = max(1, int(round(fs * 60.0)))
-                i0 = (start_m - 1) * n_per_min
-                i1 = end_m * n_per_min
+                i0 = max(0, int(round(float(start_s) * fs)))
+                i1 = max(i0 + 1, int(round(float(end_s) * fs)))
 
-        total_min = data.size / fs / 60.0 if fs > 0 else 0.0
+        total_s = data.size / fs if fs > 0 else 0.0
         if i0 >= data.size:
             raise ValueError(
-                f"起始分钟 {start_m} 超出{kind}可用长度（约 {total_min:.1f} 分钟；"
+                f"起始秒 {start_s:g} 超出{kind}可用长度（约 {total_s:.1f} 秒；"
                 f"已用 {', '.join(used_names[:3])}"
                 f"{'…' if len(used_names) > 3 else ''}）"
             )
         segment = data[i0 : min(i1, int(data.size))]
         if segment.size < 8:
             raise ValueError(f"截取后样本过少（{segment.size} 点）")
-        time_offset_s = float((start_m - 1) * 60)
+        time_offset_s = float(start_s)
         if len(used_names) == 1:
             base_title = f"{kind}·{used_names[0]}"
         else:
@@ -5285,9 +5695,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"{kind}·拼接{len(used_names)}个"
                 f"（{used_names[0]}…{used_names[-1]}）"
             )
-        title = f"{base_title} · 分钟{start_m}–{end_m}"
+        title = f"{base_title} · 秒{start_s:g}–{end_s:g}"
         if segment.size < (i1 - i0):
-            title += f"（实际约 {segment.size / fs / 60.0:.1f} 分钟，后续 chunk 不足）"
+            title += f"（实际约 {segment.size / fs:.1f} 秒，后续 chunk 不足）"
         return segment, fs, title, time_offset_s
 
     def _browse_offline_eeg_csv(self) -> None:
@@ -5337,6 +5747,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view.show()
         self._offline_view.raise_()
         self.setWindowTitle(f"EEG 离线查看 · {title}")
+        self._sync_offline_multi_compare_button_enabled()
         self._update_status_bar()
 
     @QtCore.pyqtSlot()
@@ -5359,16 +5770,14 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         self._offline_csv_path = path
         self._offline_loaded_channel = 0
-        if self._clear_zero_based_minutes_for_csv():
-            self._log("CSV 分钟框里有 EDF 的 0.x 起点格式，已清空并按全段加载")
         try:
-            minute_range = self._parse_offline_minute_range()
+            second_range = self._parse_offline_second_range()
         except ValueError as exc:
             self._log(str(exc))
             return
         try:
             raw, fs, title, time_offset_s = self._load_offline_selected_slice(
-                path, minute_range
+                path, second_range
             )
             remove_mask = None
             if self._want_reject_mask_power():
@@ -5436,6 +5845,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_channel_combo.addItem(label, 0)
         self._offline_channel_combo.setEnabled(False)
         self._offline_channel_combo.blockSignals(False)
+        self._sync_offline_multi_compare_button_enabled()
         self._offline_time_slider.blockSignals(True)
         self._offline_time_slider.setRange(0, 0)
         self._offline_time_slider.setValue(0)
@@ -5443,7 +5853,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_time_slider.blockSignals(False)
         self._offline_prev_button.setEnabled(False)
         self._offline_next_button.setEnabled(False)
-        self._offline_time_status.setText("CSV 全段/分钟截取")
+        self._offline_time_status.setText("CSV 全段/秒截取")
         self._offline_view.scroll_panel.hide()
         self._analysis_plot_active = False
         self._analysis_plot.hide()
@@ -5461,10 +5871,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view.show()
         self._offline_view.raise_()
         self.setWindowTitle(f"EEG 离线查看 · {title}")
+        self._sync_offline_multi_compare_button_enabled()
         range_tip = (
-            f"；截取分钟 {minute_range[0]}–{minute_range[1]}（墙钟约 "
+            f"；截取秒 {second_range[0]:g}–{second_range[1]:g}（墙钟约 "
             f"{time_offset_s:.0f}–{time_offset_s + n / fs:.0f} s）"
-            if minute_range is not None
+            if second_range is not None
             else ""
         )
         mark_tip = "；红带标注坏段" if remove_mask is not None else ""
@@ -5479,6 +5890,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not self._offline_view_active and not self._offline_view.has_data:
             return
         self._offline_view_active = False
+        self._sync_offline_multi_compare_button_enabled()
         self._offline_view.clear()
         self._offline_view.scroll_panel.hide()
         self._offline_view.hide()

@@ -812,7 +812,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                </size>
               </property>
               <property name="text">
-               <string>分钟</string>
+               <string>秒</string>
               </property>
               <property name="alignment">
                <set>Qt::AlignCenter</set>
@@ -822,14 +822,14 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
             <item row="1" column="1">
              <widget class="QLineEdit" name="lineEdit_offline_min_start">
               <property name="placeholderText">
-               <string>起(如6)</string>
+               <string>起(如360)</string>
               </property>
              </widget>
             </item>
             <item row="1" column="2">
              <widget class="QLineEdit" name="lineEdit_offline_min_end">
               <property name="placeholderText">
-               <string>止(如18)</string>
+               <string>止(如1080)</string>
               </property>
              </widget>
             </item>
