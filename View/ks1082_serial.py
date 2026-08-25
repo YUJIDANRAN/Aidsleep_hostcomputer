@@ -1,18 +1,14 @@
 """
-KS1082 串口协议（与 STM32 固件 send_data_cnt 逻辑一致）。
+KS1082 / 上位机串口协议。
 
-每次 DMA 完成发送一个采样时刻的数据：
-  send_data_cnt == 0 时先发校位 0xFF，再发 CH1_L、CH1_H
-  其余时刻只发 CH1_L、CH1_H
-  send_data_cnt += 2，到 32 归零 → 每 16 个采样重复一次校位
+单通道（HostUart_SendEeg，每采样 1 帧 9 字节）：
+  AA 55 | 01 | 04 | seq_L seq_H | eeg_L eeg_H | xor
+  xor = 01 ^ 04 ^ payload[0..3]
+  seq / eeg 均为小端 uint16。
 
-CH1 数据：
-  数字滤波开：Send_Filter_Data = (u16)(Filter_Data * 10000)
-  数字滤波关：ADC_Buffer[0]（12 位 ADC，0~4095）
-先发低字节 L，再高字节 H；若 L==0xFF 则线上发 0xFE，解码时还原。
-
-若固件仍发送 CH2（每点再发 2 字节），将 CH2_BYTES_ON_WIRE 设为 2。
-当前默认仅 CH1（CH2_BYTES_ON_WIRE=0）。
+多通道（≥2）仍使用旧线格式：
+  send_data_cnt == 0 时先发校位 0xFF，再发各通道 L/H；
+  其余时刻只发通道数据；若 L==0xFF 则线上发 0xFE，解码时还原。
 """
 
 from __future__ import annotations
@@ -31,31 +27,32 @@ except ImportError as exc:  # pragma: no cover
 else:
     _SERIAL_IMPORT_ERROR = None
 
+# 单通道成帧协议（与 HostUart_SendEeg 一致）
+HOST_UART_SYNC0 = 0xAA
+HOST_UART_SYNC1 = 0x55
+HOST_UART_TYPE_EEG = 0x01
+HOST_UART_LEN_EEG = 0x04
+HOST_UART_FRAME_SIZE = 2 + 1 + 1 + HOST_UART_LEN_EEG + 1  ## 9
+
+# 多通道旧协议
 SYNC_BYTE = 0xFF
-SYNC_CNT_STEP = 2  ## 固件 send_data_cnt 每次 +2
-SYNC_CNT_WRAP = 32  ## 固件 send_data_cnt 到 32 归零
-SAMPLES_PER_SYNC_GROUP = SYNC_CNT_WRAP // SYNC_CNT_STEP  ## 16 点/组
+SYNC_CNT_STEP = 2
+SYNC_CNT_WRAP = 32
+SAMPLES_PER_SYNC_GROUP = SYNC_CNT_WRAP // SYNC_CNT_STEP
 CH1_BYTES_ON_WIRE = 2
-CH2_BYTES_ON_WIRE = 0  ## 仅 CH1=0；若固件仍发 CH2 则改为 2
+CH2_BYTES_ON_WIRE = 0
 WIRE_BYTES_PER_TICK = CH1_BYTES_ON_WIRE + CH2_BYTES_ON_WIRE
 DUAL_CHANNEL_COUNT = 2
 MULTI_CHANNEL_COUNT = 6
 MULTI_BYTES_PER_TICK = MULTI_CHANNEL_COUNT * 2
 MCU_SAMPLE_RATE = 500
-BYTES_PER_SECOND = int(
-    MCU_SAMPLE_RATE
-    * (
-        1 + WIRE_BYTES_PER_TICK
-        + (SAMPLES_PER_SYNC_GROUP - 1) * WIRE_BYTES_PER_TICK
-    )
-    / SAMPLES_PER_SYNC_GROUP
-)
+BYTES_PER_SECOND = MCU_SAMPLE_RATE * HOST_UART_FRAME_SIZE
 POLL_READ_MAX_BYTES = 8192
 MAX_PARSER_BUF = 8192
 LOW_BYTE_ESCAPE = 0xFE
-UINT16_MASK = 0xFFFF  ## 下位机按 uint16_t 传输，可能是 ADC count，也可能是滤波/缩放后的协议值
-RAW_TYPICAL_MID = 2000.0  ## raw 显示默认中心（0~4096 量程中部）
-RAW_TYPICAL_AMP = 2200.0  ## raw 显示默认半幅
+UINT16_MASK = 0xFFFF
+RAW_TYPICAL_MID = 2000.0
+RAW_TYPICAL_AMP = 2200.0
 
 
 @dataclass(frozen=True)
@@ -65,23 +62,24 @@ class AdcSample:
     channel1: int
     channel2: int = 0
     channels: Tuple[int, ...] = ()
+    sequence: Optional[int] = None  ## 单通道成帧协议中的 pink_seq；多通道为 None
 
     def __post_init__(self) -> None:
         if not self.channels:
             object.__setattr__(self, "channels", (self.channel1,))
 
     @staticmethod
-    def decode_u16_le(data_low: int, data_high: int) -> int:
-        """Decode little-endian word; 0xFE on low byte is restored to 0xFF."""
+    def decode_u16_le(data_low: int, data_high: int, *, escape: bool = True) -> int:
+        """Decode little-endian word; optional 0xFE→0xFF restore for old multi protocol."""
         low = data_low & 0xFF
-        if low == LOW_BYTE_ESCAPE:
+        if escape and low == LOW_BYTE_ESCAPE:
             low = 0xFF
         high = data_high & 0xFF
         return ((high << 8) | low) & UINT16_MASK
 
     @staticmethod
     def decode_ch1_le(data_low: int, data_high: int) -> int:
-        return AdcSample.decode_u16_le(data_low, data_high)
+        return AdcSample.decode_u16_le(data_low, data_high, escape=True)
 
     @classmethod
     def from_ch1_bytes(cls, data_low: int, data_high: int) -> "AdcSample":
@@ -89,9 +87,14 @@ class AdcSample:
         return cls(channel1=value, channels=(value,))
 
     @classmethod
+    def from_framed_eeg(cls, seq: int, eeg: int) -> "AdcSample":
+        value = int(eeg) & UINT16_MASK
+        return cls(channel1=value, channels=(value,), sequence=int(seq) & UINT16_MASK)
+
+    @classmethod
     def from_channel_bytes(cls, payload: bytes, channel_count: int) -> "AdcSample":
         values = tuple(
-            cls.decode_u16_le(payload[index * 2], payload[index * 2 + 1])
+            cls.decode_u16_le(payload[index * 2], payload[index * 2 + 1], escape=True)
             for index in range(channel_count)
         )
         return cls(channel1=values[0] if values else 0, channels=values)
@@ -99,9 +102,8 @@ class AdcSample:
 
 class AdcStreamParser:
     """
-    按固件 send_data_cnt 解析：
-      _ticks_in_group == 0 → 消费 0xFF 校位，再读 CH1（及可选 CH2 丢弃）
-      _ticks_in_group == 1..15 → 直接读 CH1
+    单通道：解析 AA 55 | 01 | 04 | seq | eeg | xor。
+    多通道：旧 send_data_cnt + 0xFF 校位协议。
     """
 
     def __init__(self) -> None:
@@ -109,7 +111,7 @@ class AdcStreamParser:
 
     def reset(self) -> None:
         self._buf = bytearray()
-        self._ticks_in_group = 0  ## 0~15，对应 send_data_cnt 0,2,...,30
+        self._ticks_in_group = 0
         self._channel_count = getattr(self, "_channel_count", 1)
 
     def set_channel_count(self, channel_count: int) -> None:
@@ -129,6 +131,17 @@ class AdcStreamParser:
 
     def _trim_buffer_if_needed(self) -> None:
         if len(self._buf) <= MAX_PARSER_BUF:
+            return
+        if self._channel_count == 1:
+            sync_at = -1
+            for index in range(len(self._buf) - 1, 0, -1):
+                if self._buf[index - 1] == HOST_UART_SYNC0 and self._buf[index] == HOST_UART_SYNC1:
+                    sync_at = index - 1
+                    break
+            if sync_at >= 0:
+                self._buf = self._buf[sync_at:]
+            else:
+                self._buf.clear()
             return
         sync_at = self._buf.rfind(SYNC_BYTE)
         if sync_at >= 0:
@@ -153,14 +166,60 @@ class AdcStreamParser:
         if CH2_BYTES_ON_WIRE > 0 and len(self._buf) >= CH2_BYTES_ON_WIRE:
             del self._buf[:CH2_BYTES_ON_WIRE]
 
-    def _parse_all(self) -> List[AdcSample]:
+    @staticmethod
+    def _framed_xor(payload: bytes) -> int:
+        xorv = HOST_UART_TYPE_EEG ^ HOST_UART_LEN_EEG
+        for value in payload:
+            xorv ^= value
+        return xorv & 0xFF
+
+    def _parse_framed_single(self) -> List[AdcSample]:
+        out: List[AdcSample] = []
+        while True:
+            if len(self._buf) < HOST_UART_FRAME_SIZE:
+                break
+            # 找帧头 AA 55
+            sync_at = -1
+            for index in range(len(self._buf) - 1):
+                if (
+                    self._buf[index] == HOST_UART_SYNC0
+                    and self._buf[index + 1] == HOST_UART_SYNC1
+                ):
+                    sync_at = index
+                    break
+            if sync_at < 0:
+                # 可能只剩半个同步字
+                if self._buf and self._buf[-1] == HOST_UART_SYNC0:
+                    self._buf = bytearray([HOST_UART_SYNC0])
+                else:
+                    self._buf.clear()
+                break
+            if sync_at > 0:
+                del self._buf[:sync_at]
+            if len(self._buf) < HOST_UART_FRAME_SIZE:
+                break
+            frame_type = self._buf[2]
+            length = self._buf[3]
+            payload = bytes(self._buf[4:8])
+            checksum = self._buf[8]
+            if (
+                frame_type != HOST_UART_TYPE_EEG
+                or length != HOST_UART_LEN_EEG
+                or checksum != self._framed_xor(payload)
+            ):
+                # 坏帧：丢掉当前 AA，从下一个字节继续找头
+                del self._buf[0]
+                continue
+            seq = AdcSample.decode_u16_le(payload[0], payload[1], escape=False)
+            eeg = AdcSample.decode_u16_le(payload[2], payload[3], escape=False)
+            out.append(AdcSample.from_framed_eeg(seq, eeg))
+            del self._buf[:HOST_UART_FRAME_SIZE]
+        return out
+
+    def _parse_legacy_multi(self) -> List[AdcSample]:
         out: List[AdcSample] = []
         while self._buf:
-            bytes_per_tick = (
-                self._channel_count * 2
-                if self._channel_count > 1
-                else CH1_BYTES_ON_WIRE + CH2_BYTES_ON_WIRE
-            )
+            bytes_per_tick = self._channel_count * 2
             if self._ticks_in_group == 0:
                 if self._buf[0] != SYNC_BYTE:
                     del self._buf[0]
@@ -168,22 +227,18 @@ class AdcStreamParser:
                 if len(self._buf) < 1 + bytes_per_tick:
                     break
                 del self._buf[0]
-            if self._channel_count > 1:
-                if len(self._buf) < bytes_per_tick:
-                    break
-                payload = bytes(self._buf[:bytes_per_tick])
-                del self._buf[:bytes_per_tick]
-                out.append(AdcSample.from_channel_bytes(payload, self._channel_count))
-            else:
-                if len(self._buf) < CH1_BYTES_ON_WIRE:
-                    break
-                data_low, data_high = self._buf[0], self._buf[1]
-                del self._buf[:CH1_BYTES_ON_WIRE]
-                self._consume_ch2_if_present()
-                out.append(AdcSample.from_ch1_bytes(data_low, data_high))
+            if len(self._buf) < bytes_per_tick:
+                break
+            payload = bytes(self._buf[:bytes_per_tick])
+            del self._buf[:bytes_per_tick]
+            out.append(AdcSample.from_channel_bytes(payload, self._channel_count))
             self._ticks_in_group = (self._ticks_in_group + 1) % SAMPLES_PER_SYNC_GROUP
         return out
 
+    def _parse_all(self) -> List[AdcSample]:
+        if self._channel_count == 1:
+            return self._parse_framed_single()
+        return self._parse_legacy_multi()
 
 
 class Ks1082Serial:

@@ -53,6 +53,12 @@ from assr import (
     analyze_assr,
     format_assr_report,
 )
+from erp import (
+    ErpAnalysis,
+    analyze_erp_csv,
+    export_erp_summary_csv,
+    format_erp_report,
+)
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
     OSC_BANDS,
@@ -1104,6 +1110,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_duration_sec: Optional[float] = None  ## 实际记录时长 (s)
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
         self._eeg_raw_record: List[int] = []  ## 定时测试期间记录的 CH1 raw
+        self._eeg_pink_seq_record: List[int] = []  ## 与 raw 平行的粉噪序号（无则 -1）
         self._eeg_multi_raw_records: List[List[int]] = [
             [] for _ in range(EEG_MULTI_CHANNEL_COUNT)
         ]  ## multi-channel timed-test raw buffers
@@ -1176,6 +1183,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_psd_analysis_ui()
         self._setup_sleep_feature_analysis_ui()
         self._wire_assr_button()
+        self._wire_erp_button()
         self._multi_waveform = MultiChannelEegView(
             sample_rate=sample_rate,
             parent=self.ui.plotHost,
@@ -5827,12 +5835,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _run_post_test_power_analysis(
         self,
         full_csv_path: Path,
-        cleaned_csv_path: Path,
+        cleaned_csv_path: Optional[Path],
         sample_rate: float,
         reject_rate: float,
     ) -> None:
-        """测试结束后自动运行 power_cal.run_analysis（删减前/后各一份）。"""
-        if reject_rate > EEG_REJECT_RATE_WARN:
+        """测试结束后自动运行 power_cal.run_analysis。
+
+        有删减文件时做双份（删减前/后）功率；单通道不剔坏时仅分析全量。
+        """
+        dual = cleaned_csv_path is not None
+        if dual and reject_rate > EEG_REJECT_RATE_WARN:
             self._log(
                 f"拒绝率 {reject_rate:.1%} 超过 {EEG_REJECT_RATE_WARN:.0%}，跳过自动功率分析"
             )
@@ -5860,7 +5872,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 compare_segments if len(compare_segments) >= 2 else None
             )
             self._log(
-                f"开始 power_cal 双份分析；段时间: " + ", ".join(bits)
+                f"开始 power_cal 分析；段时间: " + ", ".join(bits)
                 + ("；将保存段对比图" if save_segment_compare else "；仅保存 band_power")
             )
         buffer = io.StringIO()
@@ -5881,10 +5893,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     compare_segments=segments_for_compare,
                     show_segment_compare=False,
                     save_segment_compare=save_segment_compare,
-                    enable_alpha_suspicious=True,
+                    enable_alpha_suspicious=dual,
                     save_model_window_table=True,
                     save_offline_waveform_data=True,
-                    dual_power_analysis=True,
+                    dual_power_analysis=dual,
                 )
             report = buffer.getvalue().strip()
             if report:
@@ -5897,7 +5909,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"分析输出已保存至: {full_csv_path.parent}"
                 + (
                     "（含删减前/后 band_power）"
-                    if save_plot
+                    if dual and save_plot
+                    else "（未做坏段删减）"
+                    if not dual
                     else "（未保存 band_power / 段对比图）"
                 )
             )
@@ -6154,7 +6168,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._last_eeg_session_dir = session_dir
                 self._log(
                     f"长时记录结束：已保存至 {session_dir}"
-                    f"（路径B分段删减 eeg_chunk_XXX.csv + 正常段报告 + 每分钟绝对功率图；"
+                    f"（单通道无陷波：不剔坏；正常段报告 + 每分钟绝对功率图；"
                     f"跳过 FFT/波形等其它图）"
                 )
             return
@@ -6173,12 +6187,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     )
             return
 
-        saved = self._save_eeg_raw_csv()
+        saved = self._save_eeg_raw_csv(save_cleaned=False)
         self._reset_timed_test_state()
         if saved is not None:
             cleaned_path, full_path, sample_rate, reject_rate = saved
             session_dir = full_path.parent
             self._last_eeg_session_dir = session_dir
+            self._log("单通道无陷波：跳过坏段剔除，仅保存全量 CSV")
             self._run_post_test_power_analysis(
                 full_path,
                 cleaned_path,
@@ -6302,8 +6317,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
     def _clear_eeg_raw_records(self) -> None:
         self._eeg_raw_record.clear()
+        self._eeg_pink_seq_record.clear()
         for record in self._eeg_multi_raw_records:
             record.clear()
+
+    @staticmethod
+    def _sample_pink_seq(sample) -> int:
+        seq = getattr(sample, "sequence", None)
+        if seq is None:
+            return -1
+        return int(seq) & 0xFFFF
 
     def _record_eeg_sample_for_timed_test(self, sample) -> None:
         if not self._is_test_recording_phase():
@@ -6312,6 +6335,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._append_long_record_sample(sample)
             return
         self._eeg_raw_record.append(sample.channel1)
+        # pink_seq 仅单通道协议写入 CSV；多通道保持原列格式
+        if self._eeg_protocol_channel_count() == 1:
+            self._eeg_pink_seq_record.append(self._sample_pink_seq(sample))
         expected_channels = self._eeg_protocol_channel_count()
         channels = sample.channels[:expected_channels]
         for index, value in enumerate(channels):
@@ -6357,20 +6383,34 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         session_dir: Optional[Path] = None,
         name_stem: str = "eeg_raw",
         raw_values: Optional[Iterable[int]] = None,
+        pink_seq_values: Optional[Iterable[int]] = None,
         channel_column: str = "ch1_raw",
         quiet_empty: bool = False,
         save_cleaned: bool = True,
+        include_pink_seq: bool = True,
     ) -> Optional[Tuple[Optional[Path], Path, float, float]]:
         """保存当前缓冲。
 
         save_cleaned=True：同时写 {stem}.csv（本段当场剔坏，仅适合单段短时测试）。
         长时 chunk 应 save_cleaned=False，只写 *_full.csv；剔坏文件改由路径B在结束后统一生成。
+        include_pink_seq：仅单通道录制写 pink_seq；多通道保持原列。
         """
         record = list(self._eeg_raw_record if raw_values is None else raw_values)
         if not record:
             if not quiet_empty:
                 self._log("定时测试结束，但没有 EEG raw 数据可保存")
             return None
+        pink: Optional[np.ndarray] = None
+        if include_pink_seq:
+            if pink_seq_values is None:
+                pink_seq = list(self._eeg_pink_seq_record)
+            else:
+                pink_seq = list(pink_seq_values)
+            if len(pink_seq) < len(record):
+                pink_seq.extend([-1] * (len(record) - len(pink_seq)))
+            elif len(pink_seq) > len(record):
+                pink_seq = pink_seq[: len(record)]
+            pink = np.asarray(pink_seq, dtype=np.int64)
         if session_dir is None:
             session_dir = self._resolve_session_dir()
         else:
@@ -6380,38 +6420,69 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         full_path = session_dir / f"{name_stem}_full.csv"
         sample_rate = self._measured_eeg_sample_rate()
         raw = np.asarray(record, dtype=np.int64)
-        quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
-        reject_rate = quality.reject_rate
-        suspicious_rate = quality.suspicious_rate
+        reject_rate = 0.0
+        suspicious_rate = 0.0
+        quality = None
+        if save_cleaned:
+            quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
+            reject_rate = quality.reject_rate
+            suspicious_rate = quality.suspicious_rate
+        header = (
+            ["index", "time_s", channel_column, "pink_seq"]
+            if include_pink_seq
+            else ["index", "time_s", channel_column]
+        )
         try:
             with full_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(["index", "time_s", channel_column])
-                for index, value in enumerate(raw):
-                    writer.writerow([index, index / sample_rate, int(value)])
+                writer.writerow(header)
+                if include_pink_seq and pink is not None:
+                    for index, value in enumerate(raw):
+                        writer.writerow(
+                            [index, index / sample_rate, int(value), int(pink[index])]
+                        )
+                else:
+                    for index, value in enumerate(raw):
+                        writer.writerow([index, index / sample_rate, int(value)])
             self._log(
                 f"EEG raw 全量已保存: {full_path} ({raw.size} 点 @ {sample_rate:.0f} Hz)"
             )
 
             out_cleaned: Optional[Path] = None
-            if save_cleaned:
-                cleaned_raw, _, removed_points = clean_raw_signal(
+            if save_cleaned and quality is not None:
+                cleaned_raw, kept_index, removed_points = clean_raw_signal(
                     raw, quality, sample_rate=sample_rate
                 )
+                kept_index = np.asarray(kept_index, dtype=np.int64)
+                cleaned_pink = None
+                if include_pink_seq and pink is not None:
+                    cleaned_pink = (
+                        pink[kept_index] if kept_index.size else np.zeros(0, dtype=np.int64)
+                    )
                 with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
-                    writer.writerow(["index", "time_s", channel_column])
+                    writer.writerow(header)
                     for index, value in enumerate(cleaned_raw):
-                        writer.writerow([index, index / sample_rate, int(value)])
+                        if cleaned_pink is not None:
+                            seq_v = (
+                                int(cleaned_pink[index])
+                                if index < cleaned_pink.size
+                                else -1
+                            )
+                            writer.writerow(
+                                [index, index / sample_rate, int(value), seq_v]
+                            )
+                        else:
+                            writer.writerow([index, index / sample_rate, int(value)])
                 out_cleaned = cleaned_path
                 self._log(
                     f"EEG raw 删减后已保存: {cleaned_path} "
                     f"({cleaned_raw.size}/{raw.size} 点, 剔除 {removed_points} 点)"
                 )
-            self._log(f"阈值拒绝率: {reject_rate:.1%}")
-            self._log(f"可疑片段率: {suspicious_rate:.1%}")
-            if reject_rate > EEG_REJECT_RATE_WARN:
-                self._log("拒绝率过高，本次数据不建议用于样本分析")
+                self._log(f"阈值拒绝率: {reject_rate:.1%}")
+                self._log(f"可疑片段率: {suspicious_rate:.1%}")
+                if reject_rate > EEG_REJECT_RATE_WARN:
+                    self._log("拒绝率过高，本次数据不建议用于样本分析")
             self._last_eeg_session_dir = session_dir
             return out_cleaned, full_path, sample_rate, reject_rate
         except OSError as exc:
@@ -6438,6 +6509,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 raw_values=record,
                 channel_column=f"ch{index + 1}_raw",
                 save_cleaned=True,
+                include_pink_seq=False,
             )
             if result is None:
                 continue
@@ -6462,7 +6534,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log("路径B删减保存跳过：目录中无 eeg_chunk_*_full.csv")
             return None
         try:
+            import pandas as pd
+
             parts: List[np.ndarray] = []
+            pink_parts: List[np.ndarray] = []
             rates: List[float] = []
             # (full_path, concat_start, concat_end)
             spans: List[Tuple[Path, int, int]] = []
@@ -6471,12 +6546,29 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 raw_i, fs_i = load_eeg_csv_with_rate(full_path)
                 raw_i = np.asarray(raw_i, dtype=np.float64)
                 n_i = int(raw_i.size)
+                frame = pd.read_csv(full_path)
+                if "pink_seq" in frame.columns:
+                    pink_i = (
+                        pd.to_numeric(frame["pink_seq"], errors="coerce")
+                        .fillna(-1)
+                        .to_numpy(dtype=np.int64)
+                    )
+                    if pink_i.size >= n_i:
+                        pink_i = pink_i[:n_i]
+                    else:
+                        pink_i = np.pad(
+                            pink_i, (0, n_i - pink_i.size), constant_values=-1
+                        )
+                else:
+                    pink_i = np.full(n_i, -1, dtype=np.int64)
                 parts.append(raw_i)
+                pink_parts.append(pink_i)
                 rates.append(float(fs_i))
                 spans.append((full_path, offset, offset + n_i))
                 offset += n_i
 
             raw = np.concatenate(parts)
+            pink_all = np.concatenate(pink_parts)
             sample_rate = float(np.median(np.asarray(rates, dtype=np.float64)))
             quality = build_threshold_rejection(raw, sample_rate)
             cleaned, kept_index, n_removed = clean_raw_signal(
@@ -6489,6 +6581,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             for full_path, i0, i1 in spans:
                 mask = (kept_index >= i0) & (kept_index < i1)
                 seg = cleaned[mask]
+                seg_pink = pink_all[kept_index[mask]] if np.any(mask) else np.zeros(0, dtype=np.int64)
                 name = full_path.name
                 if name.lower().endswith("_full.csv"):
                     out_name = name[: -len("_full.csv")] + ".csv"
@@ -6497,10 +6590,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 out_path = session_dir / out_name
                 with out_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
-                    writer.writerow(["index", "time_s", "ch1_raw"])
+                    writer.writerow(["index", "time_s", "ch1_raw", "pink_seq"])
                     for index, value in enumerate(seg):
+                        seq_v = int(seg_pink[index]) if index < seg_pink.size else -1
                         writer.writerow(
-                            [index, index / sample_rate, int(value)]
+                            [index, index / sample_rate, int(value), seq_v]
                         )
                 saved.append(out_path)
                 self._log(
@@ -6539,7 +6633,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"正常段报告生成失败: {exc}")
 
     def _run_long_record_minute_band_power(self, session_dir: Path) -> None:
-        """长时记录结束：坏段剔除后按窗长算五节律绝对功率，只画一张折线图。"""
+        """长时记录结束：按窗长算五节律绝对功率（单通道不剔坏，直接用全量）。"""
         try:
             from LongRecordMinuteBandPower import run_minute_band_power_analysis
 
@@ -6547,12 +6641,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 window_sec = self._read_power_window_sec()
             except ValueError:
                 window_sec = 60.0
-            no_splice = self._want_reject_mask_power()
             result = run_minute_band_power_analysis(
                 session_dir,
                 save_outputs=True,
                 window_sec=window_sec,
-                no_splice=no_splice,
+                skip_rejection=True,
             )
             for line in result.report_text.splitlines():
                 self._log(line)
@@ -6562,8 +6655,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log(f"节律功率窗分析失败: {exc}")
 
     def _run_long_record_postprocess(self, session_dir: Path) -> None:
-        """长时记录结束后：路径B删减CSV + 正常段报告 + 每分钟绝对功率图。"""
-        self._save_path_b_cleaned_csv(session_dir)
+        """长时记录结束：单通道不剔坏；写正常段报告 + 每分钟绝对功率图。"""
+        self._log("单通道无陷波：跳过路径B坏段删减")
         self._write_long_record_normal_report(session_dir)
         self._run_long_record_minute_band_power(session_dir)
 
@@ -6599,7 +6692,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         path = self._long_session_dir / f"eeg_chunk_{self._long_chunks_saved:03d}_full.csv"
         handle = path.open("w", newline="", encoding="utf-8")
         writer = csv.writer(handle)
-        writer.writerow(["index", "time_s", "ch1_raw"])
+        writer.writerow(["index", "time_s", "ch1_raw", "pink_seq"])
         self._long_full_handle = handle
         self._long_full_writer = writer
         self._long_full_path = path
@@ -6614,7 +6707,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         fs = float(MCU_SAMPLE_RATE)
         idx = self._long_sample_index
-        self._long_full_writer.writerow([idx, idx / fs, int(sample.channel1)])
+        self._long_full_writer.writerow(
+            [idx, idx / fs, int(sample.channel1), self._sample_pink_seq(sample)]
+        )
         self._long_sample_index += 1
         self._long_pending_since_flush += 1
         if self._long_pending_since_flush >= LONG_RECORD_DISK_FLUSH_SAMPLES:
@@ -6767,6 +6862,143 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _wire_assr_button(self) -> None:
         self._assr_button = self.ui.pushButton_assr
         self._assr_button.clicked.connect(self._show_assr_dialog)
+
+    def _wire_erp_button(self) -> None:
+        btn = getattr(self.ui, "pushButton_erp", None)
+        if btn is None:
+            return
+        btn.clicked.connect(self._on_erp_analyze_clicked)
+
+    @QtCore.pyqtSlot()
+    def _on_erp_analyze_clicked(self) -> None:
+        start_dir = ""
+        if self._last_eeg_session_dir is not None:
+            start_dir = str(self._last_eeg_session_dir)
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择含 pink_seq 的 EEG CSV",
+            start_dir,
+            "CSV (*.csv);;All (*.*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            result = analyze_erp_csv(path)
+        except Exception as exc:
+            self._log(f"ERP 分析失败: {exc}")
+            QtWidgets.QMessageBox.warning(self, "ERP 分析", f"分析失败:\n{exc}")
+            return
+        for line in format_erp_report(result).splitlines():
+            self._log(line)
+        self._show_erp_result_dialog(path, result)
+
+    def _show_erp_result_dialog(self, source_path: Path, result: ErpAnalysis) -> None:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"ERP 分析 — {source_path.name}")
+        dialog.resize(780, 560)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        report = QtWidgets.QPlainTextEdit()
+        report.setReadOnly(True)
+        report.setMaximumBlockCount(40)
+        report.setPlainText(format_erp_report(result))
+        report.setMaximumHeight(120)
+        layout.addWidget(report)
+
+        fig = Figure(figsize=(7.2, 3.8), tight_layout=True)
+        canvas = FigureCanvasQTAgg(fig)
+        ax = fig.add_subplot(111)
+
+        epochs = np.asarray(result.epochs, dtype=np.float64)
+        t = result.times_ms
+        if epochs.ndim == 2 and epochs.shape[0] > 0:
+            n_show = int(epochs.shape[0])
+            step = max(1, n_show // 40)
+            for row in epochs[::step]:
+                ax.plot(t, row, color="#90A4AE", linewidth=0.6, alpha=0.35)
+            lo = result.average - result.sem
+            hi = result.average + result.sem
+            ax.fill_between(
+                t, lo, hi, color="#1565C0", alpha=0.28, linewidth=0, label="mean ± SEM"
+            )
+            ax.plot(t, result.average, color="#0D47A1", linewidth=1.6, label="平均")
+
+        ax.axvline(0.0, color="#757575", ls="--", lw=1.0, label="刺激 onset")
+        if result.p1 is not None:
+            ax.axvline(
+                result.p1.latency_ms,
+                color="#6A1B9A",
+                ls=":",
+                lw=1.4,
+                label=f"P1 {result.p1.latency_ms:.0f} ms",
+            )
+        if result.n1 is not None:
+            ax.axvline(
+                result.n1.latency_ms,
+                color="#1565C0",
+                ls=":",
+                lw=1.2,
+                label=f"N1 {result.n1.latency_ms:.0f} ms",
+            )
+        if result.p2 is not None:
+            ax.axvline(
+                result.p2.latency_ms,
+                color="#2E7D32",
+                ls=":",
+                lw=1.2,
+                label=f"P2 {result.p2.latency_ms:.0f} ms",
+            )
+        if result.onset_latency_ms is not None:
+            ax.axvline(
+                result.onset_latency_ms,
+                color="#C62828",
+                ls="-.",
+                lw=1.2,
+                label=f"起始 {result.onset_latency_ms:.0f} ms",
+            )
+
+        ax.set_xlabel("Latency (ms)")
+        ax.set_ylabel("Amplitude (raw)")
+        ax.set_title(
+            f"单次叠加合并图（灰线=epoch，阴影=mean±SEM，n={result.n_epochs}）"
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+        layout.addWidget(canvas)
+
+        buttons = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("导出结果 CSV")
+        close_btn = QtWidgets.QPushButton("关闭")
+        buttons.addStretch(1)
+        buttons.addWidget(export_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        def _export() -> None:
+            default_name = f"{source_path.stem}_erp_summary.csv"
+            out_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dialog,
+                "导出 ERP 结果",
+                str(source_path.with_name(default_name)),
+                "CSV (*.csv)",
+            )
+            if not out_str:
+                return
+            try:
+                out_path = export_erp_summary_csv(Path(out_str), result)
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(dialog, "导出失败", str(exc))
+                return
+            self._log(f"ERP 结果已导出: {out_path}")
+            QtWidgets.QMessageBox.information(dialog, "导出成功", f"已保存:\n{out_path}")
+
+        export_btn.clicked.connect(_export)
+        close_btn.clicked.connect(dialog.accept)
+        dialog.exec_()
 
     def _force_live_eeg_display(self) -> None:
         """不论当前是结果图、离线查看还是振子页，都切回 EEG 实时波形。"""

@@ -287,7 +287,7 @@ def _load_generic_eeg_table(path: Path) -> _TabularEegFile:
                 for index, col in enumerate(raw_columns)
             ]
         else:
-            skip_names = {"index", "time_s", "time", "timestamp"}
+            skip_names = {"index", "time_s", "time", "timestamp", "pink_seq"}
             data_columns = [
                 col for col in frame.columns if str(col).lower() not in skip_names
             ]

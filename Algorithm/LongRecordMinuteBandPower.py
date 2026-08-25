@@ -582,17 +582,38 @@ def prepare_cleaned_minute_powers(
     *,
     window_sec: float = MINUTE_SEC,
     no_splice: bool = False,
+    skip_rejection: bool = False,
 ) -> tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], dict]:
-    """加载 → 质量标记 → 按窗长算绝对/相对功率。
+    """加载 →（可选）质量标记 → 按窗长算绝对/相对功率。
 
+    skip_rejection=True：不做坏段剔除，直接在全量 raw 上切窗。
     no_splice=False：剔坏硬拼（中位对齐）后再切窗。
     no_splice=True：不拼接，仅在连续好段内切窗；横轴为墙钟起始秒。
 
     返回 (x_axis, absolute, relative, meta)
     """
     raw, sample_rate, source_desc = load_raw_for_minute_analysis(source)
-    quality = build_threshold_rejection(raw, sample_rate)
     win = float(window_sec)
+
+    if skip_rejection:
+        minutes, absolute, relative = compute_minute_band_powers(
+            raw.astype(np.float64), sample_rate, window_sec=win
+        )
+        meta = {
+            "sample_rate": float(sample_rate),
+            "n_raw": int(raw.size),
+            "n_cleaned": int(raw.size),
+            "n_removed": 0,
+            "n_minutes": int(minutes.size),
+            "window_sec": win,
+            "source_desc": source_desc,
+            "no_splice": False,
+            "x_as_time_s": False,
+            "skip_rejection": True,
+        }
+        return minutes, absolute, relative, meta
+
+    quality = build_threshold_rejection(raw, sample_rate)
     remove_mask = build_raw_remove_mask(quality, int(raw.size), remove_suspicious=True)
 
     if no_splice:
@@ -651,11 +672,15 @@ def run_minute_band_power_analysis(
     save_outputs: bool = True,
     window_sec: float = MINUTE_SEC,
     no_splice: bool = False,
+    skip_rejection: bool = False,
 ) -> MinuteBandPowerResult:
     session_dir = Path(session_dir)
     win = float(window_sec)
     minutes, absolute, relative, meta = prepare_cleaned_minute_powers(
-        session_dir, window_sec=win, no_splice=no_splice
+        session_dir,
+        window_sec=win,
+        no_splice=no_splice,
+        skip_rejection=skip_rejection,
     )
     n_minutes = int(meta["n_minutes"])
     sample_rate = float(meta["sample_rate"])
@@ -663,11 +688,12 @@ def run_minute_band_power_analysis(
         float(meta["n_cleaned"] / sample_rate) if sample_rate > 0 else 0.0
     )
     x_as_time = bool(meta.get("x_as_time_s", False))
-    mode_desc = (
-        "不拼接·连续好段内切窗"
-        if no_splice
-        else "剔坏硬拼后再切窗"
-    )
+    if skip_rejection:
+        mode_desc = "全量不剔坏后切窗"
+    elif no_splice:
+        mode_desc = "不拼接·连续好段内切窗"
+    else:
+        mode_desc = "剔坏硬拼后再切窗"
 
     lines = [
         f"长时记录 · 每 {win:g} s 节律绝对/相对功率（{mode_desc}）",
@@ -677,7 +703,11 @@ def run_minute_band_power_analysis(
         f"坏段标记: 剔除/跳过 {meta['n_removed']} 点；"
         f"有效约 {cleaned_sec / 60.0:.2f} 分钟",
         f"完整窗数 N: {n_minutes}（按 {win:g} s；不足一窗的尾部丢弃）",
-        f"处理: chunk拼接(若有) + build_threshold_rejection + {mode_desc} + Welch",
+        (
+            f"处理: chunk拼接(若有) + 全量不剔坏 + Welch"
+            if skip_rejection
+            else f"处理: chunk拼接(若有) + build_threshold_rejection + {mode_desc} + Welch"
+        ),
     ]
     if no_splice:
         lines.append(f"连续好段数: {meta.get('n_good_runs', 0)}")

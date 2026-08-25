@@ -1330,6 +1330,22 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                </widget>
               </item>
               <item>
+               <widget class="QPushButton" name="pushButton_erp">
+                <property name="minimumSize">
+                 <size>
+                  <width>92</width>
+                  <height>40</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>选择含 pink_seq 的 CSV，计算听觉 ERP 响应时间</string>
+                </property>
+                <property name="text">
+                 <string>ERP 分析...</string>
+                </property>
+               </widget>
+              </item>
+              <item>
                <spacer name="horizontalSpacer_audioButtonsRight">
                 <property name="orientation">
                  <enum>Qt::Horizontal</enum>
