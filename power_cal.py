@@ -12,7 +12,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from scipy.integrate import trapezoid
-from scipy.signal import butter, sosfilt, sosfilt_zi, sosfiltfilt, welch
+from scipy.signal import (
+    butter,
+    iirnotch,
+    sosfilt,
+    sosfilt_zi,
+    sosfiltfilt,
+    tf2sos,
+    welch,
+)
 from scipy.fft import rfft, rfftfreq
 
 _ALGO_DIR = Path(__file__).resolve().parent / "Algorithm"
@@ -41,6 +49,8 @@ DEFAULT_SAMPLE_RATE = float(
 
 BANDPASS_LOW_HZ = 0.5
 BANDPASS_HIGH_HZ = 40.0
+POWERLINE_NOTCH_HZ = 50.0
+POWERLINE_NOTCH_Q = 30.0
 
 # 在 0.5–40 Hz 带通范围内的标准节律划分
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
@@ -472,6 +482,28 @@ def bandpass_filter(
     return sosfiltfilt(sos, signal, axis=0)
 
 
+def powerline_notch_filter(
+    signal: np.ndarray,
+    sample_rate: float,
+    notch_hz: float = POWERLINE_NOTCH_HZ,
+    quality_factor: float = POWERLINE_NOTCH_Q,
+) -> np.ndarray:
+    """离线50 Hz零相位陷波；采样率不足或数据过短时保持原样。"""
+    values = np.asarray(signal, dtype=np.float64)
+    fs = float(sample_rate)
+    frequency = float(notch_hz)
+    if (
+        values.size < 16
+        or not np.isfinite(fs)
+        or fs <= 0
+        or frequency <= 0
+        or frequency >= fs * 0.5
+    ):
+        return values.copy()
+    b, a = iirnotch(frequency, float(quality_factor), fs=fs)
+    return sosfiltfilt(tf2sos(b, a), values, axis=0)
+
+
 def _band_power_from_psd(
     freqs: np.ndarray, psd: np.ndarray, low_hz: float, high_hz: float
 ) -> float:
@@ -530,8 +562,9 @@ def compute_band_powers_with_metrics(
     *,
     edge_trim_sec: float = 0.0,
 ) -> tuple[PowerAnalysis, float, float]:
-    """同 compute_band_powers，额外返回去边后滤波波形的 RMS 与峰峰值。"""
-    filtered = bandpass_filter(signal, sample_rate)
+    """先50 Hz陷波和带通，再计算功率；额外返回波形 RMS 与峰峰值。"""
+    notched = powerline_notch_filter(signal, sample_rate)
+    filtered = bandpass_filter(notched, sample_rate)
     filtered = trim_filter_edges(
         filtered,
         sample_rate,
