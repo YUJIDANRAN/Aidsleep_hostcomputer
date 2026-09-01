@@ -1973,10 +1973,181 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._yasa_eeg_combo.currentIndexChanged.connect(
             self._plot_yasa_hypnogram_from_current_rows
         )
+        self._yasa_eeg_combo.currentIndexChanged.connect(self._refresh_aasm_rule_channel_hint)
+        self._yasa_eog_combo.currentIndexChanged.connect(self._refresh_aasm_rule_channel_hint)
+        self._yasa_emg_combo.currentIndexChanged.connect(self._refresh_aasm_rule_channel_hint)
         self._yasa_hypnogram_button.clicked.connect(self._plot_yasa_hypnogram_from_current_rows)
         self._sleep_feature_ui.pushButton_spindle_sigma_mark.clicked.connect(
             self._run_yasa_spindle_refinement
         )
+        self._setup_aasm_rule_runtime_ui()
+
+    def _setup_aasm_rule_runtime_ui(self) -> None:
+        ui = self._sleep_feature_ui
+        self._tab_aasm_rule = QtWidgets.QWidget(ui.tabWidget_sleep_feature)
+        self._tab_aasm_rule.setObjectName("tab_aasm_rule_staging")
+        layout = QtWidgets.QVBoxLayout(self._tab_aasm_rule)
+        hint = QtWidgets.QLabel(
+            "按 AASM 优先级运行确定性规则分期：复用已有 slow-wave/spindle/K-complex 证据，"
+            "自动补算 alpha、LAMF、EMG tone；缺少 EOG/REM 证据时只降级解释，不强行判 REM。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self._aasm_rule_channel_hint = QtWidgets.QLabel(self._tab_aasm_rule)
+        self._aasm_rule_channel_hint.setWordWrap(True)
+        layout.addWidget(self._aasm_rule_channel_hint)
+
+        grid = QtWidgets.QGridLayout()
+        layout.addLayout(grid)
+        self._aasm_reuse_spindle_check = QtWidgets.QCheckBox("复用已有 Spindle/K-complex 结果", self._tab_aasm_rule)
+        self._aasm_reuse_spindle_check.setChecked(True)
+        self._aasm_reuse_slow_wave_check = QtWidgets.QCheckBox("复用已有 SlowWave/N3 结果", self._tab_aasm_rule)
+        self._aasm_reuse_slow_wave_check.setChecked(True)
+        self._aasm_auto_detect_missing_check = QtWidgets.QCheckBox("缺失证据时自动检测", self._tab_aasm_rule)
+        self._aasm_auto_detect_missing_check.setChecked(True)
+        self._aasm_inherit_undefined_check = QtWidgets.QCheckBox("未定义 epoch 继承上一阶段", self._tab_aasm_rule)
+        self._aasm_inherit_undefined_check.setChecked(True)
+        grid.addWidget(self._aasm_reuse_spindle_check, 0, 0, 1, 2)
+        grid.addWidget(self._aasm_reuse_slow_wave_check, 0, 2, 1, 2)
+        grid.addWidget(self._aasm_auto_detect_missing_check, 1, 0, 1, 2)
+        grid.addWidget(self._aasm_inherit_undefined_check, 1, 2, 1, 2)
+
+        self._aasm_loc_combo = QtWidgets.QComboBox(self._tab_aasm_rule)
+        self._aasm_roc_combo = QtWidgets.QComboBox(self._tab_aasm_rule)
+        self._aasm_alpha_channel_combo = QtWidgets.QComboBox(self._tab_aasm_rule)
+        self._aasm_loc_combo.currentIndexChanged.connect(self._refresh_aasm_rule_channel_hint)
+        self._aasm_roc_combo.currentIndexChanged.connect(self._refresh_aasm_rule_channel_hint)
+        self._aasm_alpha_channel_combo.currentIndexChanged.connect(self._refresh_aasm_rule_channel_hint)
+        grid.addWidget(QtWidgets.QLabel("LOC通道", self._tab_aasm_rule), 2, 0, 1, 1)
+        grid.addWidget(self._aasm_loc_combo, 2, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("ROC通道", self._tab_aasm_rule), 2, 2, 1, 1)
+        grid.addWidget(self._aasm_roc_combo, 2, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Alpha来源", self._tab_aasm_rule), 3, 0, 1, 1)
+        grid.addWidget(self._aasm_alpha_channel_combo, 3, 1, 1, 1)
+
+        self._aasm_n3_swa_pct_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_n3_swa_pct_edit.setText("20")
+        self._aasm_alpha_window_rel_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_alpha_window_rel_edit.setText("50")
+        self._aasm_alpha_pct_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_alpha_pct_edit.setText("50")
+        self._aasm_wake_alpha_rel_check = QtWidgets.QCheckBox("启用30秒alpha相对功率辅助Wake", self._tab_aasm_rule)
+        self._aasm_wake_alpha_rel_check.setChecked(False)
+        self._aasm_wake_alpha_rel_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_wake_alpha_rel_edit.setText("30")
+        self._aasm_wake_eog_check = QtWidgets.QCheckBox("启用EOG眨眼/清醒眼动辅助Wake", self._tab_aasm_rule)
+        self._aasm_wake_eog_check.setChecked(False)
+        self._aasm_lamf_pct_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_lamf_pct_edit.setText("50")
+        self._aasm_emg_low_pct_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_emg_low_pct_edit.setText("40")
+        self._aasm_emg_high_pct_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_emg_high_pct_edit.setText("60")
+        self._aasm_n3_delta_support_check = QtWidgets.QCheckBox("启用delta辅助N3", self._tab_aasm_rule)
+        self._aasm_n3_delta_support_check.setChecked(False)
+        self._aasm_n3_delta_rel_edit = QtWidgets.QLineEdit(self._tab_aasm_rule)
+        self._aasm_n3_delta_rel_edit.setText("45")
+        grid.addWidget(QtWidgets.QLabel("N3 SWA下限(%)", self._tab_aasm_rule), 3, 2, 1, 1)
+        grid.addWidget(self._aasm_n3_swa_pct_edit, 3, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("alpha微标注阈值(%)", self._tab_aasm_rule), 4, 0, 1, 1)
+        grid.addWidget(self._aasm_alpha_window_rel_edit, 4, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Wake alpha覆盖下限(%)", self._tab_aasm_rule), 4, 2, 1, 1)
+        grid.addWidget(self._aasm_alpha_pct_edit, 4, 3, 1, 1)
+        grid.addWidget(self._aasm_wake_alpha_rel_check, 5, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Wake alpha_rel下限(%)", self._tab_aasm_rule), 5, 2, 1, 1)
+        grid.addWidget(self._aasm_wake_alpha_rel_edit, 5, 3, 1, 1)
+        grid.addWidget(self._aasm_wake_eog_check, 6, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("N1/LAMF下限(%)", self._tab_aasm_rule), 6, 2, 1, 1)
+        grid.addWidget(self._aasm_lamf_pct_edit, 6, 3, 1, 1)
+        grid.addWidget(self._aasm_n3_delta_support_check, 7, 0, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("delta辅助下限(%)", self._tab_aasm_rule), 7, 1, 1, 1)
+        grid.addWidget(self._aasm_n3_delta_rel_edit, 7, 2, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("EMG低肌张分位(%)", self._tab_aasm_rule), 8, 0, 1, 1)
+        grid.addWidget(self._aasm_emg_low_pct_edit, 8, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("EMG高肌张分位(%)", self._tab_aasm_rule), 8, 2, 1, 1)
+        grid.addWidget(self._aasm_emg_high_pct_edit, 8, 3, 1, 1)
+
+        self._aasm_rule_run_button = QtWidgets.QPushButton("运行 AASM 规则分期", self._tab_aasm_rule)
+        self._aasm_rule_run_button.clicked.connect(self._run_aasm_rule_staging)
+        layout.addWidget(self._aasm_rule_run_button)
+        self._aasm_rule_export_button = QtWidgets.QPushButton("导出 AASM 规则分期CSV", self._tab_aasm_rule)
+        self._aasm_rule_export_button.clicked.connect(self._export_aasm_rule_table_csv)
+        layout.addWidget(self._aasm_rule_export_button)
+        self._aasm_rule_results_table = QtWidgets.QTableWidget(self._tab_aasm_rule)
+        self._aasm_rule_results_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._aasm_rule_results_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._aasm_rule_results_table.verticalHeader().setVisible(False)
+        layout.addWidget(self._aasm_rule_results_table)
+        ui.tabWidget_sleep_feature.addTab(self._tab_aasm_rule, "AASM规则分期")
+        self._refresh_aasm_rule_channel_combos()
+        self._refresh_aasm_rule_channel_hint()
+
+    def _refresh_aasm_rule_channel_hint(self, *_args) -> None:
+        label = getattr(self, "_aasm_rule_channel_hint", None)
+        if label is None:
+            return
+        eeg = self._yasa_eeg_combo.currentText().strip() if hasattr(self, "_yasa_eeg_combo") else ""
+        eog = self._yasa_eog_combo.currentText().strip() if hasattr(self, "_yasa_eog_combo") else ""
+        emg = self._yasa_emg_combo.currentText().strip() if hasattr(self, "_yasa_emg_combo") else ""
+        loc = self._aasm_loc_combo.currentText().strip() if hasattr(self, "_aasm_loc_combo") else ""
+        roc = self._aasm_roc_combo.currentText().strip() if hasattr(self, "_aasm_roc_combo") else ""
+        alpha = self._aasm_alpha_channel_combo.currentText().strip() if hasattr(self, "_aasm_alpha_channel_combo") else ""
+        label.setText(
+            f"YASA分期通道：EEG={eeg or '未选择'}，EOG={eog or '无'}，EMG={emg or '无'}。"
+            f"AASM证据：REM LOC={loc or '无'}，ROC={roc or '无'}；alpha={alpha or '当前EEG'}。"
+            "EMG 仍来自 YASA 页。"
+        )
+
+    def _refresh_aasm_rule_channel_combos(self) -> None:
+        if (
+            not hasattr(self, "_aasm_loc_combo")
+            or not hasattr(self, "_aasm_roc_combo")
+            or not hasattr(self, "_aasm_alpha_channel_combo")
+        ):
+            return
+        combos = (self._aasm_loc_combo, self._aasm_roc_combo, self._aasm_alpha_channel_combo)
+        for combo in combos:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("无", None)
+        path = getattr(self, "_offline_csv_path", None)
+        labels: List[str] = []
+        if path is not None and self._supports_offline_channel_browse(path) and self._offline_file_info is not None:
+            labels = list(self._offline_file_info.channel_labels)
+            for index, ch_label in enumerate(labels):
+                for combo in combos:
+                    combo.addItem(str(ch_label), index)
+        for combo, prefix in ((self._aasm_loc_combo, "LOC"), (self._aasm_roc_combo, "ROC")):
+            chosen = 0
+            for i, ch_label in enumerate(labels, start=1):
+                text = str(ch_label).strip().upper()
+                if text.startswith(prefix):
+                    chosen = i
+                    break
+            if chosen == 0:
+                for i, ch_label in enumerate(labels, start=1):
+                    text = str(ch_label).strip().upper()
+                    if prefix in text:
+                        chosen = i
+                        break
+            combo.setCurrentIndex(chosen)
+            combo.blockSignals(False)
+        alpha_chosen = 0
+        for i, ch_label in enumerate(labels, start=1):
+            text = str(ch_label).strip().upper()
+            if text.startswith(("O1", "O2")) or "-O1" in text or "-O2" in text:
+                alpha_chosen = i
+                break
+        if alpha_chosen == 0:
+            eeg_index = self._yasa_eeg_combo.currentData() if hasattr(self, "_yasa_eeg_combo") else None
+            if eeg_index is not None:
+                for i, ch_label in enumerate(labels, start=1):
+                    if i - 1 == int(eeg_index):
+                        alpha_chosen = i
+                        break
+        self._aasm_alpha_channel_combo.setCurrentIndex(alpha_chosen)
+        self._aasm_alpha_channel_combo.blockSignals(False)
+        self._refresh_aasm_rule_channel_hint()
 
     def _setup_slow_wave_runtime_ui(self) -> None:
         ui = self._sleep_feature_ui
@@ -1984,8 +2155,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._tab_slow_wave_n3.setObjectName("tab_slow_wave_n3")
         layout = QtWidgets.QVBoxLayout(self._tab_slow_wave_n3)
         hint = QtWidgets.QLabel(
-            "基于慢波活动和 delta 功率对 YASA 初分期做 N3 二次修正。"
-            "第一版主要处理“真实 N3 被判成 N2”的情况，输出 slow_wave_* 特征和 stage_refined_slow。"
+            "检测 slow-wave 候选，按 30s epoch 汇总质量/证据，再对低风险 epoch 给出 N3 建议并修正分期。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -2008,6 +2178,42 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._slow_wave_delta_rel_edit.setText("45")
         self._slow_wave_confidence_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
         self._slow_wave_confidence_edit.setText("0.85")
+        self._slow_wave_candidate_stages_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_candidate_stages_edit.setText("N1,N2,N3")
+        self._slow_wave_bad_pct_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_bad_pct_edit.setText("20")
+        self._slow_wave_muscle_z_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_muscle_z_edit.setText("3")
+        self._slow_wave_flat_pct_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._slow_wave_flat_pct_edit.setText("30")
+        self._n3_context_window_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_context_window_edit.setText("2")
+        self._n3_context_min_neighbors_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_context_min_neighbors_edit.setText("2")
+        self._n3_context_delta_rel_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_context_delta_rel_edit.setText("35")
+        self._n3_context_slow_time_pct_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_context_slow_time_pct_edit.setText("5")
+        self._n3_context_max_markers_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_context_max_markers_edit.setText("1")
+        self._n3_context_confidence_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_context_confidence_edit.setText("0.85")
+        self._n3_delta_run_min_len_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_delta_run_min_len_edit.setText("3")
+        self._n3_delta_run_delta_rel_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_delta_run_delta_rel_edit.setText("45")
+        self._n3_delta_run_min_good_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_delta_run_min_good_edit.setText("2")
+        self._n3_delta_run_confidence_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_delta_run_confidence_edit.setText("0.95")
+        self._n3_island_score_enter_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_island_score_enter_edit.setText("0.60")
+        self._n3_island_score_exit_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_island_score_exit_edit.setText("0.35")
+        self._n3_island_confidence_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_island_confidence_edit.setText("0.85")
+        self._n3_island_n3_change_warn_edit = QtWidgets.QLineEdit(self._tab_slow_wave_n3)
+        self._n3_island_n3_change_warn_edit.setText("10")
 
         grid.addWidget(QtWidgets.QLabel("慢波频段(Hz)", self._tab_slow_wave_n3), 0, 0, 1, 1)
         grid.addWidget(self._slow_wave_band_edit, 0, 1, 1, 1)
@@ -2022,19 +2228,67 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self._slow_wave_time_pct_edit, 2, 1, 1, 1)
         grid.addWidget(QtWidgets.QLabel("delta相对功率下限(%)", self._tab_slow_wave_n3), 2, 2, 1, 1)
         grid.addWidget(self._slow_wave_delta_rel_edit, 2, 3, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("N2低置信阈值", self._tab_slow_wave_n3), 3, 0, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("低置信阈值", self._tab_slow_wave_n3), 3, 0, 1, 1)
         grid.addWidget(self._slow_wave_confidence_edit, 3, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("候选阶段", self._tab_slow_wave_n3), 3, 2, 1, 1)
+        grid.addWidget(self._slow_wave_candidate_stages_edit, 3, 3, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("坏段占比上限(%)", self._tab_slow_wave_n3), 4, 0, 1, 1)
+        grid.addWidget(self._slow_wave_bad_pct_edit, 4, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("肌电z上限", self._tab_slow_wave_n3), 4, 2, 1, 1)
+        grid.addWidget(self._slow_wave_muscle_z_edit, 4, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("flat占比上限(%)", self._tab_slow_wave_n3), 5, 0, 1, 1)
+        grid.addWidget(self._slow_wave_flat_pct_edit, 5, 1, 1, 1)
 
-        self._slow_wave_only_n2_check = QtWidgets.QCheckBox("仅修正 YASA=N2 的 epoch", self._tab_slow_wave_n3)
-        self._slow_wave_only_n2_check.setChecked(True)
+        self._slow_wave_quality_gate_check = QtWidgets.QCheckBox("启用epoch质量门控", self._tab_slow_wave_n3)
+        self._slow_wave_quality_gate_check.setChecked(True)
         self._slow_wave_require_low_conf_check = QtWidgets.QCheckBox("要求 YASA 置信度低于阈值", self._tab_slow_wave_n3)
         self._slow_wave_require_low_conf_check.setChecked(False)
-        grid.addWidget(self._slow_wave_only_n2_check, 3, 2, 1, 2)
-        grid.addWidget(self._slow_wave_require_low_conf_check, 4, 0, 1, 2)
+        self._n3_context_fill_check = QtWidgets.QCheckBox("启用 N3 段内补洞", self._tab_slow_wave_n3)
+        self._n3_context_fill_check.setChecked(False)
+        self._n3_delta_run_check = QtWidgets.QCheckBox("启用 delta 连续段 N3 修正", self._tab_slow_wave_n3)
+        self._n3_delta_run_check.setChecked(False)
+        self._n3_island_check = QtWidgets.QCheckBox("启用 N2/N3 孤岛双向修正", self._tab_slow_wave_n3)
+        self._n3_island_check.setChecked(False)
+        grid.addWidget(self._slow_wave_quality_gate_check, 5, 2, 1, 2)
+        grid.addWidget(self._slow_wave_require_low_conf_check, 6, 0, 1, 2)
+        grid.addWidget(self._n3_context_fill_check, 6, 2, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("补洞左右窗口(epoch)", self._tab_slow_wave_n3), 7, 0, 1, 1)
+        grid.addWidget(self._n3_context_window_edit, 7, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("邻近N3下限", self._tab_slow_wave_n3), 7, 2, 1, 1)
+        grid.addWidget(self._n3_context_min_neighbors_edit, 7, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("补洞delta下限(%)", self._tab_slow_wave_n3), 8, 0, 1, 1)
+        grid.addWidget(self._n3_context_delta_rel_edit, 8, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("补洞慢波占时下限(%)", self._tab_slow_wave_n3), 8, 2, 1, 1)
+        grid.addWidget(self._n3_context_slow_time_pct_edit, 8, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("纺锤/K复合上限", self._tab_slow_wave_n3), 9, 0, 1, 1)
+        grid.addWidget(self._n3_context_max_markers_edit, 9, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("补洞置信上限", self._tab_slow_wave_n3), 9, 2, 1, 1)
+        grid.addWidget(self._n3_context_confidence_edit, 9, 3, 1, 1)
+        grid.addWidget(self._n3_delta_run_check, 10, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("delta段最短(epoch)", self._tab_slow_wave_n3), 11, 0, 1, 1)
+        grid.addWidget(self._n3_delta_run_min_len_edit, 11, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("delta段下限(%)", self._tab_slow_wave_n3), 11, 2, 1, 1)
+        grid.addWidget(self._n3_delta_run_delta_rel_edit, 11, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("段内可用epoch下限", self._tab_slow_wave_n3), 12, 0, 1, 1)
+        grid.addWidget(self._n3_delta_run_min_good_edit, 12, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("delta段置信上限", self._tab_slow_wave_n3), 12, 2, 1, 1)
+        grid.addWidget(self._n3_delta_run_confidence_edit, 12, 3, 1, 1)
+        grid.addWidget(self._n3_island_check, 13, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("孤岛N3进入分", self._tab_slow_wave_n3), 14, 0, 1, 1)
+        grid.addWidget(self._n3_island_score_enter_edit, 14, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("孤岛N3退出分", self._tab_slow_wave_n3), 14, 2, 1, 1)
+        grid.addWidget(self._n3_island_score_exit_edit, 14, 3, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("孤岛置信上限", self._tab_slow_wave_n3), 15, 0, 1, 1)
+        grid.addWidget(self._n3_island_confidence_edit, 15, 1, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("N3净变化警告(%)", self._tab_slow_wave_n3), 15, 2, 1, 1)
+        grid.addWidget(self._n3_island_n3_change_warn_edit, 15, 3, 1, 1)
 
-        self._slow_wave_run_button = QtWidgets.QPushButton("运行 SlowWave/Delta N3 修正", self._tab_slow_wave_n3)
+        self._slow_wave_run_button = QtWidgets.QPushButton("运行 SlowWave/N3 检测并修正分期", self._tab_slow_wave_n3)
         self._slow_wave_run_button.clicked.connect(self._run_slow_wave_n3_refinement)
         layout.addWidget(self._slow_wave_run_button)
+        self._slow_wave_export_button = QtWidgets.QPushButton("导出 SlowWave 候选CSV", self._tab_slow_wave_n3)
+        self._slow_wave_export_button.clicked.connect(self._export_slow_wave_candidate_table_csv)
+        layout.addWidget(self._slow_wave_export_button)
         self._slow_wave_results_table = QtWidgets.QTableWidget(self._tab_slow_wave_n3)
         self._slow_wave_results_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self._slow_wave_results_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -2145,10 +2399,16 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
         ui.pushButton_spindle_sigma_mark.setEnabled(True)
         ui.pushButton_spindle_sigma_mark.setText("运行 Spindle/K-complex 检测并修正分期")
+        self._spindle_export_button = QtWidgets.QPushButton("导出 Spindle/K-complex 候选CSV", ui.tab_spindle_sigma)
+        self._spindle_export_button.clicked.connect(self._export_spindle_candidate_table_csv)
         self._spindle_results_table = QtWidgets.QTableWidget(ui.tab_spindle_sigma)
         self._spindle_results_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self._spindle_results_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._spindle_results_table.verticalHeader().setVisible(False)
+        ui.verticalLayout_spindle_sigma.insertWidget(
+            max(0, ui.verticalLayout_spindle_sigma.count() - 1),
+            self._spindle_export_button,
+        )
         ui.verticalLayout_spindle_sigma.insertWidget(
             max(0, ui.verticalLayout_spindle_sigma.count() - 1),
             self._spindle_results_table,
@@ -2198,6 +2458,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._sleep_start_sec_edit.setPlaceholderText(f"{start_s:.1f}")
                 self._sleep_end_sec_edit.setPlaceholderText(f"{end_s:.1f}")
         self._refresh_yasa_channel_combos()
+        self._refresh_aasm_rule_channel_combos()
+        self._refresh_aasm_rule_channel_hint()
         self._refresh_sleep_epoch_feature_tabs()
         self._plot_yasa_hypnogram_from_current_rows()
 
@@ -3087,16 +3349,41 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             )
         return events
 
-    def _populate_spindle_results_table(self, events: List[Dict[str, float]], *, origin_abs_s: float) -> None:
+    def _populate_spindle_results_table(
+        self,
+        events: List[Dict[str, float]],
+        k_events: Optional[List[Dict[str, float]]] = None,
+        *,
+        origin_abs_s: float,
+    ) -> None:
         table = self._spindle_results_table
-        headers = ["#", "Start_s", "Peak_s", "End_s", "Duration_s", "Amplitude", "Frequency", "RelPower"]
+        headers = [
+            "#",
+            "Type",
+            "Start_s",
+            "Peak_s",
+            "End_s",
+            "Duration_s",
+            "Amplitude_uV",
+            "Frequency_Hz",
+            "RelPower",
+            "PTP_uV",
+            "NegAmp_uV",
+            "NegToPos_s",
+        ]
         table.clear()
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
-        table.setRowCount(len(events))
-        for idx, event in enumerate(events):
+        combined: List[Tuple[str, Dict[str, float]]] = [
+            ("spindle", event) for event in events
+        ]
+        combined.extend(("kcomplex", event) for event in (k_events or []))
+        combined.sort(key=lambda item: float(item[1].get("Start", 0.0)))
+        table.setRowCount(len(combined))
+        for idx, (event_type, event) in enumerate(combined):
             values = [
                 idx + 1,
+                event_type,
                 origin_abs_s + event.get("Start", 0.0),
                 origin_abs_s + event.get("Peak", 0.0),
                 origin_abs_s + event.get("End", 0.0),
@@ -3104,6 +3391,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 event.get("Amplitude", np.nan),
                 event.get("Frequency", np.nan),
                 event.get("RelPower", np.nan),
+                event.get("PTP", np.nan),
+                event.get("NegAmplitude", np.nan),
+                event.get("NegToPosDuration", np.nan),
             ]
             for col, value in enumerate(values):
                 text = f"{value:.6g}" if isinstance(value, float) else str(value)
@@ -3354,6 +3644,181 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 table.setItem(idx, col, item)
         table.resizeColumnsToContents()
 
+    def _sleep_raw_to_uv_for_epoch_quality(self, raw: np.ndarray, unit: str) -> np.ndarray:
+        path = getattr(self, "_offline_csv_path", None)
+        unit_text = str(unit or "").strip().lower()
+        if (
+            path is not None
+            and not self._is_edf_like_file(path)
+            and unit_text == "raw"
+            and self._yasa_csv_raw_to_uv_check.isChecked()
+        ):
+            data_v, _baseline, _uv_per_count = self._csv_raw_to_yasa_volts(
+                np.asarray(raw, dtype=np.float64)
+            )
+            return data_v * 1e6
+        return np.asarray(raw, dtype=np.float64) * self._mne_unit_scale(unit) * 1e6
+
+    @staticmethod
+    def _epoch_flatline_pct(seg_uv: np.ndarray, fs: float) -> float:
+        arr = np.asarray(seg_uv, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        if finite.size < 2:
+            return 100.0
+        segment_size = max(2, int(round(max(float(fs), 1.0))))
+        flat_samples = 0
+        total_samples = 0
+        for start in range(0, arr.size, segment_size):
+            end = min(arr.size, start + segment_size)
+            piece = arr[start:end]
+            piece = piece[np.isfinite(piece)]
+            if piece.size < 2:
+                flat_samples += end - start
+                total_samples += end - start
+                continue
+            total_samples += piece.size
+            if float(np.ptp(piece)) <= 1.0 or float(np.nanmax(np.abs(np.diff(piece)))) <= 1e-6:
+                flat_samples += piece.size
+        return float(flat_samples / max(1, total_samples) * 100.0)
+
+    @staticmethod
+    def _epoch_high_freq_rel_pct(seg_uv: np.ndarray, fs: float) -> float:
+        arr = np.asarray(seg_uv, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < max(8, int(round(float(fs)))):
+            return 0.0
+        nyq = float(fs) * 0.5
+        fmax = min(45.0, nyq - 0.5)
+        if fmax <= 30.0:
+            return 0.0
+        nperseg = min(arr.size, max(8, int(round(min(4.0, arr.size / fs) * fs))))
+        freqs, psd = welch(arr, fs=float(fs), nperseg=nperseg)
+        total_mask = (freqs >= 0.5) & (freqs <= fmax)
+        high_mask = (freqs >= 30.0) & (freqs <= fmax)
+        total = float(np.trapz(psd[total_mask], freqs[total_mask])) if np.any(total_mask) else 0.0
+        high = float(np.trapz(psd[high_mask], freqs[high_mask])) if np.any(high_mask) else 0.0
+        return (high / total * 100.0) if total > 0 else 0.0
+
+    @staticmethod
+    def _epoch_delta_rel_pct(seg_uv: np.ndarray, fs: float) -> float:
+        arr = np.asarray(seg_uv, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < max(8, int(round(float(fs)))):
+            return 0.0
+        nyq = float(fs) * 0.5
+        fmax = min(30.0, nyq - 0.5)
+        if fmax <= 4.0:
+            return 0.0
+        nperseg = min(arr.size, max(8, int(round(min(4.0, arr.size / fs) * fs))))
+        freqs, psd = welch(arr, fs=float(fs), nperseg=nperseg)
+        total_mask = (freqs >= 0.5) & (freqs <= fmax)
+        delta_mask = (freqs >= 0.5) & (freqs <= 4.0)
+        total = float(np.trapz(psd[total_mask], freqs[total_mask])) if np.any(total_mask) else 0.0
+        delta = float(np.trapz(psd[delta_mask], freqs[delta_mask])) if np.any(delta_mask) else 0.0
+        return (delta / total * 100.0) if total > 0 else 0.0
+
+    def _apply_epoch_quality_features(
+        self,
+        rows: List[Dict[str, object]],
+        raw: np.ndarray,
+        fs: float,
+        offset_s: float,
+        unit: str,
+    ) -> None:
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        raw_uv = self._sleep_raw_to_uv_for_epoch_quality(arr, unit)
+        bad_mask = self._bad_mask_for_data(arr, fs, offset_s)
+        if bad_mask is None or bad_mask.size != arr.size:
+            bad_mask = np.zeros(arr.size, dtype=bool)
+        unit_text = str(unit or "").strip().lower().replace("μ", "u")
+        high_values: List[float] = []
+        for row in rows:
+            try:
+                start_s = float(row.get("start_s", 0.0)) - float(offset_s)
+                end_s = float(row.get("end_s", start_s)) - float(offset_s)
+            except (TypeError, ValueError):
+                high_values.append(0.0)
+                continue
+            i0 = max(0, min(arr.size, int(np.floor(start_s * fs))))
+            i1 = max(i0, min(arr.size, int(np.ceil(end_s * fs))))
+            seg = arr[i0:i1]
+            seg_uv = raw_uv[i0:i1]
+            seg_bad = bad_mask[i0:i1]
+            finite = seg[np.isfinite(seg)]
+            finite_uv = seg_uv[np.isfinite(seg_uv)]
+            bad_pct = float(np.mean(seg_bad) * 100.0) if seg_bad.size else 0.0
+            nonfinite_pct = (1.0 - finite.size / max(1, seg.size)) * 100.0 if seg.size else 100.0
+            ptp_uv = float(np.ptp(finite_uv)) if finite_uv.size else 0.0
+            if unit_text == "raw":
+                rail_mask = (finite <= movement_artifact.EEG_RAW_MIN_VALID) | (
+                    finite >= movement_artifact.EEG_RAW_MAX_VALID
+                )
+                rail_pct = float(np.count_nonzero(rail_mask) / max(1, finite.size) * 100.0)
+            else:
+                stats = self._openbci_quality_stats(finite_uv, "uV")
+                rail_pct = float(stats["rail_pct"]) if stats is not None else 0.0
+            flat_pct = self._epoch_flatline_pct(seg_uv, fs)
+            high_pct = self._epoch_high_freq_rel_pct(seg_uv, fs)
+            delta_rel_existing = row.get("delta_rel_pct", "")
+            try:
+                delta_rel_value = float(delta_rel_existing)
+            except (TypeError, ValueError):
+                delta_rel_value = np.nan
+            if not np.isfinite(delta_rel_value):
+                row["delta_rel_pct"] = self._epoch_delta_rel_pct(seg_uv, fs)
+            high_values.append(high_pct)
+            row["bad_pct"] = bad_pct
+            row["rail_pct"] = rail_pct
+            row["flatline_pct"] = flat_pct
+            row["ptp_uv"] = ptp_uv
+            row["nonfinite_pct"] = nonfinite_pct
+            row["high_freq_rel_pct"] = high_pct
+
+        high_arr = np.asarray(high_values, dtype=np.float64)
+        median = float(np.nanmedian(high_arr)) if high_arr.size else 0.0
+        mad = float(np.nanmedian(np.abs(high_arr - median))) if high_arr.size else 0.0
+        denom = 1.4826 * mad if mad > 1e-12 else 1.0
+        bad_pct_max = self._read_spindle_float(self._slow_wave_bad_pct_edit, "坏段占比上限")
+        muscle_z_max = self._read_spindle_float(self._slow_wave_muscle_z_edit, "肌电z上限")
+        flat_pct_max = self._read_spindle_float(self._slow_wave_flat_pct_edit, "flat占比上限")
+        for row in rows:
+            high_pct = float(row.get("high_freq_rel_pct", 0.0) or 0.0)
+            muscle_z = (high_pct - median) / denom
+            row["muscle_z"] = float(muscle_z)
+            reasons: List[str] = []
+            if float(row.get("bad_pct", 0.0) or 0.0) >= bad_pct_max:
+                reasons.append("bad_pct高")
+            if float(row.get("rail_pct", 0.0) or 0.0) >= 5.0:
+                reasons.append("rail_pct高")
+            if float(row.get("flatline_pct", 0.0) or 0.0) >= flat_pct_max:
+                reasons.append("flatline高")
+            if float(row.get("nonfinite_pct", 0.0) or 0.0) > 5.0:
+                reasons.append("非有限值多")
+            if muscle_z >= muscle_z_max:
+                reasons.append("高频/肌电偏高")
+            if reasons:
+                row["quality_label"] = "bad" if any(r in reasons for r in ("bad_pct高", "rail_pct高", "flatline高")) else "suspicious"
+                row["quality_action"] = "block_refine"
+                row["quality_reason"] = ";".join(reasons)
+            elif (
+                float(row.get("bad_pct", 0.0) or 0.0) > 0.0
+                or float(row.get("rail_pct", 0.0) or 0.0) > 0.0
+                or muscle_z >= 2.0
+            ):
+                row["quality_label"] = "suspicious"
+                row["quality_action"] = "downweight"
+                row["quality_reason"] = "轻度坏段/rail/高频迹象"
+            else:
+                row["quality_label"] = "good"
+                row["quality_action"] = "use"
+                row["quality_reason"] = "质量通过"
+
+    def _read_slow_wave_candidate_stages(self) -> set[str]:
+        text = self._slow_wave_candidate_stages_edit.text().strip()
+        stages = {part.strip().upper() for part in text.split(",") if part.strip()}
+        normalized = {"R" if stage == "REM" else "W" if stage == "WAKE" else stage for stage in stages}
+        return normalized or {"N1", "N2", "N3"}
+
     def _apply_slow_wave_features_to_epoch_rows(
         self,
         rows: List[Dict[str, object]],
@@ -3364,6 +3829,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         time_pct_min = self._read_spindle_float(self._slow_wave_time_pct_edit, "慢波占时下限")
         delta_rel_min = self._read_spindle_float(self._slow_wave_delta_rel_edit, "delta相对功率下限")
         conf_threshold = self._read_spindle_float(self._slow_wave_confidence_edit, "N2低置信阈值")
+        candidate_stages = self._read_slow_wave_candidate_stages()
+        quality_gate = self._slow_wave_quality_gate_check.isChecked()
         refined = 0
         for row in rows:
             try:
@@ -3406,30 +3873,1272 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             low_conf_ok = True
             if self._slow_wave_require_low_conf_check.isChecked():
                 low_conf_ok = (not np.isfinite(confidence)) or confidence < conf_threshold
-            stage_ok = stage == "N2" or not self._slow_wave_only_n2_check.isChecked()
-            slow_ok = (
-                stage_ok
-                and low_conf_ok
-                and row["slow_wave_time_pct"] >= time_pct_min
-                and delta_rel >= delta_rel_min
+            stage_key = "R" if stage == "REM" else "W" if stage == "WAKE" else stage
+            stage_ok = stage_key in candidate_stages
+            quality_action = str(row.get("quality_action", "use") or "use")
+            quality_ok = (not quality_gate) or quality_action in {"use", "downweight"}
+            sw_ratio = (
+                float(row["slow_wave_time_pct"]) / max(1e-9, time_pct_min)
+                if time_pct_min > 0
+                else 0.0
             )
-            if slow_ok:
+            delta_ratio = (
+                float(delta_rel) / max(1e-9, delta_rel_min)
+                if delta_rel_min > 0
+                else 0.0
+            )
+            ptp_ratio = 0.0
+            try:
+                mean_ptp = float(row.get("slow_wave_mean_ptp", 0.0) or 0.0)
+                ptp_ratio = mean_ptp / max(1e-9, self._read_spindle_float(self._slow_wave_ptp_uv_edit, "慢波PTP阈值"))
+            except (TypeError, ValueError):
+                ptp_ratio = 0.0
+            score = max(0.0, min(1.0, 0.45 * min(sw_ratio, 1.5) / 1.5 + 0.35 * min(delta_ratio, 1.5) / 1.5 + 0.20 * min(ptp_ratio, 1.5) / 1.5))
+            row["n3_evidence_score"] = score
+            strong_evidence = row["slow_wave_time_pct"] >= time_pct_min and delta_rel >= delta_rel_min
+            possible_evidence = (
+                row["slow_wave_time_pct"] >= time_pct_min * 0.5
+                and delta_rel >= delta_rel_min * 0.75
+                and count > 0
+            )
+            if strong_evidence:
+                evidence_level = "strong"
+            elif possible_evidence:
+                evidence_level = "possible"
+            else:
+                evidence_level = "weak"
+            row["n3_evidence_level"] = evidence_level
+            row["stage_before_n3"] = stage
+            row["stage_suggested"] = stage
+            row["n3_action"] = "keep"
+
+            if strong_evidence and stage_ok and low_conf_ok and quality_ok:
                 stage_refined_slow = "N3"
-                reason = "慢波占时和delta功率达到阈值，修正为N3"
+                row["stage_refined_n3"] = "N3"
+                row["stage_refined_slow"] = "N3"
+                row["stage_refined"] = "N3"
+                row["stage_suggested"] = "N3"
+                row["n3_action"] = "auto_refine"
+                reason = "质量通过 + 慢波占时和delta功率达到阈值，修正为N3"
                 if stage != "N3":
                     refined += 1
             else:
-                if stage != "N2" and self._slow_wave_only_n2_check.isChecked():
-                    reason = "非N2初判，不执行N3慢波修正"
+                row["stage_refined_n3"] = stage_refined_slow
+                if not stage_ok:
+                    reason = f"阶段{stage or '空'}不在N3候选范围，保留初判"
                 elif not low_conf_ok:
                     reason = "YASA置信度高，未执行N3慢波修正"
+                elif quality_gate and not quality_ok and evidence_level in {"strong", "possible"}:
+                    reason = f"质量门控阻止修正: {row.get('quality_reason', '')}"
+                    row["n3_action"] = "blocked_by_quality"
+                    row["stage_suggested"] = "N3"
+                elif evidence_level == "possible":
+                    reason = "慢波/delta证据可疑但未达强证据，仅建议复核N3"
+                    row["n3_action"] = "suggest_review"
+                    row["stage_suggested"] = "N3"
                 elif delta_rel < delta_rel_min:
                     reason = "delta相对功率不足，保留初判"
                 elif row["slow_wave_time_pct"] < time_pct_min:
                     reason = "慢波占时不足，保留初判"
             row["stage_refined_slow"] = stage_refined_slow
             row["slow_wave_refine_reason"] = reason
+            row["n3_reason"] = reason
         return refined
+
+    @staticmethod
+    def _normalized_sleep_stage(value: object) -> str:
+        stage = str(value or "").strip().upper()
+        if stage == "REM":
+            return "R"
+        if stage == "WAKE":
+            return "W"
+        return stage
+
+    def _row_float_value(self, row: Dict[str, object], key: str, default: float = 0.0) -> float:
+        try:
+            value = float(row.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if np.isfinite(value) else default
+
+    def _row_rem_probability(self, row: Dict[str, object]) -> Optional[float]:
+        for key in (
+            "prob_R",
+            "proba_R",
+            "prob_rem",
+            "proba_rem",
+            "yasa_prob_R",
+            "yasa_proba_R",
+            "yasa_prob_REM",
+            "yasa_proba_REM",
+        ):
+            if key not in row:
+                continue
+            try:
+                value = float(row.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return value
+        return None
+
+    def _apply_n3_context_fill_rule(self, rows: List[Dict[str, object]]) -> int:
+        if not getattr(self, "_n3_context_fill_check", None) or not self._n3_context_fill_check.isChecked():
+            return 0
+        window = max(1, int(round(self._read_spindle_float(self._n3_context_window_edit, "N3补洞左右窗口"))))
+        min_neighbors = max(1, int(round(self._read_spindle_float(self._n3_context_min_neighbors_edit, "N3补洞邻近N3下限"))))
+        delta_min = self._read_spindle_float(self._n3_context_delta_rel_edit, "N3补洞delta下限")
+        slow_time_min = self._read_spindle_float(self._n3_context_slow_time_pct_edit, "N3补洞慢波占时下限")
+        max_markers = max(0, int(round(self._read_spindle_float(self._n3_context_max_markers_edit, "N3补洞纺锤/K复合上限"))))
+        conf_max = self._read_spindle_float(self._n3_context_confidence_edit, "N3补洞置信上限")
+        rem_prob_max = 0.35
+        base_stages = [
+            self._normalized_sleep_stage(row.get("stage_refined_n3", row.get("stage_refined", row.get("stage_yasa", ""))))
+            for row in rows
+        ]
+        refined = 0
+        for idx, row in enumerate(rows):
+            current_stage = self._normalized_sleep_stage(
+                row.get("stage_refined_n3", row.get("stage_refined", row.get("stage_yasa", "")))
+            )
+            if current_stage != "N2":
+                continue
+            quality_label = str(row.get("quality_label", "") or "").strip().lower()
+            if quality_label == "bad":
+                row["n3_context_reason"] = "质量为bad，不执行N3段内补洞"
+                continue
+            start = max(0, idx - window)
+            end = min(len(rows), idx + window + 1)
+            neighbor_indices = [j for j in range(start, end) if j != idx]
+            n3_neighbors = sum(1 for j in neighbor_indices if base_stages[j] == "N3")
+            row["n3_context_n3_neighbors"] = n3_neighbors
+            if n3_neighbors < min_neighbors:
+                row["n3_context_reason"] = "邻近N3数量不足"
+                continue
+            delta_rel = self._row_float_value(row, "delta_rel_pct", 0.0)
+            if delta_rel < delta_min:
+                row["n3_context_reason"] = "补洞delta不足"
+                continue
+            slow_time_pct = self._row_float_value(row, "slow_wave_time_pct", 0.0)
+            if slow_time_pct < slow_time_min:
+                row["n3_context_reason"] = "补洞慢波占时不足"
+                continue
+            spindle_count = int(round(self._row_float_value(row, "spindle_count", 0.0)))
+            kcomplex_count = int(round(self._row_float_value(row, "kcomplex_count", 0.0)))
+            if spindle_count > max_markers or kcomplex_count > max_markers:
+                row["n3_context_reason"] = "纺锤/K复合特征偏强，保留N2"
+                continue
+            confidence = self._row_float_value(row, "yasa_confidence", np.nan)
+            if np.isfinite(confidence) and confidence > conf_max:
+                row["n3_context_reason"] = "YASA置信度高，保留N2"
+                continue
+            rem_prob = self._row_rem_probability(row)
+            if rem_prob is not None and rem_prob > rem_prob_max:
+                row["n3_context_reason"] = "REM概率偏高，保留N2"
+                continue
+            before = current_stage
+            row["stage_refined_n3"] = "N3"
+            row["stage_refined_slow"] = "N3"
+            row["stage_refined"] = "N3"
+            row["stage_suggested"] = "N3"
+            row["n3_action"] = "auto_refine_context"
+            reason = "N3段内补洞：左右邻近epoch支持N3 + delta较高 + 质量可用"
+            row["slow_wave_refine_reason"] = reason
+            row["n3_reason"] = reason
+            row["n3_context_reason"] = reason
+            if before != "N3":
+                refined += 1
+        return refined
+
+    def _n3_delta_run_candidate_ok(
+        self,
+        row: Dict[str, object],
+        *,
+        delta_min: float,
+        max_markers: int,
+        conf_max: float,
+        rem_prob_max: float,
+    ) -> Tuple[bool, str]:
+        current_stage = self._normalized_sleep_stage(
+            row.get("stage_refined_n3", row.get("stage_refined", row.get("stage_yasa", "")))
+        )
+        if current_stage != "N2":
+            return False, "当前阶段不是N2"
+        quality_label = str(row.get("quality_label", "") or "").strip().lower()
+        if quality_label == "bad":
+            return False, "质量为bad"
+        delta_rel = self._row_float_value(row, "delta_rel_pct", 0.0)
+        if delta_rel < delta_min:
+            return False, "delta不足"
+        spindle_count = int(round(self._row_float_value(row, "spindle_count", 0.0)))
+        kcomplex_count = int(round(self._row_float_value(row, "kcomplex_count", 0.0)))
+        if spindle_count > max_markers or kcomplex_count > max_markers:
+            return False, "纺锤/K复合特征偏强"
+        confidence = self._row_float_value(row, "yasa_confidence", np.nan)
+        if np.isfinite(confidence) and confidence > conf_max:
+            return False, "YASA置信度高"
+        rem_prob = self._row_rem_probability(row)
+        if rem_prob is not None and rem_prob > rem_prob_max:
+            return False, "REM概率偏高"
+        return True, "通过"
+
+    def _apply_n3_delta_run_rule(self, rows: List[Dict[str, object]]) -> int:
+        if not getattr(self, "_n3_delta_run_check", None) or not self._n3_delta_run_check.isChecked():
+            return 0
+        min_len = max(2, int(round(self._read_spindle_float(self._n3_delta_run_min_len_edit, "delta连续段最短epoch"))))
+        delta_min = self._read_spindle_float(self._n3_delta_run_delta_rel_edit, "delta连续段下限")
+        min_good = max(1, int(round(self._read_spindle_float(self._n3_delta_run_min_good_edit, "delta段内可用epoch下限"))))
+        max_markers = max(0, int(round(self._read_spindle_float(self._n3_context_max_markers_edit, "N3纺锤/K复合上限"))))
+        conf_max = self._read_spindle_float(self._n3_delta_run_confidence_edit, "delta段置信上限")
+        rem_prob_max = 0.35
+        ok_flags: List[bool] = []
+        reasons: List[str] = []
+        for row in rows:
+            ok, reason = self._n3_delta_run_candidate_ok(
+                row,
+                delta_min=delta_min,
+                max_markers=max_markers,
+                conf_max=conf_max,
+                rem_prob_max=rem_prob_max,
+            )
+            ok_flags.append(ok)
+            reasons.append(reason)
+            if not ok:
+                row["n3_delta_run_reason"] = reason
+
+        refined = 0
+        idx = 0
+        while idx < len(rows):
+            if not ok_flags[idx]:
+                idx += 1
+                continue
+            start = idx
+            while idx < len(rows) and ok_flags[idx]:
+                idx += 1
+            end = idx
+            run_len = end - start
+            if run_len < min_len or run_len < min_good:
+                for j in range(start, end):
+                    rows[j]["n3_delta_run_len"] = run_len
+                    rows[j]["n3_delta_run_reason"] = "delta连续段长度不足"
+                continue
+            for j in range(start, end):
+                row = rows[j]
+                row["n3_delta_run_len"] = run_len
+                row["stage_refined_n3"] = "N3"
+                row["stage_refined_slow"] = "N3"
+                row["stage_refined"] = "N3"
+                row["stage_suggested"] = "N3"
+                row["n3_action"] = "auto_refine_delta_run"
+                reason = "delta连续段N3修正：连续N2 epoch delta较高 + 质量可用"
+                row["slow_wave_refine_reason"] = reason
+                row["n3_reason"] = reason
+                row["n3_delta_run_reason"] = reason
+                refined += 1
+        return refined
+
+    def _n3_island_correction_summary(self, rows: List[Dict[str, object]]) -> Dict[str, int]:
+        return {
+            "N2_to_N3": sum(1 for row in rows if row.get("n3_island_rule") == "isolated_N2_inside_N3"),
+            "N3_to_N2": sum(1 for row in rows if row.get("n3_island_rule") == "isolated_weak_N3_inside_N2"),
+            "rejected": sum(1 for row in rows if str(row.get("n3_island_reason", "") or "").startswith("拒绝")),
+        }
+
+    def _n3_island_evidence_ok_for_n3(
+        self,
+        row: Dict[str, object],
+        *,
+        score_min: float,
+        confidence_max: float,
+    ) -> Tuple[bool, str]:
+        quality_label = str(row.get("quality_label", "") or "").strip().lower()
+        if quality_label == "bad":
+            return False, "拒绝N2->N3：质量为bad"
+        confidence = self._row_float_value(row, "yasa_confidence", np.nan)
+        if np.isfinite(confidence) and confidence > confidence_max:
+            return False, "拒绝N2->N3：原始置信度过高"
+        score = self._row_float_value(row, "n3_evidence_score", 0.0)
+        delta_rel = self._row_float_value(row, "delta_rel_pct", 0.0)
+        slow_time = self._row_float_value(row, "slow_wave_time_pct", 0.0)
+        slow_count = int(round(self._row_float_value(row, "slow_wave_count", 0.0)))
+        mean_ptp = self._row_float_value(row, "slow_wave_mean_ptp", 0.0)
+        delta_min = self._read_spindle_float(self._n3_context_delta_rel_edit, "N3孤岛delta下限")
+        slow_time_min = self._read_spindle_float(self._n3_context_slow_time_pct_edit, "N3孤岛慢波占时下限")
+        ptp_min = self._read_spindle_float(self._slow_wave_ptp_uv_edit, "N3孤岛慢波PTP阈值")
+        if score < score_min:
+            return False, "拒绝N2->N3：N3证据分不足"
+        if delta_rel < delta_min:
+            return False, "拒绝N2->N3：delta不足"
+        if slow_count <= 0:
+            return False, "拒绝N2->N3：未检出慢波"
+        if slow_time < slow_time_min and mean_ptp < ptp_min:
+            return False, "拒绝N2->N3：慢波占时/幅值不足"
+        return True, "通过"
+
+    def _n3_island_evidence_weak_for_n3(
+        self,
+        row: Dict[str, object],
+        *,
+        score_max: float,
+        confidence_max: float,
+    ) -> Tuple[bool, str]:
+        quality_label = str(row.get("quality_label", "") or "").strip().lower()
+        if quality_label == "bad":
+            return False, "拒绝N3->N2：质量为bad"
+        confidence = self._row_float_value(row, "yasa_confidence", np.nan)
+        if np.isfinite(confidence) and confidence > confidence_max:
+            return False, "拒绝N3->N2：原始N3置信度过高"
+        score = self._row_float_value(row, "n3_evidence_score", 0.0)
+        slow_count = int(round(self._row_float_value(row, "slow_wave_count", 0.0)))
+        slow_time = self._row_float_value(row, "slow_wave_time_pct", 0.0)
+        if score > score_max:
+            return False, "拒绝N3->N2：N3证据分不弱"
+        if slow_count > 0 and slow_time > 0:
+            return False, "拒绝N3->N2：仍有慢波证据"
+        return True, "通过"
+
+    def _apply_n3_island_bidirectional_rule(self, rows: List[Dict[str, object]]) -> Dict[str, int]:
+        if not getattr(self, "_n3_island_check", None) or not self._n3_island_check.isChecked():
+            return {"N2_to_N3": 0, "N3_to_N2": 0, "rejected": 0}
+        score_enter = self._read_spindle_float(self._n3_island_score_enter_edit, "孤岛N3进入分")
+        score_exit = self._read_spindle_float(self._n3_island_score_exit_edit, "孤岛N3退出分")
+        confidence_max = self._read_spindle_float(self._n3_island_confidence_edit, "孤岛置信上限")
+        if score_enter <= score_exit:
+            raise ValueError("孤岛N3进入分必须大于孤岛N3退出分")
+
+        source_stages = [
+            self._normalized_sleep_stage(row.get("stage_refined_n3", row.get("stage_refined", row.get("stage_yasa", ""))))
+            for row in rows
+        ]
+        output_stages = list(source_stages)
+        n2_to_n3 = 0
+        n3_to_n2 = 0
+        rejected = 0
+        for idx in range(1, len(rows) - 1):
+            row = rows[idx]
+            prev_stage = source_stages[idx - 1]
+            stage = source_stages[idx]
+            next_stage = source_stages[idx + 1]
+            row["n3_island_prev_stage"] = prev_stage
+            row["n3_island_next_stage"] = next_stage
+
+            if stage == "N2" and prev_stage == "N3" and next_stage == "N3":
+                ok, reason = self._n3_island_evidence_ok_for_n3(
+                    row,
+                    score_min=score_enter,
+                    confidence_max=confidence_max,
+                )
+                if ok:
+                    output_stages[idx] = "N3"
+                    row["n3_island_rule"] = "isolated_N2_inside_N3"
+                    row["n3_island_old_stage"] = "N2"
+                    row["n3_island_new_stage"] = "N3"
+                    row["n3_island_reason"] = "孤立N2夹在N3中：邻域支持 + 慢波/N3证据通过"
+                    n2_to_n3 += 1
+                else:
+                    row["n3_island_reason"] = reason
+                    rejected += 1
+            elif stage == "N3" and prev_stage == "N2" and next_stage == "N2":
+                ok, reason = self._n3_island_evidence_weak_for_n3(
+                    row,
+                    score_max=score_exit,
+                    confidence_max=confidence_max,
+                )
+                if ok:
+                    output_stages[idx] = "N2"
+                    row["n3_island_rule"] = "isolated_weak_N3_inside_N2"
+                    row["n3_island_old_stage"] = "N3"
+                    row["n3_island_new_stage"] = "N2"
+                    row["n3_island_reason"] = "孤立N3夹在N2中：N3证据弱 + 原始置信度不高"
+                    n3_to_n2 += 1
+                else:
+                    row["n3_island_reason"] = reason
+                    rejected += 1
+
+        for idx, new_stage in enumerate(output_stages):
+            if new_stage == source_stages[idx]:
+                continue
+            row = rows[idx]
+            row["stage_refined_n3"] = new_stage
+            row["stage_refined_slow"] = new_stage
+            row["stage_refined"] = new_stage
+            row["stage_suggested"] = new_stage
+            if row.get("n3_island_rule") == "isolated_N2_inside_N3":
+                row["n3_action"] = "auto_refine_island_n2_to_n3"
+            elif row.get("n3_island_rule") == "isolated_weak_N3_inside_N2":
+                row["n3_action"] = "auto_refine_island_n3_to_n2"
+            row["n3_reason"] = str(row.get("n3_island_reason", "") or "N2/N3孤岛双向修正")
+            row["slow_wave_refine_reason"] = row["n3_reason"]
+        return {"N2_to_N3": n2_to_n3, "N3_to_N2": n3_to_n2, "rejected": rejected}
+
+    @staticmethod
+    def _count_epoch_values(rows: List[Dict[str, object]], key: str) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for row in rows:
+            value = str(row.get(key, "") or "").strip()
+            if not value:
+                value = "(空)"
+            counts[value] = counts.get(value, 0) + 1
+        return counts
+
+    @staticmethod
+    def _format_epoch_counts(counts: Dict[str, int]) -> str:
+        if not counts:
+            return "无"
+        return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+    def _export_table_widget_csv(
+        self,
+        table: QtWidgets.QTableWidget,
+        *,
+        title: str,
+        default_name: str,
+        empty_message: str,
+        success_prefix: str,
+    ) -> None:
+        if table.rowCount() <= 0 or table.columnCount() <= 0:
+            self._log(empty_message)
+            return
+        default_dir = Path(getattr(self, "_offline_csv_path", _ROOT) or _ROOT).parent
+        path_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            title,
+            str(default_dir / default_name),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        headers = [
+            table.horizontalHeaderItem(col).text()
+            if table.horizontalHeaderItem(col) is not None
+            else f"col_{col + 1}"
+            for col in range(table.columnCount())
+        ]
+        try:
+            with path.open("w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for row in range(table.rowCount()):
+                    writer.writerow(
+                        [
+                            table.item(row, col).text()
+                            if table.item(row, col) is not None
+                            else ""
+                            for col in range(table.columnCount())
+                        ]
+                    )
+            self._log(f"{success_prefix}已导出: {path}")
+        except Exception as exc:
+            self._log(f"{success_prefix}导出失败: {exc}")
+
+    @QtCore.pyqtSlot()
+    def _export_spindle_candidate_table_csv(self) -> None:
+        self._export_table_widget_csv(
+            self._spindle_results_table,
+            title="导出 Spindle/K-complex 候选CSV",
+            default_name="sleep_spindle_kcomplex_candidates.csv",
+            empty_message="请先运行 Spindle/K-complex 检测，再导出候选 CSV",
+            success_prefix="Spindle/K-complex候选CSV",
+        )
+
+    @QtCore.pyqtSlot()
+    def _export_slow_wave_candidate_table_csv(self) -> None:
+        self._export_table_widget_csv(
+            self._slow_wave_results_table,
+            title="导出 SlowWave 候选CSV",
+            default_name="sleep_slow_wave_candidates.csv",
+            empty_message="请先运行 SlowWave/N3 检测，再导出候选 CSV",
+            success_prefix="SlowWave候选CSV",
+        )
+
+    @staticmethod
+    def _event_peak_abs_s(event: Dict[str, float], origin_abs_s: float) -> float:
+        return float(origin_abs_s + event.get("Peak", event.get("Start", 0.0)))
+
+    def _events_in_epoch(
+        self,
+        events: List[Dict[str, float]],
+        *,
+        epoch_start: float,
+        epoch_end: float,
+        origin_abs_s: float,
+    ) -> List[Dict[str, float]]:
+        return [
+            event
+            for event in events
+            if epoch_start <= self._event_peak_abs_s(event, origin_abs_s) < epoch_end
+        ]
+
+    def _summarize_slow_wave_for_rule_rows(
+        self,
+        rows: List[Dict[str, object]],
+        events: List[Dict[str, float]],
+        *,
+        origin_abs_s: float,
+    ) -> None:
+        for row in rows:
+            try:
+                epoch_start = float(row.get("start_s", 0.0))
+                epoch_end = float(row.get("end_s", epoch_start))
+            except (TypeError, ValueError):
+                continue
+            epoch_duration = max(1e-9, epoch_end - epoch_start)
+            in_epoch = self._events_in_epoch(
+                events,
+                epoch_start=epoch_start,
+                epoch_end=epoch_end,
+                origin_abs_s=origin_abs_s,
+            )
+            total_time = sum(max(0.0, float(event.get("Duration", 0.0))) for event in in_epoch)
+            row["slow_wave_count"] = len(in_epoch)
+            row["slow_wave_time_pct"] = min(100.0, total_time / epoch_duration * 100.0)
+            row["swa_pct"] = row["slow_wave_time_pct"]
+
+    def _summarize_spindle_kcomplex_for_rule_rows(
+        self,
+        rows: List[Dict[str, object]],
+        spindles: List[Dict[str, float]],
+        k_events: List[Dict[str, float]],
+        *,
+        origin_abs_s: float,
+    ) -> None:
+        for row in rows:
+            try:
+                epoch_start = float(row.get("start_s", 0.0))
+                epoch_end = float(row.get("end_s", epoch_start))
+            except (TypeError, ValueError):
+                continue
+            epoch_duration = max(1e-9, epoch_end - epoch_start)
+            spindle_in_epoch = self._events_in_epoch(
+                spindles,
+                epoch_start=epoch_start,
+                epoch_end=epoch_end,
+                origin_abs_s=origin_abs_s,
+            )
+            k_in_epoch = self._events_in_epoch(
+                k_events,
+                epoch_start=epoch_start,
+                epoch_end=epoch_end,
+                origin_abs_s=origin_abs_s,
+            )
+            row["spindle_count"] = len(spindle_in_epoch)
+            row["spindle_density"] = len(spindle_in_epoch) / (epoch_duration / 60.0)
+            row["kcomplex_count"] = len(k_in_epoch)
+            row["kcomplex_density"] = len(k_in_epoch) / (epoch_duration / 60.0)
+
+        all_markers = list(spindles) + list(k_events)
+        for idx, row in enumerate(rows):
+            try:
+                epoch_start = float(row.get("start_s", 0.0))
+                epoch_end = float(row.get("end_s", epoch_start))
+            except (TypeError, ValueError):
+                continue
+            half = epoch_start + max(0.0, epoch_end - epoch_start) * 0.5
+            current_first = [
+                event for event in all_markers
+                if epoch_start <= self._event_peak_abs_s(event, origin_abs_s) < half
+            ]
+            prev_second: List[Dict[str, float]] = []
+            if idx > 0:
+                try:
+                    prev_start = float(rows[idx - 1].get("start_s", 0.0))
+                    prev_end = float(rows[idx - 1].get("end_s", prev_start))
+                except (TypeError, ValueError):
+                    prev_start = prev_end = 0.0
+                prev_half = prev_start + max(0.0, prev_end - prev_start) * 0.5
+                prev_second = [
+                    event for event in all_markers
+                    if prev_half <= self._event_peak_abs_s(event, origin_abs_s) < prev_end
+                ]
+            row["n2_marker_first_half_count"] = len(current_first)
+            row["n2_marker_prev_second_half_count"] = len(prev_second)
+
+    def _compute_aasm_alpha_lamf_features(
+        self,
+        rows: List[Dict[str, object]],
+        eeg_uv: np.ndarray,
+        fs: float,
+        *,
+        origin_abs_s: float,
+        alpha_uv: Optional[np.ndarray] = None,
+    ) -> None:
+        arr = np.asarray(eeg_uv, dtype=np.float64).reshape(-1)
+        finite = arr[np.isfinite(arr)]
+        if finite.size < max(8, int(round(float(fs) * 2.0))):
+            for row in rows:
+                row["alpha_pct"] = 0.0
+                row["lamf_pct"] = 0.0
+            return
+        centered = arr - float(np.nanmedian(finite))
+        alpha_arr = np.asarray(alpha_uv, dtype=np.float64).reshape(-1) if alpha_uv is not None else arr
+        alpha_finite = alpha_arr[np.isfinite(alpha_arr)]
+        if alpha_finite.size >= max(8, int(round(float(fs) * 2.0))):
+            alpha_centered = alpha_arr - float(np.nanmedian(alpha_finite))
+        else:
+            alpha_centered = centered
+        n = centered.size
+        alpha_mask = np.zeros(n, dtype=bool)
+        lamf_mask = np.zeros(n, dtype=bool)
+        alpha_win = max(8, int(round(2.0 * fs)))
+        alpha_step = max(1, int(round(0.5 * fs)))
+        lamf_win = max(8, int(round(1.0 * fs)))
+        lamf_step = max(1, int(round(0.5 * fs)))
+        alpha_window_rel_min = self._read_spindle_float(self._aasm_alpha_window_rel_edit, "alpha微标注阈值")
+        abs_signal = np.abs(centered)
+        amp_limit = float(np.nanmean(np.abs(finite)) - 0.01 * np.nanstd(np.abs(finite)))
+        amp_limit = max(0.0, amp_limit)
+
+        def _rel_power(seg: np.ndarray, low: float, high: float, total_low: float = 0.5, total_high: float = 30.0) -> float:
+            seg = np.asarray(seg, dtype=np.float64)
+            seg = seg[np.isfinite(seg)]
+            if seg.size < 8:
+                return 0.0
+            nyq = float(fs) * 0.5
+            high = min(high, nyq - 0.1)
+            total_high = min(total_high, nyq - 0.1)
+            if high <= low or total_high <= total_low:
+                return 0.0
+            nperseg = min(seg.size, max(8, int(round(min(2.0, seg.size / fs) * fs))))
+            freqs, psd = welch(seg, fs=float(fs), nperseg=nperseg, detrend="constant")
+            total_mask = (freqs >= total_low) & (freqs <= total_high)
+            band_mask = (freqs >= low) & (freqs <= high)
+            total = float(np.trapz(psd[total_mask], freqs[total_mask])) if np.any(total_mask) else 0.0
+            band = float(np.trapz(psd[band_mask], freqs[band_mask])) if np.any(band_mask) else 0.0
+            return band / total * 100.0 if total > 0 else 0.0
+
+        for start in range(0, max(1, n - alpha_win + 1), alpha_step):
+            end = min(n, start + alpha_win)
+            alpha_end = min(alpha_centered.size, end)
+            if alpha_end <= start:
+                continue
+            if _rel_power(alpha_centered[start:alpha_end], 8.0, 12.0) >= alpha_window_rel_min:
+                alpha_mask[start:end] = True
+        for start in range(0, max(1, n - lamf_win + 1), lamf_step):
+            end = min(n, start + lamf_win)
+            if np.nanmean(abs_signal[start:end] <= amp_limit) < 0.80:
+                continue
+            if _rel_power(centered[start:end], 4.0, 7.0) >= 1.0:
+                lamf_mask[start:end] = True
+
+        for idx, row in enumerate(rows):
+            try:
+                start_s = float(row.get("start_s", 0.0))
+                end_s = float(row.get("end_s", start_s))
+            except (TypeError, ValueError):
+                continue
+            i0 = max(0, min(n, int(round((start_s - origin_abs_s) * fs))))
+            i1 = max(i0, min(n, int(round((end_s - origin_abs_s) * fs))))
+            denom = max(1, i1 - i0)
+            row["alpha_pct"] = float(np.count_nonzero(alpha_mask[i0:i1]) / denom * 100.0)
+            row["lamf_pct"] = float(np.count_nonzero(lamf_mask[i0:i1]) / denom * 100.0)
+            alpha_i0 = max(0, min(alpha_centered.size, int(round((start_s - origin_abs_s) * fs))))
+            alpha_i1 = max(alpha_i0, min(alpha_centered.size, int(round((end_s - origin_abs_s) * fs))))
+            row["alpha_rel_pct_aasm"] = _rel_power(alpha_centered[alpha_i0:alpha_i1], 8.0, 12.0)
+            if idx > 0:
+                prev_alpha = self._row_float_value(rows[idx - 1], "alpha_pct", 0.0)
+                row["alpha_attenuated"] = bool(prev_alpha >= 20.0 and row["alpha_pct"] < prev_alpha * 0.5)
+            else:
+                row["alpha_attenuated"] = False
+
+    def _compute_aasm_emg_features(
+        self,
+        rows: List[Dict[str, object]],
+        emg_uv: Optional[np.ndarray],
+        fs: float,
+        *,
+        origin_abs_s: float,
+    ) -> None:
+        if emg_uv is None:
+            for row in rows:
+                row["emg_tone"] = "missing"
+                row["emg_rms_uv"] = ""
+            return
+        arr = np.asarray(emg_uv, dtype=np.float64).reshape(-1)
+        rms_values: List[float] = []
+        for row in rows:
+            try:
+                start_s = float(row.get("start_s", 0.0))
+                end_s = float(row.get("end_s", start_s))
+            except (TypeError, ValueError):
+                rms_values.append(np.nan)
+                continue
+            i0 = max(0, min(arr.size, int(round((start_s - origin_abs_s) * fs))))
+            i1 = max(i0, min(arr.size, int(round((end_s - origin_abs_s) * fs))))
+            seg = arr[i0:i1]
+            seg = seg[np.isfinite(seg)]
+            rms_values.append(float(np.sqrt(np.mean(seg * seg))) if seg.size else np.nan)
+        finite = np.asarray([v for v in rms_values if np.isfinite(v)], dtype=np.float64)
+        if finite.size == 0:
+            low_thr = high_thr = np.nan
+        else:
+            low_pct = self._read_spindle_float(self._aasm_emg_low_pct_edit, "EMG低肌张分位")
+            high_pct = self._read_spindle_float(self._aasm_emg_high_pct_edit, "EMG高肌张分位")
+            low_thr = float(np.nanpercentile(finite, max(0.0, min(100.0, low_pct))))
+            high_thr = float(np.nanpercentile(finite, max(0.0, min(100.0, high_pct))))
+        for row, rms in zip(rows, rms_values):
+            row["emg_rms_uv"] = float(rms) if np.isfinite(rms) else ""
+            if not np.isfinite(rms) or not np.isfinite(low_thr) or not np.isfinite(high_thr):
+                row["emg_tone"] = "missing"
+            elif rms <= low_thr:
+                row["emg_tone"] = "low"
+            elif rms >= high_thr:
+                row["emg_tone"] = "high"
+            else:
+                row["emg_tone"] = "mid"
+
+    def _load_aasm_channel_uv_window(
+        self,
+        channel_index: Optional[int],
+        *,
+        start_s: float,
+        end_s: float,
+        target_fs: float,
+    ) -> Tuple[Optional[np.ndarray], str]:
+        if channel_index is None:
+            return None, ""
+        path = getattr(self, "_offline_csv_path", None)
+        try:
+            if path is not None and self._supports_offline_channel_browse(path):
+                if not self._is_edf_like_file(path) and is_openbci_brainflow_eeg_file(path):
+                    raw_i, fs_i, label_i, unit_i, _actual_start_s = load_eeg_file_channel_window(
+                        path,
+                        int(channel_index),
+                        start_s=float(start_s),
+                        duration_s=max(0.0, float(end_s - start_s)),
+                    )
+                else:
+                    raw_i, fs_i, label_i, unit_i = load_eeg_file_channel(path, int(channel_index))
+                    i0 = max(0, int(round(float(start_s) * float(fs_i))))
+                    i1 = min(len(raw_i), int(round(float(end_s) * float(fs_i))))
+                    raw_i = np.asarray(raw_i, dtype=np.float64)[i0:i1]
+            else:
+                raw_i = np.asarray(getattr(self, "_offline_current_raw", np.zeros(0)), dtype=np.float64)
+                fs_i = float(getattr(self, "_offline_current_fs", 0.0))
+                label_i = getattr(self, "_offline_current_y_label", "EEG") or "EEG"
+                unit_i = str(getattr(self, "_offline_current_y_label", "raw") or "raw")
+            arr = np.asarray(raw_i, dtype=np.float64)
+            if arr.size < 8:
+                return None, str(label_i)
+            unit_text = str(unit_i)
+            if (
+                path is not None
+                and not self._is_edf_like_file(path)
+                and unit_text.strip().lower() == "raw"
+                and self._yasa_csv_raw_to_uv_check.isChecked()
+            ):
+                data_v, _baseline, _uv_per_count = self._csv_raw_to_yasa_volts(arr)
+                data_uv = data_v * 1e6
+            else:
+                data_uv = arr * self._mne_unit_scale(unit_text) * 1e6
+            if abs(float(fs_i) - float(target_fs)) > 1e-6:
+                try:
+                    from scipy.signal import resample_poly
+                except ImportError as exc:
+                    raise ValueError("AASM LOC/ROC 采样率不同，需要 scipy 做临时重采样") from exc
+                from math import gcd
+
+                src_i = int(round(float(fs_i)))
+                target_i = int(round(float(target_fs)))
+                if src_i <= 0 or target_i <= 0:
+                    raise ValueError("AASM LOC/ROC 采样率无效，无法重采样")
+                common = gcd(src_i, target_i)
+                data_uv = np.asarray(resample_poly(data_uv, target_i // common, src_i // common), dtype=np.float64)
+                self._log(f"AASM REM 临时重采样: {label_i} {float(fs_i):g} Hz -> {float(target_fs):g} Hz")
+            return data_uv, str(label_i)
+        except Exception as exc:
+            raise ValueError(f"读取AASM EOG通道失败: {exc}") from exc
+
+    def _detect_aasm_rem_events(
+        self,
+        loc_uv: Optional[np.ndarray],
+        roc_uv: Optional[np.ndarray],
+        fs: float,
+        *,
+        loc_label: str,
+        roc_label: str,
+    ) -> Tuple[List[Dict[str, float]], str]:
+        if loc_uv is None or roc_uv is None:
+            return [], "未选择LOC/ROC双EOG，REM快速眼动证据不足"
+        try:
+            import yasa  # type: ignore
+        except ImportError:
+            return [], "未安装yasa，REM快速眼动证据不足"
+        if not hasattr(yasa, "rem_detect"):
+            return [], "当前yasa版本无rem_detect，REM快速眼动证据不足"
+        try:
+            loc = np.asarray(loc_uv, dtype=np.float64).reshape(-1)
+            roc = np.asarray(roc_uv, dtype=np.float64).reshape(-1)
+            n = min(loc.size, roc.size)
+            if n < max(8, int(round(float(fs) * 2.0))):
+                return [], "LOC/ROC有效样本过少，REM快速眼动证据不足"
+            loc = loc[:n]
+            roc = roc[:n]
+            try:
+                result = yasa.rem_detect(loc, roc, sf=float(fs), verbose=False)
+            except TypeError:
+                result = yasa.rem_detect(loc, roc, float(fs), verbose=False)
+            summary = result.summary() if result is not None and hasattr(result, "summary") else result
+            events = self._spindle_events_from_summary(summary)
+            return events, f"REM快速眼动检测完成: LOC={loc_label}, ROC={roc_label}, {len(events)} 个"
+        except Exception as exc:
+            return [], f"REM快速眼动检测失败: {exc}"
+
+    def _summarize_rem_for_rule_rows(
+        self,
+        rows: List[Dict[str, object]],
+        rem_events: List[Dict[str, float]],
+        *,
+        origin_abs_s: float,
+    ) -> None:
+        for row in rows:
+            try:
+                epoch_start = float(row.get("start_s", 0.0))
+                epoch_end = float(row.get("end_s", epoch_start))
+            except (TypeError, ValueError):
+                continue
+            row["rem_count"] = len(
+                self._events_in_epoch(
+                    rem_events,
+                    epoch_start=epoch_start,
+                    epoch_end=epoch_end,
+                    origin_abs_s=origin_abs_s,
+                )
+            )
+
+    def _compute_aasm_wake_eog_features(
+        self,
+        rows: List[Dict[str, object]],
+        loc_uv: Optional[np.ndarray],
+        roc_uv: Optional[np.ndarray],
+        fs: float,
+        *,
+        origin_abs_s: float,
+    ) -> None:
+        if loc_uv is None and roc_uv is None:
+            for row in rows:
+                row["wake_eog_pct"] = 0.0
+            return
+        sources = [
+            np.asarray(arr, dtype=np.float64).reshape(-1)
+            for arr in (loc_uv, roc_uv)
+            if arr is not None and np.asarray(arr).size > 0
+        ]
+        n = min(arr.size for arr in sources)
+        if n < max(8, int(round(float(fs) * 2.0))):
+            for row in rows:
+                row["wake_eog_pct"] = 0.0
+            return
+        data = np.vstack([arr[:n] for arr in sources])
+        data = data - np.nanmedian(data, axis=1, keepdims=True)
+        try:
+            from scipy.signal import butter, sosfiltfilt
+            nyq = float(fs) * 0.5
+            high = min(8.0, nyq - 0.1)
+            if high > 0.3:
+                sos = butter(2, [0.3 / nyq, high / nyq], btype="bandpass", output="sos")
+                data = sosfiltfilt(sos, data, axis=1)
+        except Exception:
+            pass
+        abs_data = np.nanmax(np.abs(data), axis=0)
+        finite = abs_data[np.isfinite(abs_data)]
+        if finite.size == 0:
+            threshold = np.inf
+        else:
+            median = float(np.nanmedian(finite))
+            mad = float(np.nanmedian(np.abs(finite - median)))
+            threshold = max(75.0, median + 6.0 * 1.4826 * mad)
+        mask = np.zeros(n, dtype=bool)
+        win = max(8, int(round(2.0 * fs)))
+        step = max(1, int(round(0.5 * fs)))
+        for start in range(0, max(1, n - win + 1), step):
+            end = min(n, start + win)
+            seg = data[:, start:end]
+            if seg.size == 0:
+                continue
+            ptp = float(np.nanmax(np.ptp(seg, axis=1)))
+            peak = float(np.nanmax(np.abs(seg)))
+            if ptp >= threshold * 1.5 or peak >= threshold:
+                mask[start:end] = True
+        for row in rows:
+            try:
+                start_s = float(row.get("start_s", 0.0))
+                end_s = float(row.get("end_s", start_s))
+            except (TypeError, ValueError):
+                row["wake_eog_pct"] = 0.0
+                continue
+            i0 = max(0, min(n, int(round((start_s - origin_abs_s) * fs))))
+            i1 = max(i0, min(n, int(round((end_s - origin_abs_s) * fs))))
+            row["wake_eog_pct"] = float(np.count_nonzero(mask[i0:i1]) / max(1, i1 - i0) * 100.0)
+
+    def _apply_aasm_rule_engine(self, rows: List[Dict[str, object]]) -> Dict[str, int]:
+        wake_alpha_min = self._read_spindle_float(self._aasm_alpha_pct_edit, "Wake alpha下限")
+        wake_alpha_rel_support = self._aasm_wake_alpha_rel_check.isChecked()
+        wake_alpha_rel_min = self._read_spindle_float(self._aasm_wake_alpha_rel_edit, "Wake alpha_rel下限")
+        wake_eog_support = self._aasm_wake_eog_check.isChecked()
+        lamf_min = self._read_spindle_float(self._aasm_lamf_pct_edit, "N1/LAMF下限")
+        n3_min = self._read_spindle_float(self._aasm_n3_swa_pct_edit, "N3 SWA下限")
+        delta_support = self._aasm_n3_delta_support_check.isChecked()
+        delta_min = self._read_spindle_float(self._aasm_n3_delta_rel_edit, "delta辅助下限")
+        labels: List[str] = []
+        passes: List[str] = []
+        reasons: List[str] = []
+        for idx, row in enumerate(rows):
+            swa = self._row_float_value(row, "swa_pct", self._row_float_value(row, "slow_wave_time_pct", 0.0))
+            delta_rel = self._row_float_value(row, "delta_rel_pct", 0.0)
+            alpha = self._row_float_value(row, "alpha_pct", 0.0)
+            alpha_rel = self._row_float_value(row, "alpha_rel_pct_aasm", 0.0)
+            wake_eog = self._row_float_value(row, "wake_eog_pct", 0.0)
+            lamf = self._row_float_value(row, "lamf_pct", 0.0)
+            rem_count = int(round(self._row_float_value(row, "rem_count", 0.0)))
+            spindle_count = int(round(self._row_float_value(row, "spindle_count", 0.0)))
+            k_count = int(round(self._row_float_value(row, "kcomplex_count", 0.0)))
+            n2_first = int(round(self._row_float_value(row, "n2_marker_first_half_count", 0.0)))
+            n2_prev = int(round(self._row_float_value(row, "n2_marker_prev_second_half_count", 0.0)))
+            emg_tone = str(row.get("emg_tone", "missing") or "missing").lower()
+            checks: List[str] = []
+            stage = ""
+            rule_pass = "definite"
+            if swa >= n3_min:
+                stage = "N3"
+                checks.append(f"N3命中: SWA {swa:.1f}% >= {n3_min:g}%")
+            elif delta_support and delta_rel >= delta_min and swa >= n3_min * 0.25:
+                stage = "N3"
+                checks.append(
+                    f"N3工程增强命中: SWA {swa:.1f}% < {n3_min:g}% 但 delta {delta_rel:.1f}% >= {delta_min:g}%"
+                )
+            else:
+                if delta_support:
+                    checks.append(
+                        f"N3排除: SWA {swa:.1f}% < {n3_min:g}% 且 delta {delta_rel:.1f}% < {delta_min:g}%"
+                    )
+                else:
+                    checks.append(f"N3排除: SWA {swa:.1f}% < {n3_min:g}%")
+                alpha_rel_hit = wake_alpha_rel_support and alpha_rel >= wake_alpha_rel_min
+                wake_eog_hit = wake_eog_support and wake_eog >= wake_alpha_min
+                if alpha >= wake_alpha_min or alpha_rel_hit or wake_eog_hit:
+                    stage = "W"
+                    wake_parts = [f"alpha覆盖 {alpha:.1f}%/{wake_alpha_min:g}%"]
+                    if wake_alpha_rel_support:
+                        wake_parts.append(f"30秒alpha_rel {alpha_rel:.1f}%/{wake_alpha_rel_min:g}%")
+                    if wake_eog_support:
+                        wake_parts.append(f"EOG清醒眼动 {wake_eog:.1f}%/{wake_alpha_min:g}%")
+                    checks.append("Wake命中: " + "，".join(wake_parts))
+                else:
+                    wake_parts = [f"alpha覆盖 {alpha:.1f}% < {wake_alpha_min:g}%"]
+                    if wake_alpha_rel_support:
+                        wake_parts.append(f"30秒alpha_rel {alpha_rel:.1f}% < {wake_alpha_rel_min:g}%")
+                    if wake_eog_support:
+                        wake_parts.append(f"EOG清醒眼动 {wake_eog:.1f}% < {wake_alpha_min:g}%")
+                    checks.append("Wake排除: " + "，".join(wake_parts))
+                    rem_ready = emg_tone != "missing"
+                    has_n2_marker = spindle_count > 0 or k_count > 0
+                    if lamf >= lamf_min and rem_count > 0 and not has_n2_marker and emg_tone == "low":
+                        stage = "R"
+                        checks.append("REM命中: LAMF达标 + 快速眼动 + 低肌张 + 无纺锤/K复合")
+                    else:
+                        if not rem_ready:
+                            checks.append("REM排除: EMG证据缺失")
+                        elif rem_count <= 0:
+                            checks.append("REM排除: 未检出快速眼动")
+                        elif has_n2_marker:
+                            checks.append("REM排除: 存在纺锤/K复合")
+                        elif emg_tone != "low":
+                            checks.append(f"REM排除: EMG为{emg_tone}")
+                        else:
+                            checks.append(f"REM排除: LAMF {lamf:.1f}% < {lamf_min:g}%")
+                        if n2_first > 0 or n2_prev > 0:
+                            stage = "N2"
+                            checks.append(
+                                f"N2命中: 当前前半/上一后半纺锤或K复合 {n2_first}/{n2_prev} 个"
+                            )
+                        else:
+                            checks.append("N2排除: 当前前半和上一后半未检出纺锤/K复合")
+                            alpha_attenuated = bool(row.get("alpha_attenuated", False))
+                            if lamf >= lamf_min and (alpha_attenuated or alpha > 0):
+                                stage = "N1"
+                                checks.append(f"N1命中: LAMF {lamf:.1f}% >= {lamf_min:g}% 且alpha衰减/存在")
+                            else:
+                                stage = ""
+                                rule_pass = "undefined"
+                                checks.append("N1排除: LAMF或alpha衰减证据不足")
+            labels.append(stage)
+            passes.append(rule_pass)
+            reasons.append("; ".join(checks))
+
+        inherit = self._aasm_inherit_undefined_check.isChecked()
+        for idx, stage in enumerate(labels):
+            if stage:
+                continue
+            prev = labels[idx - 1] if idx > 0 else ""
+            row = rows[idx]
+            lamf = self._row_float_value(row, "lamf_pct", 0.0)
+            emg_tone = str(row.get("emg_tone", "missing") or "missing").lower()
+            spindle_count = int(round(self._row_float_value(row, "spindle_count", 0.0)))
+            k_count = int(round(self._row_float_value(row, "kcomplex_count", 0.0)))
+            if prev == "R" and lamf >= lamf_min and emg_tone in {"low", "missing"} and spindle_count + k_count == 0:
+                labels[idx] = "R"
+                passes[idx] = "transition"
+                reasons[idx] += "; 过渡规则: 上一epoch为R且LAMF/肌张特征延续"
+            elif prev == "N2" and spindle_count + k_count == 0:
+                labels[idx] = "N2"
+                passes[idx] = "transition"
+                reasons[idx] += "; 过渡规则: 上一epoch为N2且无明确转换证据"
+            elif inherit and prev:
+                labels[idx] = prev
+                passes[idx] = "inherit"
+                reasons[idx] += f"; 继承规则: 未定义，继承上一epoch={prev}"
+            else:
+                labels[idx] = "UNDEF"
+                passes[idx] = "undefined"
+                reasons[idx] += "; 未定义: 缺少可用上一阶段或继承关闭"
+
+        counts: Dict[str, int] = {}
+        for row, stage, rule_pass, reason in zip(rows, labels, passes, reasons):
+            row["stage_rule"] = stage
+            row["rule_pass"] = rule_pass
+            row["rule_reason"] = reason
+            yasa_stage = self._normalized_sleep_stage(row.get("stage_yasa", ""))
+            rule_stage = self._normalized_sleep_stage(stage)
+            if not yasa_stage:
+                row["stage_compare"] = "no_yasa"
+            elif rule_stage == "UNDEF":
+                row["stage_compare"] = "rule_undefined"
+            elif yasa_stage == rule_stage:
+                row["stage_compare"] = "same"
+            else:
+                row["stage_compare"] = "different"
+            counts[stage] = counts.get(stage, 0) + 1
+        return counts
+
+    def _populate_aasm_rule_results_table(self, rows: List[Dict[str, object]]) -> None:
+        table = self._aasm_rule_results_table
+        headers = [
+            "epoch",
+            "start_s",
+            "end_s",
+            "stage_yasa",
+            "yasa_confidence",
+            "stage_rule",
+            "rule_pass",
+            "stage_compare",
+            "swa_pct",
+            "alpha_pct",
+            "alpha_rel_pct_aasm",
+            "wake_eog_pct",
+            "lamf_pct",
+            "rem_count",
+            "emg_tone",
+            "emg_rms_uv",
+            "spindle_count",
+            "kcomplex_count",
+            "n2_marker_first_half_count",
+            "n2_marker_prev_second_half_count",
+            "rule_reason",
+        ]
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            for col_idx, key in enumerate(headers):
+                value = row.get(key, "")
+                text = f"{value:.6g}" if isinstance(value, float) else str(value)
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                table.setItem(row_idx, col_idx, item)
+        table.resizeColumnsToContents()
+
+    @QtCore.pyqtSlot()
+    def _export_aasm_rule_table_csv(self) -> None:
+        self._export_table_widget_csv(
+            self._aasm_rule_results_table,
+            title="导出 AASM 规则分期CSV",
+            default_name="sleep_aasm_rule_staging.csv",
+            empty_message="请先运行 AASM 规则分期，再导出 CSV",
+            success_prefix="AASM规则分期CSV",
+        )
+
+    @QtCore.pyqtSlot()
+    def _run_aasm_rule_staging(self) -> None:
+        self._sync_sleep_channel_to_yasa_eeg()
+        data = self._sleep_feature_data()
+        if data is None:
+            return
+        raw, fs, offset_s, label, unit = data
+        try:
+            start_s, end_s, epoch_s, hop_s, _bands = self._read_sleep_trend_params(
+                raw,
+                fs,
+                offset_s,
+                require_power_type=False,
+            )
+            if abs(epoch_s - 30.0) > 1e-6 or abs(hop_s - 30.0) > 1e-6:
+                raise ValueError("AASM规则分期按30s epoch判定；请先设置 epoch=30、hop=30")
+            channel_index = self._current_sleep_channel_index()
+            rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not rows:
+                self._generate_sleep_epoch_feature_table()
+                rows = self._sleep_epoch_feature_rows_by_channel.get(channel_index, [])
+            if not rows:
+                raise ValueError("请先生成睡眠Epoch特征表")
+
+            prepared = self._make_yasa_raw_from_ui(
+                start_s=float(start_s),
+                end_s=float(end_s),
+            )
+            if prepared is None:
+                return
+            raw_mne, eeg_name, eog_name, emg_name, target_fs = prepared
+            origin_abs_s = float(offset_s + start_s)
+            eeg_uv = np.asarray(raw_mne.get_data(picks=[eeg_name])[0], dtype=np.float64) * 1e6
+            alpha_uv = None
+            alpha_index = self._aasm_alpha_channel_combo.currentData() if hasattr(self, "_aasm_alpha_channel_combo") else None
+            if alpha_index is not None:
+                alpha_uv, _alpha_label = self._load_aasm_channel_uv_window(
+                    int(alpha_index),
+                    start_s=float(start_s),
+                    end_s=float(end_s),
+                    target_fs=float(target_fs),
+                )
+            self._compute_aasm_alpha_lamf_features(
+                rows,
+                eeg_uv,
+                float(target_fs),
+                origin_abs_s=origin_abs_s,
+                alpha_uv=alpha_uv,
+            )
+            emg_uv = None
+            if emg_name:
+                emg_uv = np.asarray(raw_mne.get_data(picks=[emg_name])[0], dtype=np.float64) * 1e6
+            self._compute_aasm_emg_features(rows, emg_uv, float(target_fs), origin_abs_s=origin_abs_s)
+
+            auto_missing = self._aasm_auto_detect_missing_check.isChecked()
+            if (
+                (not self._aasm_reuse_slow_wave_check.isChecked() or not any("slow_wave_time_pct" in row for row in rows))
+                and auto_missing
+            ):
+                slow_events = self._detect_slow_wave_candidates(eeg_uv, float(target_fs))
+                self._summarize_slow_wave_for_rule_rows(rows, slow_events, origin_abs_s=origin_abs_s)
+            else:
+                for row in rows:
+                    row["swa_pct"] = self._row_float_value(row, "slow_wave_time_pct", 0.0)
+
+            if (
+                (not self._aasm_reuse_spindle_check.isChecked() or not any("spindle_count" in row for row in rows))
+                and auto_missing
+            ):
+                spindles: List[Dict[str, float]] = []
+                try:
+                    import yasa  # type: ignore
+                    hypno = self._build_epoch_hypno_samples(
+                        rows,
+                        n_samples=int(raw_mne.n_times),
+                        fs=float(target_fs),
+                        origin_abs_s=origin_abs_s,
+                    )
+                    result = yasa.spindles_detect(
+                        raw_mne.copy().pick([eeg_name]),
+                        hypno=hypno,
+                        include=self._read_spindle_include_codes(),
+                        freq_sp=(
+                            self._read_spindle_float(self._sleep_feature_ui.lineEdit_spindle_sigma_fmin, "spindle fmin"),
+                            self._read_spindle_float(self._sleep_feature_ui.lineEdit_spindle_sigma_fmax, "spindle fmax"),
+                        ),
+                        freq_broad=self._read_spindle_freq_broad(),
+                        duration=(
+                            self._read_spindle_float(self._spindle_duration_min_edit, "持续时间下限"),
+                            self._read_spindle_float(self._spindle_duration_max_edit, "持续时间上限"),
+                        ),
+                        min_distance=self._read_spindle_float(self._spindle_min_distance_edit, "最小间隔"),
+                        thresh={
+                            "corr": self._read_spindle_float(self._spindle_thresh_corr_edit, "corr阈值"),
+                            "rel_pow": self._read_spindle_float(self._spindle_thresh_rel_pow_edit, "rel_pow阈值"),
+                            "rms": self._read_spindle_float(self._spindle_thresh_rms_edit, "rms阈值"),
+                        },
+                        remove_outliers=self._spindle_remove_outliers_check.isChecked(),
+                        verbose=False,
+                    )
+                    summary = result.summary() if result is not None else None
+                    spindles = self._spindle_events_from_summary(summary)
+                except Exception as exc:
+                    self._log(f"AASM规则分期: spindle自动检测失败，按缺失处理: {exc}")
+                k_events = self._detect_kcomplex_candidates(
+                    eeg_uv,
+                    float(target_fs),
+                    hypno=None,
+                    include=self._read_spindle_include_codes(),
+                )
+                self._summarize_spindle_kcomplex_for_rule_rows(
+                    rows,
+                    spindles,
+                    k_events,
+                    origin_abs_s=origin_abs_s,
+                )
+            else:
+                for row in rows:
+                    markers = int(round(self._row_float_value(row, "spindle_count", 0.0))) + int(
+                        round(self._row_float_value(row, "kcomplex_count", 0.0))
+                    )
+                    row["n2_marker_first_half_count"] = markers
+                    row["n2_marker_prev_second_half_count"] = 0
+
+            loc_index = self._aasm_loc_combo.currentData() if hasattr(self, "_aasm_loc_combo") else None
+            roc_index = self._aasm_roc_combo.currentData() if hasattr(self, "_aasm_roc_combo") else None
+            loc_uv, loc_label = self._load_aasm_channel_uv_window(
+                int(loc_index) if loc_index is not None else None,
+                start_s=float(start_s),
+                end_s=float(end_s),
+                target_fs=float(target_fs),
+            )
+            roc_uv, roc_label = self._load_aasm_channel_uv_window(
+                int(roc_index) if roc_index is not None else None,
+                start_s=float(start_s),
+                end_s=float(end_s),
+                target_fs=float(target_fs),
+            )
+            self._compute_aasm_wake_eog_features(
+                rows,
+                loc_uv,
+                roc_uv,
+                float(target_fs),
+                origin_abs_s=origin_abs_s,
+            )
+            rem_events, rem_message = self._detect_aasm_rem_events(
+                loc_uv,
+                roc_uv,
+                float(target_fs),
+                loc_label=loc_label,
+                roc_label=roc_label,
+            )
+            self._summarize_rem_for_rule_rows(rows, rem_events, origin_abs_s=origin_abs_s)
+            counts = self._apply_aasm_rule_engine(rows)
+            self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
+            self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
+            self._sleep_epoch_feature_rows = rows
+            self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
+            self._populate_aasm_rule_results_table(rows)
+            compare_counts = self._count_epoch_values(rows, "stage_compare")
+            self._log(
+                f"AASM规则分期完成: {label} | {origin_abs_s:.1f}-{offset_s + end_s:.1f}s | "
+                f"{len(rows)} 个epoch | 分期 {self._format_epoch_counts(counts)} | "
+                f"对比YASA {self._format_epoch_counts(compare_counts)} | {rem_message}"
+            )
+        except Exception as exc:
+            self._log(f"AASM规则分期失败: {exc}")
+
+    @staticmethod
+    def _count_blocked_quality_reasons(rows: List[Dict[str, object]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for row in rows:
+            if str(row.get("n3_action", "") or "") != "blocked_by_quality":
+                continue
+            reason_text = str(row.get("quality_reason", "") or "未知原因")
+            for reason in (part.strip() for part in reason_text.split(";")):
+                if not reason:
+                    continue
+                counts[reason] = counts.get(reason, 0) + 1
+        return counts
 
     @QtCore.pyqtSlot()
     def _run_slow_wave_n3_refinement(self) -> None:
@@ -3475,7 +5184,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             origin_abs_s = float(offset_s + start_s)
             data_uv = np.asarray(raw_crop.get_data(picks=[0])[0], dtype=np.float64) * 1e6
             events = self._detect_slow_wave_candidates(data_uv, float(raw_crop.info["sfreq"]))
+            self._apply_epoch_quality_features(rows, raw, fs, offset_s, unit)
             refined = self._apply_slow_wave_features_to_epoch_rows(rows, events, origin_abs_s=origin_abs_s)
+            context_refined = self._apply_n3_context_fill_rule(rows)
+            delta_run_refined = self._apply_n3_delta_run_rule(rows)
+            island_summary = self._apply_n3_island_bidirectional_rule(rows)
             self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
             self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
             self._sleep_epoch_feature_rows = rows
@@ -3483,8 +5196,47 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
             self._log(
                 f"SlowWave/N3 修正完成: {label} | {origin_abs_s:.1f}-{offset_s + end_s:.1f}s | "
-                f"slow wave {len(events)} 个 | 修正 {refined} 个 epoch"
+                f"slow wave {len(events)} 个 | 自动修正 "
+                f"{refined + context_refined + delta_run_refined + island_summary['N2_to_N3'] + island_summary['N3_to_N2']} 个 epoch "
+                f"(慢波{refined}, 补洞{context_refined}, delta段{delta_run_refined}, "
+                f"孤岛N2->N3 {island_summary['N2_to_N3']}, 孤岛N3->N2 {island_summary['N3_to_N2']})"
             )
+            if self._n3_delta_run_check.isChecked() and self._n3_island_check.isChecked():
+                self._log("提示: delta连续段与N2/N3孤岛修正同时启用；若要按Correct_4评估，建议关闭delta连续段")
+            net_n3_change = (
+                refined
+                + context_refined
+                + delta_run_refined
+                + island_summary["N2_to_N3"]
+                - island_summary["N3_to_N2"]
+            )
+            initial_n3_count = sum(
+                1
+                for row in rows
+                if self._normalized_sleep_stage(row.get("stage_before_n3", row.get("stage_yasa", ""))) == "N3"
+            )
+            change_pct = (net_n3_change / initial_n3_count * 100.0) if initial_n3_count > 0 else 0.0
+            warn_pct = self._read_spindle_float(self._n3_island_n3_change_warn_edit, "N3净变化警告")
+            self._log(
+                f"N3净变化: {net_n3_change:+d} epoch ({change_pct:+.1f}%, 基线N3={initial_n3_count}) | "
+                f"孤岛拒绝={island_summary['rejected']}"
+            )
+            if abs(change_pct) > warn_pct:
+                self._log(f"N3净变化超过警告阈值 {warn_pct:g}%：请重点复核是否过修")
+            self._log(
+                "N3证据分布: "
+                f"{self._format_epoch_counts(self._count_epoch_values(rows, 'n3_evidence_level'))} | "
+                "N3动作: "
+                f"{self._format_epoch_counts(self._count_epoch_values(rows, 'n3_action'))} | "
+                "质量: "
+                f"{self._format_epoch_counts(self._count_epoch_values(rows, 'quality_label'))}"
+            )
+            blocked_reasons = self._count_blocked_quality_reasons(rows)
+            if blocked_reasons:
+                self._log(
+                    "N3质量阻止原因: "
+                    f"{self._format_epoch_counts(blocked_reasons)}"
+                )
         except Exception as exc:
             self._log(f"SlowWave/N3 修正失败: {exc}")
 
@@ -3718,7 +5470,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._sleep_epoch_feature_rows_by_channel[channel_index] = rows
             self._sleep_epoch_feature_labels_by_channel[channel_index] = self._clean_channel_tab_label(label, f"CH{channel_index + 1}")
             self._sleep_epoch_feature_rows = rows
-            self._populate_spindle_results_table(events, origin_abs_s=origin_abs_s)
+            self._populate_spindle_results_table(events, k_events, origin_abs_s=origin_abs_s)
             self._populate_sleep_epoch_feature_table(rows, channel_index=channel_index)
             self._log(
                 f"Spindle/K-complex 检测完成: {label} | {origin_abs_s:.1f}-{offset_s + end_s:.1f}s | "
@@ -3755,8 +5507,32 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         for key in (
             "stage_yasa",
             "yasa_confidence",
+            "stage_rule",
+            "rule_pass",
+            "rule_reason",
+            "stage_compare",
+            "swa_pct",
+            "alpha_pct",
+            "alpha_rel_pct_aasm",
+            "wake_eog_pct",
+            "lamf_pct",
+            "rem_count",
+            "emg_tone",
+            "emg_rms_uv",
+            "n2_marker_first_half_count",
+            "n2_marker_prev_second_half_count",
             "stage_refined",
             "refine_reason",
+            "quality_label",
+            "quality_action",
+            "quality_reason",
+            "bad_pct",
+            "rail_pct",
+            "flatline_pct",
+            "ptp_uv",
+            "nonfinite_pct",
+            "high_freq_rel_pct",
+            "muscle_z",
             "spindle_count",
             "spindle_density",
             "spindle_mean_duration",
@@ -3768,6 +5544,23 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             "kcomplex_mean_duration",
             "kcomplex_mean_ptp",
             "kcomplex_mean_neg_amp",
+            "stage_before_n3",
+            "stage_suggested",
+            "stage_refined_n3",
+            "n3_action",
+            "n3_reason",
+            "n3_context_n3_neighbors",
+            "n3_context_reason",
+            "n3_delta_run_len",
+            "n3_delta_run_reason",
+            "n3_island_rule",
+            "n3_island_old_stage",
+            "n3_island_new_stage",
+            "n3_island_prev_stage",
+            "n3_island_next_stage",
+            "n3_island_reason",
+            "n3_evidence_score",
+            "n3_evidence_level",
             "stage_refined_slow",
             "slow_wave_refine_reason",
             "slow_wave_count",
@@ -5432,7 +7225,28 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._log("当前离线窗口没有有效波形数据")
             return
         try:
+            current_channel_index = max(0, self._offline_channel_combo.currentIndex())
             channel_indices = list(range(len(labels)))
+            if self._is_edf_like_file(path):
+                rates = [float(v) for v in getattr(info, "channel_rates", [])]
+                filtered_indices: List[int] = []
+                for index in channel_indices:
+                    rate = rates[index] if index < len(rates) else fs_current
+                    if rate <= 0:
+                        continue
+                    if abs(rate - fs_current) > max(1e-6, fs_current * 0.01):
+                        continue
+                    if int(round(duration_s * rate)) < 32:
+                        continue
+                    filtered_indices.append(index)
+                channel_indices = filtered_indices
+                if current_channel_index not in channel_indices and 0 <= current_channel_index < len(labels):
+                    channel_indices.insert(0, current_channel_index)
+                if len(channel_indices) <= 1:
+                    self._log(
+                        "EDF/BDF 多通道比较：当前窗口内没有足够的同采样率通道可比较"
+                    )
+                    return
             loaded = load_eeg_file_channels_window(
                 path,
                 channel_indices,
@@ -5467,7 +7281,11 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             actual_start = min(actual_starts) if actual_starts else start_s
             if self._offline_multi_compare_dialog is None:
                 self._offline_multi_compare_dialog = OfflineMultiChannelCompareDialog(self)
-            current_index = max(0, self._offline_channel_combo.currentIndex())
+            current_index = (
+                channel_indices.index(current_channel_index)
+                if current_channel_index in channel_indices
+                else 0
+            )
             title = f"{path.name} | 多通道比较"
             self._offline_multi_compare_dialog.load_channels(
                 channels,
@@ -5486,6 +7304,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 f"多通道波形比较已加载: {path.name} | {len(channels)} 通道 | "
                 f"{actual_start:.1f}-{actual_start + duration_s:.1f}s"
             )
+            if self._is_edf_like_file(path) and len(channels) < len(labels):
+                self._log(
+                    f"EDF/BDF 多通道比较已跳过 {len(labels) - len(channels)} 个采样率不同或窗口过短的通道"
+                )
         except Exception as exc:
             self._log(f"多通道波形比较失败: {exc}")
 

@@ -409,15 +409,16 @@ def _load_eeg_edf_with_rate(path: Path) -> tuple[np.ndarray, float]:
         import pyedflib  # type: ignore
     except ImportError as exc:
         raise ImportError(
-            "缂哄皯 pyedflib锛屾棤娉曡鍙?EDF/BDF銆傝鍏堟墽琛? pip install pyedflib"
+            "缺少 pyedflib，无法读取 EDF/BDF。请先执行: pip install pyEDFlib"
         ) from exc
 
     reader = pyedflib.EdfReader(str(path))
     try:
         n_signals = int(reader.signals_in_file)
         if n_signals <= 0:
-            raise ValueError(f"EDF/BDF 涓病鏈変俊鍙烽€氶亾: {path.name}")
+            raise ValueError(f"EDF/BDF 中没有信号通道: {path.name}")
         raw = reader.readSignal(0).astype(np.float64, copy=False)
+        unit = _edf_physical_dimension(reader, 0)
         try:
             sample_rate = float(reader.getSampleFrequency(0))
         except AttributeError:
@@ -428,9 +429,10 @@ def _load_eeg_edf_with_rate(path: Path) -> tuple[np.ndarray, float]:
             close()
 
     if raw.size < 8:
-        raise ValueError(f"鏈夋晥鏍锋湰杩囧皯 ({raw.size}): {path.name}")
+        raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
     if sample_rate <= 0:
-        raise ValueError(f"EDF/BDF 閲囨牱鐜囨棤鏁?({sample_rate:g}): {path.name}")
+        raise ValueError(f"EDF/BDF 采样率无效 ({sample_rate:g}): {path.name}")
+    raw, _unit = _normalize_edf_signal_to_uv(raw, unit)
     return raw, sample_rate
 
 
@@ -439,7 +441,7 @@ def _open_pyedflib_reader(path: Path):
         import pyedflib  # type: ignore
     except ImportError as exc:
         raise ImportError(
-            "缂哄皯 pyedflib锛屾棤娉曡鍙?EDF/BDF銆傝鍏堟墽琛? pip install pyedflib"
+            "缺少 pyedflib，无法读取 EDF/BDF。请先执行: pip install pyEDFlib"
         ) from exc
     return pyedflib.EdfReader(str(path))
 
@@ -458,6 +460,27 @@ def _edf_physical_dimension(reader, channel_index: int) -> str:
     if unit in {"uV", "uv", "UV", "microV"}:
         return "uV"
     return unit or "uV"
+
+
+def _edf_unit_to_uv_scale(unit: str) -> Optional[float]:
+    text = str(unit or "").strip().lower().replace("μ", "u").replace("µ", "u")
+    text = text.replace(" ", "")
+    if text in {"uv", "microv", "microvolt", "microvolts"}:
+        return 1.0
+    if text in {"mv", "milliv", "millivolt", "millivolts"}:
+        return 1000.0
+    if text in {"v", "volt", "volts"}:
+        return 1_000_000.0
+    if text in {"nv", "nanov", "nanovolt", "nanovolts"}:
+        return 0.001
+    return None
+
+
+def _normalize_edf_signal_to_uv(raw: np.ndarray, unit: str) -> tuple[np.ndarray, str]:
+    scale = _edf_unit_to_uv_scale(unit)
+    if scale is None:
+        return np.asarray(raw, dtype=np.float64), unit or "uV"
+    return np.asarray(raw, dtype=np.float64) * scale, "uV"
 
 
 def load_eeg_file_info(path: Path) -> OfflineEegFileInfo:
@@ -497,7 +520,7 @@ def load_eeg_file_info(path: Path) -> OfflineEegFileInfo:
     try:
         n_signals = int(reader.signals_in_file)
         if n_signals <= 0:
-            raise ValueError(f"EDF/BDF 涓病鏈変俊鍙烽€氶亾: {path.name}")
+            raise ValueError(f"EDF/BDF 中没有信号通道: {path.name}")
         try:
             labels = list(reader.getSignalLabels())
         except Exception:
@@ -517,7 +540,8 @@ def load_eeg_file_info(path: Path) -> OfflineEegFileInfo:
             rates.append(rate)
             label = labels[index].strip() if index < len(labels) else ""
             clean_labels.append(label or f"CH{index + 1}")
-            units.append(_edf_physical_dimension(reader, index))
+            unit = _edf_physical_dimension(reader, index)
+            units.append("uV" if _edf_unit_to_uv_scale(unit) is not None else unit)
     finally:
         _close_edf_reader(reader)
 
@@ -563,7 +587,7 @@ def load_eeg_file_channel(path: Path, channel_index: int = 0) -> tuple[np.ndarra
     try:
         n_signals = int(reader.signals_in_file)
         if n_signals <= 0:
-            raise ValueError(f"EDF/BDF 涓病鏈変俊鍙烽€氶亾: {path.name}")
+            raise ValueError(f"EDF/BDF 中没有信号通道: {path.name}")
         index = max(0, min(int(channel_index), n_signals - 1))
         try:
             labels = list(reader.getSignalLabels())
@@ -581,9 +605,10 @@ def load_eeg_file_channel(path: Path, channel_index: int = 0) -> tuple[np.ndarra
         _close_edf_reader(reader)
 
     if raw.size < 8:
-        raise ValueError(f"鏈夋晥鏍锋湰杩囧皯 ({raw.size}): {path.name}")
+        raise ValueError(f"有效样本过少 ({raw.size}): {path.name}")
     if sample_rate <= 0:
-        raise ValueError(f"EDF/BDF 閲囨牱鐜囨棤鏁?({sample_rate:g}): {path.name}")
+        raise ValueError(f"EDF/BDF 采样率无效 ({sample_rate:g}): {path.name}")
+    raw, unit = _normalize_edf_signal_to_uv(raw, unit)
     return raw, sample_rate, label, unit
 
 
@@ -947,10 +972,17 @@ class OfflineMultiChannelCompareDialog(QtWidgets.QDialog):
         low, high = COMPARE_BAND_RANGES[mode]
         values: List[np.ndarray] = []
         for _label, raw_values, _display_values, _note in self._channels:
-            base = bandpass_filter(raw_values, self._sample_rate)
-            values.append(
-                bandpass_filter(base, self._sample_rate, low_hz=low, high_hz=high)
-            )
+            raw_arr = np.asarray(raw_values, dtype=np.float64)
+            if raw_arr.size <= 32 or self._sample_rate <= 2 * max(high, 40.0):
+                values.append(np.full(raw_arr.shape, np.nan, dtype=np.float64))
+                continue
+            try:
+                base = bandpass_filter(raw_arr, self._sample_rate)
+                values.append(
+                    bandpass_filter(base, self._sample_rate, low_hz=low, high_hz=high)
+                )
+            except ValueError:
+                values.append(np.full(raw_arr.shape, np.nan, dtype=np.float64))
         self._band_cache[mode] = values
         return values
 
@@ -1144,10 +1176,17 @@ class OfflineMultiChannelCompareDialog(QtWidgets.QDialog):
         low, high = COMPARE_BAND_RANGES[mode]
         filtered: List[np.ndarray] = []
         for values in raw_values:
-            base = bandpass_filter(values, self._sample_rate)
-            filtered.append(
-                bandpass_filter(base, self._sample_rate, low_hz=low, high_hz=high)
-            )
+            arr = np.asarray(values, dtype=np.float64)
+            if arr.size <= 32 or self._sample_rate <= 2 * max(high, 40.0):
+                filtered.append(np.full(arr.shape, np.nan, dtype=np.float64))
+                continue
+            try:
+                base = bandpass_filter(arr, self._sample_rate)
+                filtered.append(
+                    bandpass_filter(base, self._sample_rate, low_hz=low, high_hz=high)
+                )
+            except ValueError:
+                filtered.append(np.full(arr.shape, np.nan, dtype=np.float64))
         return filtered
 
     def _phase_rows_for_sleep_stages(
