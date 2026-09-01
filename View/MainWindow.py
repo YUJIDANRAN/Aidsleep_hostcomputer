@@ -242,6 +242,9 @@ class Ui_MainWindow(object):
         self.checkBox_6 = QtWidgets.QCheckBox(self.groupBox_eeg_display)
         self.checkBox_6.setObjectName("checkBox_6")
         self.gridLayout_eeg_checks.addWidget(self.checkBox_6, 3, 1, 1, 1)
+        self.checkBox_pink = QtWidgets.QCheckBox(self.groupBox_eeg_display)
+        self.checkBox_pink.setObjectName("checkBox_pink")
+        self.gridLayout_eeg_checks.addWidget(self.checkBox_pink, 4, 0, 1, 1)
         self.horizontalLayout_eeg_options.addLayout(self.gridLayout_eeg_checks)
         self.verticalLayout_eeg_display.addLayout(self.horizontalLayout_eeg_options)
         spacerItem = QtWidgets.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding)
@@ -536,6 +539,10 @@ class Ui_MainWindow(object):
         self.pushButton_erp.setMinimumSize(QtCore.QSize(92, 40))
         self.pushButton_erp.setObjectName("pushButton_erp")
         self.horizontalLayout_audioButtons.addWidget(self.pushButton_erp)
+        self.pushButton_alpha_phase = QtWidgets.QPushButton(self.groupBox_2)
+        self.pushButton_alpha_phase.setMinimumSize(QtCore.QSize(108, 40))
+        self.pushButton_alpha_phase.setObjectName("pushButton_alpha_phase")
+        self.horizontalLayout_audioButtons.addWidget(self.pushButton_alpha_phase)
         spacerItem4 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
         self.horizontalLayout_audioButtons.addItem(spacerItem4)
         self.gridLayout_audio.addLayout(self.horizontalLayout_audioButtons, 6, 0, 1, 3)
@@ -702,6 +709,13 @@ class Ui_MainWindow(object):
         self.checkBox_5.setText(_translate("MainWindow", "gamma"))
         self.checkBox.setText(_translate("MainWindow", "Alpha"))
         self.checkBox_6.setText(_translate("MainWindow", "raw data"))
+        self.checkBox_pink.setToolTip(
+            _translate(
+                "MainWindow",
+                "离线模式下与 Alpha 同时勾选：在 α 波形上标出粉噪发射位置",
+            )
+        )
+        self.checkBox_pink.setText(_translate("MainWindow", "pink"))
         self.tabWidget_wave_display.setTabText(self.tabWidget_wave_display.indexOf(self.tab_wave_eeg), _translate("MainWindow", "EEG"))
         self.groupBox_osc_display.setTitle(_translate("MainWindow", "振子显示"))
         self.label_osc_port.setText(_translate("MainWindow", "振子"))
@@ -768,6 +782,13 @@ class Ui_MainWindow(object):
         self.pushButton_assr.setText(_translate("MainWindow", "ASSR 测试..."))
         self.pushButton_erp.setToolTip(_translate("MainWindow", "选择含 pink_seq 的 CSV，计算听觉 ERP 响应时间"))
         self.pushButton_erp.setText(_translate("MainWindow", "ERP 分析..."))
+        self.pushButton_alpha_phase.setToolTip(
+            _translate(
+                "MainWindow",
+                "选择含 pink_seq 的 CSV，验证粉噪是否打在 α 波谷附近（PLV / 极坐标）",
+            )
+        )
+        self.pushButton_alpha_phase.setText(_translate("MainWindow", "α 锁相验证..."))
         self.bottomPanel.setTitle(_translate("MainWindow", "采集、保存与串口"))
         self.groupBox_log.setTitle(_translate("MainWindow", "运行日志"))
         self.groupBox_record.setTitle(_translate("MainWindow", "定时记录"))

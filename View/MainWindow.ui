@@ -534,6 +534,16 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                       </property>
                      </widget>
                     </item>
+                    <item row="4" column="0">
+                     <widget class="QCheckBox" name="checkBox_pink">
+                      <property name="toolTip">
+                       <string>离线模式下与 Alpha 同时勾选：在 α 波形上标出粉噪发射位置</string>
+                      </property>
+                      <property name="text">
+                       <string>pink</string>
+                      </property>
+                     </widget>
+                    </item>
                    </layout>
                   </item>
                  </layout>
@@ -1342,6 +1352,22 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                 </property>
                 <property name="text">
                  <string>ERP 分析...</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pushButton_alpha_phase">
+                <property name="minimumSize">
+                 <size>
+                  <width>108</width>
+                  <height>40</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>选择含 pink_seq 的 CSV，验证粉噪是否打在 α 波谷附近（PLV / 极坐标）</string>
+                </property>
+                <property name="text">
+                 <string>α 锁相验证...</string>
                 </property>
                </widget>
               </item>

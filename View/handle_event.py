@@ -14,6 +14,7 @@ from pathlib import Path  ## 项目根路径
 from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
 import numpy as np
+import pandas as pd
 from scipy.signal import welch
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
 
@@ -56,8 +57,15 @@ from assr import (
 from erp import (
     ErpAnalysis,
     analyze_erp_csv,
+    detect_pink_seq_events,
     export_erp_summary_csv,
     format_erp_report,
+)
+from alpha_phase import (
+    AlphaPhaseAnalysis,
+    analyze_alpha_phase_csv,
+    export_alpha_phase_summary_csv,
+    format_alpha_phase_report,
 )
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
@@ -102,7 +110,7 @@ from controller import (
 )
 
 
-DEFAULT_SERIAL_PORT = "COM6"  ## EEG 默认串口
+DEFAULT_SERIAL_PORT = "COM5"  ## EEG 默认串口
 DEFAULT_OSC_SERIAL_PORT = "COM7"  ## 振子默认串口
 DEFAULT_SERIAL_BAUDRATE = 115200
 DEFAULT_SERIAL_BYTESIZE = 8
@@ -1099,6 +1107,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_current_y_label = "raw"
         self._offline_bad_segments: Dict[Tuple[str, int], List[Tuple[float, float, str]]] = {}
         self._offline_view_active = False  ## 离线分层波形查看中
+        self._offline_pink_event_times_s = np.zeros(0, dtype=np.float64)  ## 当前离线窗粉噪发射时刻
         self._analysis_plot_active = False  ## 功率对比图显示中
         self._yasa_thread: Optional[QtCore.QThread] = None
         self._yasa_worker: Optional[YasaSleepStagingWorker] = None
@@ -1184,6 +1193,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._setup_sleep_feature_analysis_ui()
         self._wire_assr_button()
         self._wire_erp_button()
+        self._wire_alpha_phase_button()
         self._multi_waveform = MultiChannelEegView(
             sample_rate=sample_rate,
             parent=self.ui.plotHost,
@@ -1217,6 +1227,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             checkbox.toggled.connect(
                 lambda checked, m=mode: self._on_display_checkbox_toggled(m, checked)
             )
+        pink_cb = getattr(self.ui, "checkBox_pink", None)
+        if pink_cb is not None:
+            pink_cb.toggled.connect(self._on_pink_checkbox_toggled)
         self.ui.comboBox_eeg_channel_mode.currentIndexChanged.connect(
             self._on_eeg_channel_mode_changed
         )
@@ -5408,12 +5421,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     if remove_mask is None
                     else np.asarray(remove_mask, dtype=bool) | stored_mask
                 )
+            pink_times = self._load_offline_pink_events_for_slice(
+                path,
+                n_samples=int(np.asarray(raw).size),
+                fs=float(fs),
+                time_offset_s=float(time_offset_s),
+                minute_range=minute_range,
+            )
+            self._offline_pink_event_times_s = pink_times
             n, fs = self._offline_view.load_raw(
                 raw,
                 fs,
                 source_name=title,
                 time_offset_s=time_offset_s,
                 remove_mask=remove_mask,
+                pink_event_times_s=pink_times,
             )
             self._offline_current_raw = np.asarray(raw, dtype=np.float64)
             self._offline_current_fs = float(fs)
@@ -5476,9 +5498,15 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             else ""
         )
         mark_tip = "；红带标注坏段" if remove_mask is not None else ""
+        pink_n = int(self._offline_pink_event_times_s.size)
+        pink_tip = (
+            f"；粉噪事件 {pink_n}（勾选 pink+Alpha 可在 α 上查看发射位置）"
+            if pink_n > 0
+            else ""
+        )
         self._log(
             f"离线查看已加载: {title}（{n} 点 @ {fs:.0f} Hz"
-            f"{range_tip}{mark_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
+            f"{range_tip}{mark_tip}{pink_tip}）；raw 始终显示，勾选其它节律叠加分层波形"
         )
         self._update_status_bar()
 
@@ -5487,6 +5515,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if not self._offline_view_active and not self._offline_view.has_data:
             return
         self._offline_view_active = False
+        self._offline_pink_event_times_s = np.zeros(0, dtype=np.float64)
+        pink_cb = getattr(self.ui, "checkBox_pink", None)
+        if pink_cb is not None:
+            pink_cb.blockSignals(True)
+            pink_cb.setChecked(False)
+            pink_cb.blockSignals(False)
         self._offline_view.clear()
         self._offline_view.scroll_panel.hide()
         self._offline_view.hide()
@@ -5503,7 +5537,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._update_status_bar()
 
     def _refresh_offline_visible_channels(self) -> None:
-        """raw 始终显示；其它节律仅勾选才显示。"""
+        """raw 始终显示；其它节律仅勾选才显示；pink+Alpha 时在 α 上标粉噪发射点。"""
         names = ["raw"]
         for mode in CHANNEL_ORDER:
             if mode == "raw":
@@ -5517,6 +5551,23 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             raw_cb.blockSignals(True)
             raw_cb.setChecked(True)
             raw_cb.blockSignals(False)
+
+        pink_cb = getattr(self.ui, "checkBox_pink", None)
+        pink_on = pink_cb is not None and pink_cb.isChecked()
+        alpha_cb = self._display_checkboxes.get("alpha")
+        if pink_on:
+            if alpha_cb is not None and not alpha_cb.isChecked():
+                alpha_cb.blockSignals(True)
+                alpha_cb.setChecked(True)
+                alpha_cb.blockSignals(False)
+                if "alpha" not in names:
+                    names.append("alpha")
+                self._log("已自动勾选 Alpha（与 pink 联用，显示粉噪发射位置）")
+            show_pink = True
+        else:
+            show_pink = False
+        self._offline_view.set_pink_events(self._offline_pink_event_times_s)
+        self._offline_view.set_show_pink_on_alpha(show_pink)
         self._offline_view.set_visible_channels(names)
 
     def _setup_timed_test_ui(self) -> None:
@@ -6869,6 +6920,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         btn.clicked.connect(self._on_erp_analyze_clicked)
 
+    def _wire_alpha_phase_button(self) -> None:
+        btn = getattr(self.ui, "pushButton_alpha_phase", None)
+        if btn is None:
+            return
+        btn.clicked.connect(self._on_alpha_phase_clicked)
+
     @QtCore.pyqtSlot()
     def _on_erp_analyze_clicked(self) -> None:
         start_dir = ""
@@ -6994,6 +7051,166 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(dialog, "导出失败", str(exc))
                 return
             self._log(f"ERP 结果已导出: {out_path}")
+            QtWidgets.QMessageBox.information(dialog, "导出成功", f"已保存:\n{out_path}")
+
+        export_btn.clicked.connect(_export)
+        close_btn.clicked.connect(dialog.accept)
+        dialog.exec_()
+
+    @QtCore.pyqtSlot()
+    def _on_alpha_phase_clicked(self) -> None:
+        start_dir = ""
+        if self._last_eeg_session_dir is not None:
+            start_dir = str(self._last_eeg_session_dir)
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择含 pink_seq 的 EEG CSV（α 锁相验证）",
+            start_dir,
+            "CSV (*.csv);;All (*.*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            result = analyze_alpha_phase_csv(path)
+        except Exception as exc:
+            self._log(f"α 锁相验证失败: {exc}")
+            QtWidgets.QMessageBox.warning(self, "α 锁相验证", f"分析失败:\n{exc}")
+            return
+        for line in format_alpha_phase_report(result).splitlines():
+            self._log(line)
+        self._show_alpha_phase_result_dialog(path, result)
+
+    def _show_alpha_phase_result_dialog(
+        self, source_path: Path, result: AlphaPhaseAnalysis
+    ) -> None:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"α 锁相验证 — {source_path.name}")
+        dialog.resize(920, 640)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        report = QtWidgets.QPlainTextEdit()
+        report.setReadOnly(True)
+        report.setMaximumBlockCount(60)
+        report.setPlainText(format_alpha_phase_report(result))
+        report.setMaximumHeight(150)
+        layout.addWidget(report)
+
+        fig = Figure(figsize=(9.0, 4.6), tight_layout=True)
+        canvas = FigureCanvasQTAgg(fig)
+
+        def _polar(ax, phases_deg, title: str, mean_deg: float, plv: float) -> None:
+            if phases_deg.size == 0:
+                ax.set_title(title)
+                return
+            bins = 18
+            edges = np.linspace(-np.pi, np.pi, bins + 1)
+            counts, _ = np.histogram(np.deg2rad(phases_deg), bins=edges)
+            centers = (edges[:-1] + edges[1:]) / 2.0
+            width = (2.0 * np.pi) / bins
+            ax.bar(
+                centers,
+                counts,
+                width=width * 0.92,
+                bottom=0.0,
+                color="#90CAF9",
+                edgecolor="#1565C0",
+                linewidth=0.6,
+                alpha=0.85,
+            )
+            r_max = max(float(np.max(counts)), 1.0)
+            ## 目标波谷 ±半宽
+            half = np.deg2rad(result.hit_half_width_deg)
+            tgt = np.deg2rad(result.target_deg)
+            ax.bar(
+                [tgt],
+                [r_max * 1.05],
+                width=2.0 * half,
+                bottom=0.0,
+                color="#C62828",
+                alpha=0.18,
+                edgecolor="none",
+            )
+            ## 平均相位箭头（长度∝PLV）
+            arrow_r = r_max * max(0.15, min(1.0, float(plv)))
+            ax.annotate(
+                "",
+                xy=(np.deg2rad(mean_deg), arrow_r),
+                xytext=(0.0, 0.0),
+                arrowprops=dict(arrowstyle="->", color="#0D47A1", lw=2.0),
+            )
+            ax.set_theta_zero_location("E")
+            ax.set_theta_direction(1)
+            ax.set_title(
+                f"{title}\nmean={mean_deg:.0f}°  PLV={plv:.2f}  n={phases_deg.size}",
+                fontsize=10,
+            )
+
+        ax0 = fig.add_subplot(131, projection="polar")
+        _polar(
+            ax0,
+            result.onset.phases_deg,
+            "onset 相位",
+            result.onset.mean_deg,
+            result.onset.plv,
+        )
+        ax1 = fig.add_subplot(132, projection="polar")
+        _polar(
+            ax1,
+            result.at_p1.phases_deg,
+            "onset+P1 相位",
+            result.at_p1.mean_deg,
+            result.at_p1.plv,
+        )
+
+        ax2 = fig.add_subplot(133)
+        t = result.times_ms
+        lo = result.alpha_average - result.alpha_sem
+        hi = result.alpha_average + result.alpha_sem
+        ax2.fill_between(t, lo, hi, color="#F9A825", alpha=0.28, linewidth=0)
+        ax2.plot(t, result.alpha_average, color="#F57F17", linewidth=1.6, label="α 平均")
+        ax2.axvline(0.0, color="#757575", ls="--", lw=1.0, label="onset")
+        ax2.axvline(
+            result.p1_latency_ms,
+            color="#6A1B9A",
+            ls=":",
+            lw=1.4,
+            label=f"P1 {result.p1_latency_ms:.0f} ms",
+        )
+        ax2.set_xlabel("Latency (ms)")
+        ax2.set_ylabel("α (filtered)")
+        ax2.set_title("刺激锁定 α 平均（波谷应对齐 P1）")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="upper right", fontsize=8)
+        layout.addWidget(canvas)
+
+        buttons = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("导出结果 CSV")
+        close_btn = QtWidgets.QPushButton("关闭")
+        buttons.addStretch(1)
+        buttons.addWidget(export_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        def _export() -> None:
+            default_name = f"{source_path.stem}_alpha_phase_summary.csv"
+            out_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dialog,
+                "导出 α 锁相结果",
+                str(source_path.with_name(default_name)),
+                "CSV (*.csv)",
+            )
+            if not out_str:
+                return
+            try:
+                out_path = export_alpha_phase_summary_csv(Path(out_str), result)
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(dialog, "导出失败", str(exc))
+                return
+            self._log(f"α 锁相结果已导出: {out_path}")
             QtWidgets.QMessageBox.information(dialog, "导出成功", f"已保存:\n{out_path}")
 
         export_btn.clicked.connect(_export)
@@ -7395,6 +7612,95 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             m_cb.setChecked(True)
             m_cb.blockSignals(False)
             self._apply_osc_display_mode("m_freq")
+
+    @QtCore.pyqtSlot(bool)
+    def _on_pink_checkbox_toggled(self, checked: bool) -> None:
+        """pink 仅离线有效；与 Alpha 联用时在 α 波形标注发射位置。"""
+        if not self._offline_view_active:
+            if checked:
+                self._log("pink 仅在离线查看模式下生效（请先加载含 pink_seq 的 CSV）")
+            return
+        if checked and self._offline_pink_event_times_s.size == 0:
+            self._log("当前离线数据没有粉噪事件（CSV 需含 pink_seq 列）")
+        self._refresh_offline_visible_channels()
+        if self._active_view != "eeg":
+            self._switch_to_eeg_view()
+        self._update_status_bar()
+
+    def _read_pink_seq_from_csv(self, path: Path) -> Optional[np.ndarray]:
+        """读取 CSV 的 pink_seq 列；缺失则返回 None。"""
+        try:
+            frame = pd.read_csv(path)
+        except Exception:
+            return None
+        columns_lower = {str(col).strip().lower(): col for col in frame.columns}
+        if "pink_seq" not in columns_lower:
+            return None
+        pink = pd.to_numeric(frame[columns_lower["pink_seq"]], errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+        pink = np.nan_to_num(pink, nan=-1.0)
+        return pink.astype(np.int64)
+
+    def _load_offline_pink_events_for_slice(
+        self,
+        path: Path,
+        *,
+        n_samples: int,
+        fs: float,
+        time_offset_s: float,
+        minute_range: Optional[Tuple[int, int]],
+    ) -> np.ndarray:
+        """按与 raw 相同的切片规则加载 pink_seq，并转为事件时刻。"""
+        pink = self._read_pink_seq_from_csv(path)
+        if pink is None:
+            return np.zeros(0, dtype=np.float64)
+
+        data = np.asarray(pink, dtype=np.int64)
+        if minute_range is None:
+            segment = data
+        else:
+            start_m, end_m = minute_range
+            n_per_min = max(1, int(round(float(fs) * 60.0)))
+            i0 = (start_m - 1) * n_per_min
+            i1 = end_m * n_per_min
+            siblings = self._list_offline_sibling_chunks(path)
+            need_concat = i1 > data.size or i0 >= data.size
+            path_res = path.resolve()
+            sibling_res = [p.resolve() for p in siblings]
+            if need_concat and path_res in sibling_res:
+                start_idx = sibling_res.index(path_res)
+                parts: List[np.ndarray] = []
+                total = 0
+                for p in siblings[start_idx:]:
+                    pink_i = self._read_pink_seq_from_csv(p)
+                    if pink_i is None:
+                        pink_i = np.full(0, -1, dtype=np.int64)
+                    parts.append(np.asarray(pink_i, dtype=np.int64))
+                    total += int(parts[-1].size)
+                    if total >= i1:
+                        break
+                data = np.concatenate(parts) if parts else data
+                n_per_min = max(1, int(round(float(fs) * 60.0)))
+                i0 = (start_m - 1) * n_per_min
+                i1 = end_m * n_per_min
+            if i0 >= data.size:
+                return np.zeros(0, dtype=np.float64)
+            segment = data[i0 : min(i1, int(data.size))]
+
+        if segment.size != int(n_samples):
+            if segment.size > int(n_samples):
+                segment = segment[: int(n_samples)]
+            else:
+                segment = np.pad(
+                    segment,
+                    (0, int(n_samples) - int(segment.size)),
+                    constant_values=-1,
+                )
+        events = detect_pink_seq_events(segment)
+        if events.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        return float(time_offset_s) + events.astype(np.float64) / max(float(fs), 1.0)
 
     @QtCore.pyqtSlot(str, bool)
     def _on_display_checkbox_toggled(self, mode: str, checked: bool) -> None:

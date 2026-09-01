@@ -45,7 +45,21 @@ CHANNEL_COLORS = {
     "raw": "#212121",
     **BAND_COLORS,
 }
+## 粉噪落在 α 相位分区的标注色
+PINK_PHASE_COLORS = {
+    "peak": "#1565C0",
+    "falling": "#EF6C00",
+    "trough": "#C62828",
+    "rising": "#2E7D32",
+}
+PINK_PHASE_LABELS = {
+    "peak": "峰",
+    "falling": "下降沿",
+    "trough": "谷",
+    "rising": "上升沿",
+}
 MAX_PLOT_POINTS = 25000
+MAX_PINK_MARKERS = 800
 
 class OfflineEegFileInfo(NamedTuple):
     channel_labels: List[str]
@@ -782,6 +796,8 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._y_limits: Optional[tuple[float, float]] = None
         self._raw_y_label = "raw"
         self._display_note = ""
+        self._pink_event_times_s = np.zeros(0, dtype=np.float64)
+        self._show_pink_on_alpha = False
         super().__init__(parent, empty_message="选择 CSV/EDF 后点击加载")
 
     @property
@@ -796,6 +812,10 @@ class OfflineRhythmStackView(_MatplotlibHostView):
     def sample_rate(self) -> float:
         return self._sample_rate
 
+    @property
+    def pink_event_count(self) -> int:
+        return int(self._pink_event_times_s.size)
+
     def clear(self) -> None:
         self._time_s = np.zeros(0, dtype=np.float64)
         self._channels.clear()
@@ -805,7 +825,28 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._y_limits = None
         self._raw_y_label = "raw"
         self._display_note = ""
+        self._pink_event_times_s = np.zeros(0, dtype=np.float64)
+        self._show_pink_on_alpha = False
         self._draw_empty("选择 CSV/EDF 后点击加载")
+
+    def set_pink_events(self, event_times_s: Optional[np.ndarray]) -> None:
+        """设置粉噪发射时刻（绝对时间轴，与 _time_s 一致）。"""
+        if event_times_s is None:
+            self._pink_event_times_s = np.zeros(0, dtype=np.float64)
+        else:
+            arr = np.asarray(event_times_s, dtype=np.float64).reshape(-1)
+            arr = arr[np.isfinite(arr)]
+            self._pink_event_times_s = np.sort(arr)
+        if self.has_data:
+            self.redraw()
+
+    def set_show_pink_on_alpha(self, enabled: bool) -> None:
+        flag = bool(enabled)
+        if flag == self._show_pink_on_alpha:
+            return
+        self._show_pink_on_alpha = flag
+        if self.has_data:
+            self.redraw()
 
     def set_y_limits(self, y_min: Optional[float], y_max: Optional[float]) -> None:
         if y_min is None or y_max is None:
@@ -828,6 +869,7 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         y_label: str = "raw",
         display_raw: Optional[np.ndarray] = None,
         display_note: str = "",
+        pink_event_times_s: Optional[np.ndarray] = None,
     ) -> tuple[int, float]:
         """Load a raw segment into the waveform view."""
         raw_arr = np.asarray(raw, dtype=np.float64)
@@ -849,6 +891,11 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         self._raw_y_label = y_label or "raw"
         self._display_note = str(display_note or "")
         self._visible = ["raw"]
+        if pink_event_times_s is None:
+            self._pink_event_times_s = np.zeros(0, dtype=np.float64)
+        else:
+            arr = np.asarray(pink_event_times_s, dtype=np.float64).reshape(-1)
+            self._pink_event_times_s = np.sort(arr[np.isfinite(arr)])
         if remove_mask is None:
             self._remove_mask = None
         else:
@@ -899,12 +946,98 @@ class OfflineRhythmStackView(_MatplotlibHostView):
             i = j
         return spans
 
+    @staticmethod
+    def _phase_region(deg: float) -> str:
+        x = float((deg + 180.0) % 360.0 - 180.0)
+        if abs(x) <= 45.0:
+            return "peak"
+        if abs(x) >= 135.0:
+            return "trough"
+        if x > 0:
+            return "falling"
+        return "rising"
+
+    def _draw_pink_on_alpha(self, ax) -> None:
+        """在 α 波形上标注粉噪发射时刻，颜色表示峰/谷/上升/下降沿。"""
+        if not self._show_pink_on_alpha:
+            return
+        events = self._pink_event_times_s
+        alpha = self._channels.get("alpha")
+        if events is None or events.size == 0 or alpha is None or self._time_s.size < 8:
+            return
+        t0 = float(self._time_s[0])
+        t1 = float(self._time_s[-1])
+        in_win = events[(events >= t0) & (events <= t1)]
+        if in_win.size == 0:
+            return
+        try:
+            from scipy.signal import hilbert
+        except Exception:
+            hilbert = None
+        phases = None
+        if hilbert is not None and alpha.size == self._time_s.size:
+            try:
+                phases = np.angle(hilbert(np.asarray(alpha, dtype=np.float64)))
+            except Exception:
+                phases = None
+
+        idx = np.searchsorted(self._time_s, in_win)
+        idx = np.clip(idx, 0, self._time_s.size - 1)
+        if idx.size > MAX_PINK_MARKERS:
+            step = int(np.ceil(idx.size / MAX_PINK_MARKERS))
+            sel = np.arange(0, idx.size, step)
+            idx = idx[sel]
+            in_win = in_win[sel]
+
+        y_vals = np.asarray(alpha, dtype=np.float64)[idx]
+        region_points: Dict[str, List[tuple]] = {
+            "peak": [],
+            "falling": [],
+            "trough": [],
+            "rising": [],
+        }
+        for k, i_ev in enumerate(idx):
+            if phases is not None:
+                deg = float(np.rad2deg(phases[int(i_ev)]))
+                region = self._phase_region(deg)
+            else:
+                region = "trough"
+            region_points[region].append((float(in_win[k]), float(y_vals[k])))
+
+        for region, pts in region_points.items():
+            if not pts:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.scatter(
+                xs,
+                ys,
+                s=22,
+                c=PINK_PHASE_COLORS[region],
+                marker="o",
+                zorder=6,
+                alpha=0.85,
+                edgecolors="white",
+                linewidths=0.4,
+                label=f"pink·{PINK_PHASE_LABELS[region]}",
+            )
+            for x in xs:
+                ax.axvline(x, color=PINK_PHASE_COLORS[region], alpha=0.18, lw=0.7)
+
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
+
     def redraw(self) -> None:
         self._figure.clear()
         self._axes = []
         visible = [name for name in self._visible if name in self._channels]
         if "raw" in self._channels and "raw" not in visible:
             visible = ["raw"] + visible
+        if (
+            self._show_pink_on_alpha
+            and "alpha" in self._channels
+            and "alpha" not in visible
+        ):
+            visible.append("alpha")
         if not visible or self._time_s.size == 0:
             self._draw_empty("璇峰厛鍔犺浇 CSV/EDF")
             return
@@ -935,6 +1068,8 @@ class OfflineRhythmStackView(_MatplotlibHostView):
                     t0 = float(t_full[i0])
                     t1 = float(t_full[i1 - 1]) + dt
                     ax.axvspan(t0, t1, color="#E53935", alpha=0.28, lw=0)
+            if name == "alpha":
+                self._draw_pink_on_alpha(ax)
             y_label = self._raw_y_label if name == "raw" else CHANNEL_LABELS.get(name, name)
             ax.set_ylabel(y_label, fontsize=9)
             if self._y_limits is not None:
@@ -955,8 +1090,11 @@ class OfflineRhythmStackView(_MatplotlibHostView):
         title = self._source_name or "offline"
         mark_tip = " | bad segments marked" if reject_spans else ""
         display_tip = f" | {self._display_note}" if self._display_note else ""
+        pink_tip = ""
+        if self._show_pink_on_alpha:
+            pink_tip = f" | pink on α ({self.pink_event_count} events)"
         self._figure.suptitle(
-            f"{title} | {self._sample_rate:.0f} Hz | waveform always shown{mark_tip}{display_tip}",
+            f"{title} | {self._sample_rate:.0f} Hz | waveform always shown{mark_tip}{display_tip}{pink_tip}",
             fontsize=10,
         )
         self._figure.tight_layout()
