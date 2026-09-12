@@ -90,6 +90,7 @@ from MuscleArtifactDialog import Ui_MuscleArtifactDialog
 from AssrDialog import Ui_AssrDialog
 from oscillator_serial import OscillatorSerial, BUFFER_SIZE as OSC_BUFFER_SIZE
 from serial_pump import BackgroundQueuePump
+from sleep_stage_sender import SleepStageSenderWidget
 from controller import (
     AssrStimulusController,
     StereoAudioController,
@@ -1414,6 +1415,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._offline_view = OfflineRhythmStackView(parent=self.ui.plotHost)
         self._offline_view.hide()
         self._setup_offline_viewer_ui()
+        self._setup_sleep_stage_sender_ui()
         self._setup_rejection_processing_ui()
         self._setup_muscle_artifact_ui()
         self._setup_psd_analysis_ui()
@@ -1645,6 +1647,40 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._waveform.refresh_layout()
         self._multi_waveform.refresh_layout()
         self._osc_waveform.refresh_layout()
+
+    def _setup_sleep_stage_sender_ui(self) -> None:
+        """动态增加睡眠分期发送页，避免修改 Designer 自动生成的 UI 文件。"""
+        tabs = self.ui.tabWidget_wave_display
+        self._sleep_stage_sender = SleepStageSenderWidget(
+            default_port=self.ui.lineEdit_5.text().strip() or DEFAULT_SERIAL_PORT,
+            parent=tabs,
+        )
+        self._sleep_stage_sender.serial_claim_requested.connect(
+            self._prepare_sleep_stage_serial
+        )
+        tabs.addTab(self._sleep_stage_sender, "睡眠分期发送")
+        tabs.setMinimumHeight(max(tabs.minimumHeight(), 450))
+
+    @QtCore.pyqtSlot(str)
+    def _prepare_sleep_stage_serial(self, port: str) -> None:
+        """发送前释放被实时二进制解析器占用的同名串口。"""
+        port_key = str(port).strip().upper()
+        if self._link is not None and self._link.is_open:
+            if str(self._link.port).strip().upper() == port_key:
+                self._stop_eeg_pump()
+                self._link.close()
+                self._link = None
+                self._running = False
+                self._refresh_capture_button()
+                self._log(f"已释放实时 EEG 串口 {port}，切换为睡眠分期文本协议")
+        if self._osc_link is not None and self._osc_link.is_open:
+            if str(self._osc_link.port).strip().upper() == port_key:
+                self._stop_osc_pump()
+                self._osc_link.close()
+                self._osc_link = None
+                self._log(f"已释放振子串口 {port}，切换为睡眠分期文本协议")
+        self.ui.lineEdit_5.setText(port)
+        self._refresh_serial_button()
 
     def _setup_offline_viewer_ui(self) -> None:
         """Bind Designer-defined offline viewer controls."""
@@ -9330,8 +9366,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _on_wave_display_tab_changed(self, index: int) -> None:
         if index == 1:
             self._switch_to_osc_view()
-        else:
+        elif index == 0:
             self._switch_to_eeg_view()
+        else:
+            # 第三个 tab 是 EDF -> STM32 的离线发送工具。这里不能调用
+            # _switch_to_eeg_view()，因为该函数会把 tab 强制切回索引 0。
+            self.ui.stackedWidget.setCurrentIndex(0)
+            self._active_view = "sleep_stage_sender"
+            self._set_audio_panel_visible(False)
+            self._set_eeg_analysis_panels_visible(False)
+            self.setWindowTitle("EEG 睡眠分期发送")
+            self._update_status_bar()
 
     def _uncheck_osc_axis_checkboxes(self) -> None:
         for checkbox in self._osc_axis_checkboxes.values():
@@ -10255,6 +10300,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._poll_timer.stop()
         self._running = False
+        sender = getattr(self, "_sleep_stage_sender", None)
+        if sender is not None:
+            sender.shutdown()
         self._halt_serial_readers()
         self._close_long_record_writer(final=True)
         self._audio_controller.shutdown()
