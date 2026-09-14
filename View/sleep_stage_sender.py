@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
-from scipy.signal import resample_poly
+from scipy.signal import butter, lfilter, resample, resample_poly
 
 from analysis_plot_view import (
     _normalize_edf_signal_to_uv,
@@ -21,6 +21,8 @@ from analysis_plot_view import (
 
 
 TARGET_FS = 100.0
+DOD_TRAINING_FS = 250.0
+DOD_CONTEXT_SECONDS = 60.0
 EPOCH_SECONDS = 30
 EPOCH_SAMPLES = 3000
 DEFAULT_DATA_DIR = Path(r"D:\eeglab2026.0.0\opensource_psg\EPCTL01-2025\EPCTL01")
@@ -50,8 +52,13 @@ def parse_sleep_labels(path: Optional[Path]) -> Dict[int, str]:
     return result
 
 
-def resample_to_model_rate(raw: np.ndarray, source_fs: float) -> np.ndarray:
-    """整段重采样到 100 Hz，避免逐帧重采样造成边界不连续。"""
+def preprocess_dod_training_signal(raw: np.ndarray, source_fs: float) -> np.ndarray:
+    """复现 DOD 训练脚本的连续信号预处理顺序。
+
+    源信号先抗混叠重采样到 250 Hz，再执行五阶因果 0.5~40 Hz
+    Butterworth 带通滤波，最后按训练脚本使用 FFT 重采样到 100 Hz。
+    每个 epoch 的标准化和量化仍由 MCU 端已有代码完成。
+    """
     values = np.asarray(raw, dtype=np.float64).reshape(-1)
     if values.size == 0:
         raise ValueError("所选通道没有数据")
@@ -60,22 +67,36 @@ def resample_to_model_rate(raw: np.ndarray, source_fs: float) -> np.ndarray:
     if not np.all(np.isfinite(values)):
         count = int(np.count_nonzero(~np.isfinite(values)))
         raise ValueError(f"所选通道含 {count} 个 NaN/Inf，请先处理坏段")
-    if abs(source_fs - TARGET_FS) < 1.0e-6:
-        return values
-    ratio = Fraction(TARGET_FS / source_fs).limit_denominator(10000)
-    return np.asarray(
-        resample_poly(values, ratio.numerator, ratio.denominator),
-        dtype=np.float64,
-    )
+
+    if abs(source_fs - DOD_TRAINING_FS) < 1.0e-6:
+        at_training_rate = values
+    else:
+        ratio = Fraction(DOD_TRAINING_FS / source_fs).limit_denominator(10000)
+        at_training_rate = np.asarray(
+            resample_poly(values, ratio.numerator, ratio.denominator),
+            dtype=np.float64,
+        )
+
+    nyquist = 0.5 * DOD_TRAINING_FS
+    b, a = butter(5, [0.5 / nyquist, 40.0 / nyquist], btype="band")
+    filtered = lfilter(b, a, at_training_rate)
+    # DOD trainer.py 使用 int(len(x) * 100 / 250)，这里保持相同的截断规则。
+    target_count = int(filtered.size * TARGET_FS / DOD_TRAINING_FS)
+    return np.asarray(resample(filtered, target_count), dtype=np.float64)
+
+
+def resample_to_model_rate(raw: np.ndarray, source_fs: float) -> np.ndarray:
+    """兼容旧调用名；现在返回 DOD 训练预处理后的 100 Hz 信号。"""
+    return preprocess_dod_training_signal(raw, source_fs)
 
 
 def load_edf_epoch_range(
     path: Path, channel_index: int, first_epoch: int, last_epoch: int
 ) -> tuple[np.ndarray, float, str, str, int]:
-    """只读取所选 epoch 范围，返回严格对齐的 100 Hz 连续信号。
+    """只读取所选 epoch 范围，返回按 DOD 训练链处理的 100 Hz 信号。
 
-    范围两端额外读取 1 秒，再在重采样后裁掉。这样既避免加载整夜通道，
-    也减少 resample_poly 在所选范围边缘补零造成的瞬态。
+    范围两端额外读取 60 秒，再在完整预处理后裁掉，以减小因果 IIR
+    初始状态和 FFT 重采样边界对目标 epoch 的影响。
     """
     import pyedflib
 
@@ -94,8 +115,8 @@ def load_edf_epoch_range(
     requested_start_s = first * EPOCH_SECONDS
     requested_end_s = (last + 1) * EPOCH_SECONDS
     file_end_s = sample_count / source_fs
-    padded_start_s = max(0.0, requested_start_s - 1.0)
-    padded_end_s = min(file_end_s, requested_end_s + 1.0)
+    padded_start_s = max(0.0, requested_start_s - DOD_CONTEXT_SECONDS)
+    padded_end_s = min(file_end_s, requested_end_s + DOD_CONTEXT_SECONDS)
     source_start = int(round(padded_start_s * source_fs))
     source_length = int(round((padded_end_s - padded_start_s) * source_fs))
 
@@ -110,13 +131,13 @@ def load_edf_epoch_range(
         reader.close()
 
     raw, unit = _normalize_edf_signal_to_uv(raw, physical_unit)
-    padded_100_hz = resample_to_model_rate(raw, source_fs)
+    padded_100_hz = preprocess_dod_training_signal(raw, source_fs)
     crop_start = int(round((requested_start_s - padded_start_s) * TARGET_FS))
     required = (last - first + 1) * EPOCH_SAMPLES
     signal = padded_100_hz[crop_start:crop_start + required]
     if signal.size != required:
         raise RuntimeError(
-            f"重采样后点数异常：得到 {signal.size}，期望 {required}"
+            f"DOD 训练链处理后点数异常：得到 {signal.size}，期望 {required}"
         )
     return signal, source_fs, info.channel_labels[index], unit, total_epochs
 
@@ -141,7 +162,7 @@ def parse_mcu_reply(lines: List[str]) -> Dict[str, str]:
 
 
 class SleepStageSendWorker(QtCore.QObject):
-    """后台执行 EDF 读取、重采样和串口握手，防止界面卡顿。"""
+    """后台执行 EDF 读取、DOD 预处理和串口握手，防止界面卡顿。"""
 
     log = QtCore.pyqtSignal(str)
     prepared = QtCore.pyqtSignal(int, float, str, str)
@@ -201,7 +222,8 @@ class SleepStageSendWorker(QtCore.QObject):
 
             self.log.emit(
                 f"读取 EDF 通道 {self.channel_index}，epoch "
-                f"{self.first_epoch}~{self.last_epoch}: {self.edf_path.name}"
+                f"{self.first_epoch}~{self.last_epoch}: {self.edf_path.name}；"
+                "执行 DOD 训练预处理"
             )
             signal, source_fs, channel, unit, total_epochs = load_edf_epoch_range(
                 self.edf_path,
@@ -344,7 +366,8 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         root.addLayout(send_row)
 
         self.info = QtWidgets.QLabel(
-            "epoch 从 0 开始；每帧 30 秒/3000 点；收到 READY 后才发下一帧。", self
+            "epoch 从 0 开始；发送前执行 DOD 训练预处理；"
+            "每帧 30 秒/3000 点；收到 READY 后才发下一帧。", self
         )
         self.info.setWordWrap(True)
         root.addWidget(self.info)
@@ -357,7 +380,22 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         self.table.setHorizontalHeaderLabels(
             ["epoch", "时间(s)", "真实标签", "CNN", "LSTM/STAGE", "状态"]
         )
-        self.table.horizontalHeader().setStretchLastSection(True)
+        header = self.table.horizontalHeader()
+        header.setDefaultAlignment(QtCore.Qt.AlignCenter)
+        header.setStretchLastSection(False)
+
+        # 前三列只显示短数字/标签，固定为较小宽度；把主要空间留给
+        # CNN 和 LSTM 结果，使常用列在窄控制面板中也能同时看到。
+        for column in (0, 1, 2, 5):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 54)   # epoch
+        self.table.setColumnWidth(1, 66)   # 时间(s)
+        self.table.setColumnWidth(2, 62)   # 真实标签
+        self.table.setColumnWidth(5, 58)   # 状态
+        self.table.setTextElideMode(QtCore.Qt.ElideRight)
+        self.table.setWordWrap(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setMinimumHeight(105)
@@ -472,7 +510,8 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
             label_count = len(parse_sleep_labels(self.optional_label_path()))
             self.info.setText(
                 f"共 {len(info.channel_labels)} 个通道，约 {available} 个 epoch，"
-                f"标签 {label_count} 个；发送前仅重采样到 100 Hz。"
+                f"标签 {label_count} 个；发送前：源采样率→250 Hz、0.5~40 Hz "
+                "五阶因果带通、FFT→100 Hz。"
             )
             self.append_log(f"已读取: {path.name}")
         except Exception as exc:
@@ -542,7 +581,7 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
     def on_prepared(self, total: int, source_fs: float, channel: str, unit: str) -> None:
         self.info.setText(
             f"{channel} ({unit})，原采样率 {source_fs:g} Hz，共 {total} 个完整 epoch；"
-            "发送采样率 100 Hz。"
+            "DOD 训练预处理后发送 100 Hz 数据。"
         )
 
     def on_result(self, result: Dict[str, object]) -> None:
@@ -555,7 +594,12 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
             result.get("status", ""),
         ]
         for column, value in enumerate(values):
-            self.table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
+            text = str(value)
+            item = QtWidgets.QTableWidgetItem(text)
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+            # CNN/LSTM 文本较长，单元格内省略显示，悬停仍可查看完整内容。
+            item.setToolTip(text)
+            self.table.setItem(row, column, item)
         self.table.scrollToBottom()
 
     def on_progress(self, current: int, total: int) -> None:
