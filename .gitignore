@@ -7,6 +7,7 @@
 # PyInstaller outputs
 /build/
 /dist/
+/packaging/sync_dist.ps1
 
 *.spec.bak
 
