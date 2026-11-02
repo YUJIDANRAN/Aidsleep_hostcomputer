@@ -1,4 +1,4 @@
-"""EDF 单通道按 30 秒 epoch 发送到 STM32 睡眠分期网络。"""
+"""EDF/BDF 或 OpenBCI 单通道按 30 秒 epoch 发送到 STM32 睡眠分期网络。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,11 @@ from PyQt5 import QtCore, QtWidgets
 from scipy.signal import butter, lfilter, resample, resample_poly
 
 from analysis_plot_view import (
+    _brainflow_columns_and_labels,
+    _looks_like_brainflow_raw,
+    _read_sibling_openbci_sample_rate,
     _normalize_edf_signal_to_uv,
+    load_eeg_file_channel_window,
     load_eeg_file_info,
 )
 
@@ -26,6 +30,27 @@ DOD_CONTEXT_SECONDS = 60.0
 EPOCH_SECONDS = 30
 EPOCH_SAMPLES = 3000
 DEFAULT_DATA_DIR = Path(r"D:\eeglab2026.0.0\opensource_psg\EPCTL01-2025\EPCTL01")
+STAGE_LABELS = ("W", "N1", "N2", "N3", "R")
+OPENBCI_CHANNELS = ("Fp1", "Fp2", "F3", "F4", "C3", "C4", "O1", "O2")
+
+
+def prediction_label(reply: object) -> str:
+    """仅提取显示类别，原始 MCU 回复仍完整保存在结果中。"""
+    match = re.match(r"^(?:CNN|STAGE) class=(\d+)(?:\s|$)", str(reply))
+    if match and 0 <= int(match[1]) < len(STAGE_LABELS):
+        return STAGE_LABELS[int(match[1])]
+    return ""
+
+
+def stage_matches_label(result: Dict[str, object]) -> str:
+    """无最终分期或有效真值时不判错；CSV 留空，UI 显示破折号。"""
+    predicted = prediction_label(result.get("stage", ""))
+    label = str(result.get("label", "")).strip().upper()
+    if label == "REM":
+        label = "R"
+    if not predicted or label not in STAGE_LABELS:
+        return ""
+    return "true" if predicted == label else "false"
 
 
 def parse_sleep_labels(path: Optional[Path]) -> Dict[int, str]:
@@ -50,6 +75,72 @@ def parse_sleep_labels(path: Optional[Path]) -> Dict[int, str]:
             if stage and start_s >= 0.0 and duration_s > 0.0:
                 result[int(round(start_s / EPOCH_SECONDS))] = stage
     return result
+
+
+def count_brainflow_rows(path: Path) -> int:
+    """Count rows exactly without loading a potentially multi-gigabyte CSV."""
+    line_count = 0
+    last_byte = b""
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            line_count += chunk.count(b"\n")
+            last_byte = chunk[-1:]
+    if path.stat().st_size and last_byte != b"\n":
+        line_count += 1
+    return line_count
+
+
+def load_openbci_epoch_range(
+    path: Path, channel_index: int, first_epoch: int, last_epoch: int
+) -> tuple[np.ndarray, float, str, str, int]:
+    """Load one BrainFlow EXG channel with DOD context and preprocessing."""
+    if not _looks_like_brainflow_raw(path):
+        raise ValueError("请选择 OpenBCI BrainFlow-RAW_*.csv")
+    columns, _labels, _n_columns = _brainflow_columns_and_labels(path)
+    if not 0 <= int(channel_index) < min(len(columns), len(OPENBCI_CHANNELS)):
+        raise ValueError(f"EXG 通道序号无效: {channel_index}")
+    source_fs = float(_read_sibling_openbci_sample_rate(path) or 500.0)
+    sample_count = count_brainflow_rows(path)
+    total_epochs = int(math.floor(sample_count / source_fs / EPOCH_SECONDS))
+    first = max(0, int(first_epoch))
+    last = min(int(last_epoch), total_epochs - 1)
+    if total_epochs <= 0 or first > last:
+        raise ValueError(f"epoch 范围无效；可用范围为 0~{total_epochs - 1}")
+
+    requested_start_s = first * EPOCH_SECONDS
+    requested_end_s = (last + 1) * EPOCH_SECONDS
+    file_end_s = sample_count / source_fs
+    padded_start_s = max(0.0, requested_start_s - DOD_CONTEXT_SECONDS)
+    padded_end_s = min(file_end_s, requested_end_s + DOD_CONTEXT_SECONDS)
+    raw, loaded_fs, _label, unit, actual_start_s = load_eeg_file_channel_window(
+        path,
+        int(channel_index),
+        start_s=padded_start_s,
+        duration_s=padded_end_s - padded_start_s,
+    )
+    expected_source_samples = int(round((padded_end_s - padded_start_s) * source_fs))
+    if raw.size != expected_source_samples:
+        raise ValueError(
+            f"所选 BrainFlow 通道样本数异常: 得到 {raw.size}, 期望 {expected_source_samples}；"
+            "请检查文件是否有空值或行缺失"
+        )
+    if unit.strip().lower() not in {"uv", "µv", "μv"}:
+        raise ValueError(f"BrainFlow 单位不是 uV: {unit}")
+    if abs(float(loaded_fs) - source_fs) > 1.0e-6:
+        raise ValueError("BrainFlow 文件采样率读取不一致")
+
+    processed = preprocess_dod_training_signal(raw, source_fs)
+    crop_start = int(round((requested_start_s - actual_start_s) * TARGET_FS))
+    required = (last - first + 1) * EPOCH_SAMPLES
+    signal = processed[crop_start:crop_start + required]
+    if signal.size != required:
+        raise RuntimeError(
+            f"DOD 训练链处理后点数异常：得到 {signal.size}，期望 {required}"
+        )
+    return signal, source_fs, f"{OPENBCI_CHANNELS[channel_index]} (EXG {channel_index})", unit, total_epochs
 
 
 def preprocess_dod_training_signal(raw: np.ndarray, source_fs: float) -> np.ndarray:
@@ -162,7 +253,7 @@ def parse_mcu_reply(lines: List[str]) -> Dict[str, str]:
 
 
 class SleepStageSendWorker(QtCore.QObject):
-    """后台执行 EDF 读取、DOD 预处理和串口握手，防止界面卡顿。"""
+    """后台执行文件读取、DOD 预处理和串口握手，防止界面卡顿。"""
 
     log = QtCore.pyqtSignal(str)
     prepared = QtCore.pyqtSignal(int, float, str, str)
@@ -170,11 +261,13 @@ class SleepStageSendWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, int)
     finished = QtCore.pyqtSignal(bool, str)
 
-    def __init__(self, *, edf_path: Path, label_path: Optional[Path],
+    def __init__(self, *, source_path: Path, source_kind: str,
+                 label_path: Optional[Path],
                  channel_index: int, port: str, first_epoch: int,
                  last_epoch: int) -> None:
         super().__init__()
-        self.edf_path = edf_path
+        self.source_path = source_path
+        self.source_kind = source_kind
         self.label_path = label_path
         self.channel_index = channel_index
         self.port = port
@@ -221,19 +314,17 @@ class SleepStageSendWorker(QtCore.QObject):
             from serial import Serial
 
             self.log.emit(
-                f"读取 EDF 通道 {self.channel_index}，epoch "
-                f"{self.first_epoch}~{self.last_epoch}: {self.edf_path.name}；"
+                f"读取 {self.source_kind} 通道 {self.channel_index}，epoch "
+                f"{self.first_epoch}~{self.last_epoch}: {self.source_path.name}；"
                 "执行 DOD 训练预处理"
             )
-            signal, source_fs, channel, unit, total_epochs = load_edf_epoch_range(
-                self.edf_path,
-                self.channel_index,
-                self.first_epoch,
-                self.last_epoch,
+            loader = load_openbci_epoch_range if self.source_kind == "OpenBCI" else load_edf_epoch_range
+            signal, source_fs, channel, unit, total_epochs = loader(
+                self.source_path, self.channel_index, self.first_epoch, self.last_epoch,
             )
             first = max(0, self.first_epoch)
             last = min(self.last_epoch, total_epochs - 1)
-            labels = parse_sleep_labels(self.label_path)
+            labels = parse_sleep_labels(self.label_path) if self.source_kind != "OpenBCI" else {}
             self.prepared.emit(total_epochs, float(source_fs), channel, unit)
 
             ser = Serial(
@@ -267,17 +358,33 @@ class SleepStageSendWorker(QtCore.QObject):
                     f"PC  > epoch={epoch_index} time={epoch_index * 30}s "
                     f"label={label or '-'} samples=3000 bytes={len(payload)}"
                 )
+                roundtrip_started = time.perf_counter()
                 self._write_all(ser, payload)
+                upload_finished = time.perf_counter()
                 lines = self._read_until_ready(ser)
+                response_finished = time.perf_counter()
+                upload_ms = (upload_finished - roundtrip_started) * 1000.0
+                response_ms = (response_finished - upload_finished) * 1000.0
+                roundtrip_ms = (response_finished - roundtrip_started) * 1000.0
                 parsed = parse_mcu_reply(lines)
                 parsed.update({
                     "epoch": epoch_index,
+                    "sequence_position": (sent - 1) % 12 + 1,
                     "time_s": epoch_index * EPOCH_SECONDS,
                     "label": label,
                     "channel": channel,
+                    "source_file": str(self.source_path),
+                    "source_type": self.source_kind,
                     "source_fs": float(source_fs),
+                    "upload_ms": upload_ms,
+                    "response_ms": response_ms,
+                    "roundtrip_ms": roundtrip_ms,
                     "reply": "\n".join(lines),
                 })
+                self.log.emit(
+                    f"TIME epoch={epoch_index} upload={upload_ms:.1f} ms "
+                    f"mcu_response={response_ms:.1f} ms total={roundtrip_ms:.1f} ms"
+                )
                 self.epoch_result.emit(parsed)
                 self.progress.emit(sent, total)
                 if str(parsed["status"]).startswith("ERR"):
@@ -317,16 +424,35 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         root.setSpacing(6)
 
         files = QtWidgets.QGridLayout()
+        self.edf_mode_check = QtWidgets.QCheckBox("EDF/BDF", self)
+        self.openbci_mode_check = QtWidgets.QCheckBox("OpenBCI BrainFlow CSV", self)
+        self.source_mode_group = QtWidgets.QButtonGroup(self)
+        self.source_mode_group.setExclusive(True)
+        self.source_mode_group.addButton(self.edf_mode_check, 0)
+        self.source_mode_group.addButton(self.openbci_mode_check, 1)
+        self.edf_mode_check.setChecked(True)
+        files.addWidget(QtWidgets.QLabel("输入格式", self), 0, 0)
+        files.addWidget(self.edf_mode_check, 0, 1)
+        files.addWidget(self.openbci_mode_check, 0, 2)
+
+        self.edf_path_label = QtWidgets.QLabel("EDF/BDF", self)
         self.edf_edit = QtWidgets.QLineEdit(self)
         self.edf_button = QtWidgets.QPushButton("选择 EDF...", self)
+        self.openbci_path_label = QtWidgets.QLabel("BrainFlow CSV", self)
+        self.openbci_edit = QtWidgets.QLineEdit(self)
+        self.openbci_button = QtWidgets.QPushButton("选择 CSV...", self)
         self.label_edit = QtWidgets.QLineEdit(self)
         self.label_button = QtWidgets.QPushButton("选择标签...", self)
-        files.addWidget(QtWidgets.QLabel("EDF/BDF", self), 0, 0)
-        files.addWidget(self.edf_edit, 0, 1)
-        files.addWidget(self.edf_button, 0, 2)
-        files.addWidget(QtWidgets.QLabel("标签", self), 1, 0)
-        files.addWidget(self.label_edit, 1, 1)
-        files.addWidget(self.label_button, 1, 2)
+        self.reference_path_label = QtWidgets.QLabel("真实标签", self)
+        files.addWidget(self.edf_path_label, 1, 0)
+        files.addWidget(self.edf_edit, 1, 1)
+        files.addWidget(self.edf_button, 1, 2)
+        files.addWidget(self.openbci_path_label, 2, 0)
+        files.addWidget(self.openbci_edit, 2, 1)
+        files.addWidget(self.openbci_button, 2, 2)
+        files.addWidget(self.reference_path_label, 3, 0)
+        files.addWidget(self.label_edit, 3, 1)
+        files.addWidget(self.label_button, 3, 2)
         root.addLayout(files)
 
         options = QtWidgets.QHBoxLayout()
@@ -376,24 +502,34 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         self.progress.setValue(0)
         root.addWidget(self.progress)
 
-        self.table = QtWidgets.QTableWidget(0, 6, self)
+        self.table = QtWidgets.QTableWidget(0, 7, self)
         self.table.setHorizontalHeaderLabels(
-            ["epoch", "时间(s)", "真实标签", "CNN", "LSTM/STAGE", "状态"]
+            ["epoch", "真实标签", "CNN", "LSTM", "一致", "MCU响应(ms)", "状态"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeaderItem(3).setToolTip(
+            "本次发送每 12 帧的序号,最终类别；LSTM 使用 12 帧滑动窗口，预热后每帧输出。"
+        )
+        self.table.horizontalHeaderItem(4).setToolTip(
+            "LSTM 最终类别与真实标签是否一致；无结果或无有效标签时显示 —。"
         )
         header = self.table.horizontalHeader()
         header.setDefaultAlignment(QtCore.Qt.AlignCenter)
         header.setStretchLastSection(False)
 
-        # 前三列只显示短数字/标签，固定为较小宽度；把主要空间留给
-        # CNN 和 LSTM 结果，使常用列在窄控制面板中也能同时看到。
-        for column in (0, 1, 2, 5):
+        # 类别使用短标签，剩余宽度留给 LSTM 的序号和类别。
+        for column in (0, 1, 2, 4, 5, 6):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.Fixed)
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        header.setMinimumSectionSize(40)
         self.table.setColumnWidth(0, 54)   # epoch
-        self.table.setColumnWidth(1, 66)   # 时间(s)
-        self.table.setColumnWidth(2, 62)   # 真实标签
-        self.table.setColumnWidth(5, 58)   # 状态
+        self.table.setColumnWidth(1, 62)   # 真实标签
+        self.table.setColumnWidth(2, 54)   # CNN 类别
+        self.table.setColumnWidth(
+            4, max(64, self.table.fontMetrics().horizontalAdvance("false") + 16)
+        )
+        self.table.setColumnWidth(5, 92)   # 发送完成到 READY，近似 MCU 处理耗时
+        self.table.setColumnWidth(6, 58)   # 状态
         self.table.setTextElideMode(QtCore.Qt.ElideRight)
         self.table.setWordWrap(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -417,7 +553,10 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         root.addLayout(bottom)
 
     def _wire_ui(self) -> None:
+        self.edf_mode_check.toggled.connect(self._update_source_mode)
+        self.openbci_mode_check.toggled.connect(self._update_source_mode)
         self.edf_button.clicked.connect(self.browse_edf)
+        self.openbci_button.clicked.connect(self.browse_openbci)
         self.label_button.clicked.connect(self.browse_label)
         self.load_button.clicked.connect(self.load_channels)
         self.port_button.clicked.connect(self.refresh_ports)
@@ -434,6 +573,49 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
             self.edf_edit.setText(str(edf))
         if label.exists():
             self.label_edit.setText(str(label))
+        self._update_source_mode()
+
+    def is_openbci_mode(self) -> bool:
+        return self.openbci_mode_check.isChecked()
+
+    def _update_source_mode(self, *_args) -> None:
+        openbci = self.is_openbci_mode()
+        can_change_mode = self.thread is None and not self.results
+        can_edit_source = self.thread is None and not self.results
+        self.edf_mode_check.setEnabled(can_change_mode)
+        self.openbci_mode_check.setEnabled(can_change_mode)
+        for widget in (self.edf_path_label, self.edf_edit, self.edf_button):
+            widget.setEnabled(can_edit_source and not openbci)
+        for widget in (self.openbci_path_label, self.openbci_edit, self.openbci_button):
+            widget.setEnabled(can_edit_source and openbci)
+        for widget in (self.label_edit, self.label_button):
+            widget.setEnabled(can_edit_source and not openbci)
+        for widget in (self.load_button, self.channel_combo):
+            widget.setEnabled(can_edit_source)
+        self._update_source_hint()
+
+    def _update_source_hint(self) -> None:
+        if self.is_openbci_mode():
+            self.info.setText(
+                "OpenBCI BrainFlow CSV：EXG0–7 映射为 Fp1/Fp2/F3/F4/C3/C4/O1/O2；"
+                "按 µV 和文件采样率读取，执行与 EDF 相同的 DOD 预处理，30 秒/3000 点后串口发送；"
+                "结果单独导出，之后可与上位机 YASA CSV 按 epoch 对照。"
+            )
+        else:
+            self.info.setText(
+                "epoch 从 0 开始；发送前执行 DOD 训练预处理；"
+                "每帧 30 秒/3000 点；收到 READY 后才发下一帧。"
+            )
+
+    def browse_openbci(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择 OpenBCI BrainFlow CSV",
+            self.openbci_edit.text() or str(Path(r"E:\OpenBCI\OpenBCI_GUI\Recordings")),
+            "BrainFlow CSV (BrainFlow-RAW_*.csv);;CSV (*.csv);;所有文件 (*)"
+        )
+        if path:
+            self.openbci_edit.setText(path)
+            self.load_channels()
 
     def append_log(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -487,32 +669,70 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
 
     def load_channels(self) -> None:
         try:
-            path = Path(self.edf_edit.text().strip())
-            if not path.is_file():
-                raise FileNotFoundError(f"EDF 文件不存在: {path}")
-            info = load_eeg_file_info(path)
             self.channel_combo.clear()
-            for i, name in enumerate(info.channel_labels):
-                self.channel_combo.addItem(
-                    f"{i}: {name}  {info.channel_rates[i]:g}Hz  "
-                    f"{info.channel_units[i]}  {info.channel_samples[i]}点", i
-                )
+            if self.is_openbci_mode():
+                path = Path(self.openbci_edit.text().strip())
+                if not path.is_file():
+                    raise FileNotFoundError(f"BrainFlow CSV 不存在: {path}")
+                if not _looks_like_brainflow_raw(path):
+                    raise ValueError("请选择 OpenBCI BrainFlow-RAW_*.csv")
+                columns, _labels, _column_count = _brainflow_columns_and_labels(path)
+                sample_rate = float(_read_sibling_openbci_sample_rate(path) or 500.0)
+                brainflow_info = load_eeg_file_info(path)
+                sample_count = int(brainflow_info.channel_samples[0])
+                channel_count = min(len(columns), len(OPENBCI_CHANNELS))
+                for i, _column in enumerate(columns[:channel_count]):
+                    self.channel_combo.addItem(
+                        f"{i}: {OPENBCI_CHANNELS[i]} (EXG {i})  {sample_rate:g}Hz  uV  {sample_count}点", i
+                    )
+                if self.channel_combo.count() > 3:
+                    self.channel_combo.setCurrentIndex(3)
+            else:
+                path = Path(self.edf_edit.text().strip())
+                if not path.is_file():
+                    raise FileNotFoundError(f"EDF 文件不存在: {path}")
+                info = load_eeg_file_info(path)
+                channel_count = len(info.channel_labels)
+                for i, name in enumerate(info.channel_labels):
+                    self.channel_combo.addItem(
+                        f"{i}: {name}  {info.channel_rates[i]:g}Hz  "
+                        f"{info.channel_units[i]}  {info.channel_samples[i]}点", i
+                    )
             if self.channel_combo.count() == 0:
-                raise ValueError("EDF 中没有可用通道")
-            available = max(
-                int(round(n / fs * TARGET_FS)) // EPOCH_SAMPLES
-                for n, fs in zip(info.channel_samples, info.channel_rates) if fs > 0
-            )
+                raise ValueError("输入文件中没有可用通道")
+            if self.is_openbci_mode():
+                available = int(math.floor(sample_count / sample_rate / EPOCH_SECONDS))
+            else:
+                available = max(
+                    int(round(n / fs * TARGET_FS)) // EPOCH_SAMPLES
+                    for n, fs in zip(info.channel_samples, info.channel_rates) if fs > 0
+                )
             maximum = max(0, available - 1)
+            if self.is_openbci_mode():
+                # File-size row estimates can be low for variable-width BrainFlow rows.
+                # The worker counts CSV records exactly and validates the requested end epoch.
+                maximum = 999999
             self.first_spin.setMaximum(maximum)
             self.last_spin.setMaximum(maximum)
             self.last_spin.setValue(min(11, maximum))
-            label_count = len(parse_sleep_labels(self.optional_label_path()))
+            if self.is_openbci_mode():
+                labels = {}
+                ref_name = "参照标签"
+            else:
+                labels = parse_sleep_labels(self.optional_label_path())
+                ref_name = "标签"
             self.info.setText(
-                f"共 {len(info.channel_labels)} 个通道，约 {available} 个 epoch，"
-                f"标签 {label_count} 个；发送前：源采样率→250 Hz、0.5~40 Hz "
+                f"共 {channel_count} 个通道，约 {available} 个 epoch，"
+                f"{ref_name} {len(labels)} 个；发送前：源采样率→250 Hz、0.5~40 Hz "
                 "五阶因果带通、FFT→100 Hz。"
             )
+            if self.is_openbci_mode():
+                self.info.setText(
+                    f"BrainFlow CSV: 约 {sample_count} 点 @ {sample_rate:g} Hz，{available} 个完整 epoch；"
+                    "通道映射 EXG0–7→Fp1/Fp2/F3/F4/C3/C4/O1/O2；"
+                    "DOD 预处理：→250 Hz、0.5–40 Hz 五阶因果带通、FFT→100 Hz；"
+                    "IGT6 结果单独导出，之后再和 YASA CSV 对照。输入范围会按实际 CSV 行数校验。"
+                )
             self.append_log(f"已读取: {path.name}")
         except Exception as exc:
             self.channel_combo.clear()
@@ -528,9 +748,14 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         if self.thread is not None:
             return
         try:
-            edf = Path(self.edf_edit.text().strip())
-            if not edf.is_file():
-                raise FileNotFoundError(f"EDF 文件不存在: {edf}")
+            openbci = self.is_openbci_mode()
+            source = Path((self.openbci_edit if openbci else self.edf_edit).text().strip())
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"{'BrainFlow CSV' if openbci else 'EDF/BDF'} 文件不存在: {source}"
+                )
+            if openbci and not _looks_like_brainflow_raw(source):
+                raise ValueError("请选择 OpenBCI BrainFlow-RAW_*.csv")
             if self.channel_combo.count() == 0:
                 self.load_channels()
             if self.channel_combo.count() == 0:
@@ -541,7 +766,7 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
                 raise ValueError("请选择串口")
             if first > last:
                 raise ValueError("起始 epoch 不能大于结束 epoch")
-            label = self.optional_label_path()
+            label = None if openbci else self.optional_label_path()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "无法发送", str(exc))
             return
@@ -552,7 +777,8 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         self.progress.setValue(0)
         thread = QtCore.QThread(self)
         worker = SleepStageSendWorker(
-            edf_path=edf, label_path=label, channel_index=channel,
+            source_path=source, source_kind="OpenBCI" if openbci else "EDF/BDF",
+            label_path=label, channel_index=channel,
             port=port, first_epoch=first, last_epoch=last,
         )
         worker.moveToThread(thread)
@@ -571,11 +797,11 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
 
     def _set_running(self, running: bool) -> None:
         for widget in (
-            self.edf_button, self.label_button, self.load_button,
-            self.channel_combo, self.port_combo, self.port_button,
+            self.port_combo, self.port_button,
             self.first_spin, self.last_spin, self.one_button, self.range_button,
         ):
             widget.setEnabled(not running)
+        self._update_source_mode()
         self.stop_button.setEnabled(running)
 
     def on_prepared(self, total: int, source_fs: float, channel: str, unit: str) -> None:
@@ -585,20 +811,32 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         )
 
     def on_result(self, result: Dict[str, object]) -> None:
-        self.results.append(dict(result))
+        result = dict(result)
+        result["stage_matches_label"] = stage_matches_label(result)
+        self.results.append(result)
         row = self.table.rowCount()
         self.table.insertRow(row)
+        cnn = prediction_label(result.get("cnn", ""))
+        stage = prediction_label(result.get("stage", ""))
+        position = result.get("sequence_position", row % 12 + 1)
+        stage_display = stage or ("等待" if result.get("sequence") else "—")
         values = [
-            result.get("epoch", ""), result.get("time_s", ""), result.get("label", ""),
-            result.get("cnn", ""), result.get("stage", "") or result.get("sequence", ""),
+            result.get("epoch", ""), result.get("label", ""), cnn or "—",
+            f"{position}/12,{stage_display}", result["stage_matches_label"] or "—",
+            f"{float(result.get('response_ms', 0.0)):.1f}",
             result.get("status", ""),
         ]
         for column, value in enumerate(values):
             text = str(value)
             item = QtWidgets.QTableWidgetItem(text)
             item.setTextAlignment(QtCore.Qt.AlignCenter)
-            # CNN/LSTM 文本较长，单元格内省略显示，悬停仍可查看完整内容。
-            item.setToolTip(text)
+            # 精简显示，悬停仍可查看原始回复和分数。
+            tooltip = text
+            if column == 2:
+                tooltip = str(result.get("cnn", ""))
+            elif column == 3:
+                tooltip = str(result.get("stage", "") or result.get("sequence", ""))
+            item.setToolTip(tooltip)
             self.table.setItem(row, column, item)
         self.table.scrollToBottom()
 
@@ -629,6 +867,7 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
             self.results.clear()
             self.table.setRowCount(0)
             self.log.clear()
+            self._update_source_mode()
 
     def save_results(self) -> None:
         if not self.results:
@@ -640,7 +879,10 @@ class SleepStageSenderWidget(QtWidgets.QWidget):
         if not path:
             return
         fields = ["epoch", "time_s", "label", "channel", "source_fs",
-                  "ack", "cnn", "sequence", "stage", "status", "reply"]
+                  "source_file", "source_type",
+                  "upload_ms", "response_ms", "roundtrip_ms",
+                  "ack", "cnn", "sequence", "stage", "status", "reply",
+                  "stage_matches_label"]
         with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
