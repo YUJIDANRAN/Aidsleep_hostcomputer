@@ -67,6 +67,18 @@ from alpha_phase import (
     export_alpha_phase_summary_csv,
     format_alpha_phase_report,
 )
+from post_stim_alpha import (
+    PostStimAlphaAnalysis,
+    analyze_post_stim_alpha_csv,
+    export_post_stim_alpha_summary_csv,
+    format_post_stim_alpha_report,
+)
+from afv import (
+    AfvAnalysis,
+    analyze_afv_csv,
+    export_afv_summary_csv,
+    format_afv_report,
+)
 from osc_data import (  ## 振子三轴加速度节律分析
     ACCEL_DISPLAY_UNIT,
     OSC_BANDS,
@@ -1120,6 +1132,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._test_started_at: Optional[float] = None  ## 采集开始时刻 (monotonic)
         self._eeg_raw_record: List[int] = []  ## 定时测试期间记录的 CH1 raw
         self._eeg_pink_seq_record: List[int] = []  ## 与 raw 平行的粉噪序号（无则 -1）
+        self._eeg_iaf_cHz_record: List[int] = []  ## 与 raw 平行的 IAF（0.01 Hz；未知 -1）
         self._eeg_multi_raw_records: List[List[int]] = [
             [] for _ in range(EEG_MULTI_CHANNEL_COUNT)
         ]  ## multi-channel timed-test raw buffers
@@ -1138,6 +1151,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._osc_sample_count = 0  ## 振子已处理样本数
         self._no_data_ticks = 0  ## EEG 无数据 poll 计数
         self._osc_no_data_ticks = 0  ## 振子无数据 poll 计数
+        self._last_iaf_cHz: Optional[int] = None  ## 最新 IAF（0.01 Hz）
+        self._last_iaf_logged_cHz: Optional[int] = None  ## 上次写入日志的 IAF
         self._last_status_update = 0.0  ## 上次刷新状态栏时刻
         self._display_mode = ""  ## 当前 EEG 显示模式
         self._eeg_channel_mode = "single"  ## single | dual | multi
@@ -1194,6 +1209,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         self._wire_assr_button()
         self._wire_erp_button()
         self._wire_alpha_phase_button()
+        self._wire_post_stim_alpha_button()
+        self._wire_afv_button()
         self._multi_waveform = MultiChannelEegView(
             sample_rate=sample_rate,
             parent=self.ui.plotHost,
@@ -1312,8 +1329,9 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
         self.ui.groupBox_eeg_display.setMinimumHeight(210)
         self.ui.groupBox_osc_display.setMinimumHeight(210)
-        self.ui.groupBox_2.setMinimumHeight(280)
-        self.ui.groupBox_2.hide()
+        ## 第二行含 AFV，加高以免按钮被裁切；EEG/振子页均显示音频区
+        self.ui.groupBox_2.setMinimumHeight(340)
+        self.ui.groupBox_2.show()
         self.ui.pushButton_7.setMinimumSize(92, 42)
 
         self.ui.plainTextEdit.setMinimumSize(420, 82)
@@ -6369,6 +6387,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
     def _clear_eeg_raw_records(self) -> None:
         self._eeg_raw_record.clear()
         self._eeg_pink_seq_record.clear()
+        self._eeg_iaf_cHz_record.clear()
         for record in self._eeg_multi_raw_records:
             record.clear()
 
@@ -6379,6 +6398,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return -1
         return int(seq) & 0xFFFF
 
+    def _current_iaf_cHz_for_record(self) -> int:
+        """采样时刻携带的最新 IAF（0.01 Hz）；尚未收到则为 -1。"""
+        if self._last_iaf_cHz is None:
+            return -1
+        return int(self._last_iaf_cHz) & 0xFFFF
+
     def _record_eeg_sample_for_timed_test(self, sample) -> None:
         if not self._is_test_recording_phase():
             return
@@ -6386,9 +6411,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._append_long_record_sample(sample)
             return
         self._eeg_raw_record.append(sample.channel1)
-        # pink_seq 仅单通道协议写入 CSV；多通道保持原列格式
+        # pink_seq / iaf_cHz 仅单通道协议写入 CSV；多通道保持原列格式
         if self._eeg_protocol_channel_count() == 1:
             self._eeg_pink_seq_record.append(self._sample_pink_seq(sample))
+            self._eeg_iaf_cHz_record.append(self._current_iaf_cHz_for_record())
         expected_channels = self._eeg_protocol_channel_count()
         channels = sample.channels[:expected_channels]
         for index, value in enumerate(channels):
@@ -6428,6 +6454,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             sample_rate = measured
         return sample_rate
 
+    @staticmethod
+    def _align_side_column(
+        values: Optional[Iterable[int]],
+        length: int,
+        *,
+        fill: int = -1,
+    ) -> np.ndarray:
+        """将旁路列（pink_seq / iaf_cHz）对齐到 raw 长度。"""
+        seq = [] if values is None else list(values)
+        if len(seq) < length:
+            seq.extend([fill] * (length - len(seq)))
+        elif len(seq) > length:
+            seq = seq[:length]
+        return np.asarray(seq, dtype=np.int64)
+
     def _save_eeg_raw_csv(
         self,
         *,
@@ -6435,16 +6476,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         name_stem: str = "eeg_raw",
         raw_values: Optional[Iterable[int]] = None,
         pink_seq_values: Optional[Iterable[int]] = None,
+        iaf_cHz_values: Optional[Iterable[int]] = None,
         channel_column: str = "ch1_raw",
         quiet_empty: bool = False,
         save_cleaned: bool = True,
         include_pink_seq: bool = True,
+        include_iaf: bool = True,
     ) -> Optional[Tuple[Optional[Path], Path, float, float]]:
         """保存当前缓冲。
 
         save_cleaned=True：同时写 {stem}.csv（本段当场剔坏，仅适合单段短时测试）。
         长时 chunk 应 save_cleaned=False，只写 *_full.csv；剔坏文件改由路径B在结束后统一生成。
-        include_pink_seq：仅单通道录制写 pink_seq；多通道保持原列。
+        include_pink_seq / include_iaf：仅单通道录制写旁路列；多通道保持原列。
         """
         record = list(self._eeg_raw_record if raw_values is None else raw_values)
         if not record:
@@ -6452,16 +6495,17 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._log("定时测试结束，但没有 EEG raw 数据可保存")
             return None
         pink: Optional[np.ndarray] = None
+        iaf: Optional[np.ndarray] = None
         if include_pink_seq:
-            if pink_seq_values is None:
-                pink_seq = list(self._eeg_pink_seq_record)
-            else:
-                pink_seq = list(pink_seq_values)
-            if len(pink_seq) < len(record):
-                pink_seq.extend([-1] * (len(record) - len(pink_seq)))
-            elif len(pink_seq) > len(record):
-                pink_seq = pink_seq[: len(record)]
-            pink = np.asarray(pink_seq, dtype=np.int64)
+            pink = self._align_side_column(
+                self._eeg_pink_seq_record if pink_seq_values is None else pink_seq_values,
+                len(record),
+            )
+        if include_iaf:
+            iaf = self._align_side_column(
+                self._eeg_iaf_cHz_record if iaf_cHz_values is None else iaf_cHz_values,
+                len(record),
+            )
         if session_dir is None:
             session_dir = self._resolve_session_dir()
         else:
@@ -6478,23 +6522,33 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             quality = build_threshold_rejection(raw.astype(np.float64), sample_rate)
             reject_rate = quality.reject_rate
             suspicious_rate = quality.suspicious_rate
-        header = (
-            ["index", "time_s", channel_column, "pink_seq"]
-            if include_pink_seq
-            else ["index", "time_s", channel_column]
-        )
+        header = ["index", "time_s", channel_column]
+        if include_pink_seq:
+            header.append("pink_seq")
+        if include_iaf:
+            header.append("iaf_cHz")
+
+        def _row(index: int, value: int, pink_v: int = -1, iaf_v: int = -1) -> list:
+            row = [index, index / sample_rate, int(value)]
+            if include_pink_seq:
+                row.append(int(pink_v))
+            if include_iaf:
+                row.append(int(iaf_v))
+            return row
+
         try:
             with full_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(header)
-                if include_pink_seq and pink is not None:
-                    for index, value in enumerate(raw):
-                        writer.writerow(
-                            [index, index / sample_rate, int(value), int(pink[index])]
+                for index, value in enumerate(raw):
+                    writer.writerow(
+                        _row(
+                            index,
+                            int(value),
+                            int(pink[index]) if pink is not None else -1,
+                            int(iaf[index]) if iaf is not None else -1,
                         )
-                else:
-                    for index, value in enumerate(raw):
-                        writer.writerow([index, index / sample_rate, int(value)])
+                    )
             self._log(
                 f"EEG raw 全量已保存: {full_path} ({raw.size} 点 @ {sample_rate:.0f} Hz)"
             )
@@ -6505,26 +6559,39 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                     raw, quality, sample_rate=sample_rate
                 )
                 kept_index = np.asarray(kept_index, dtype=np.int64)
-                cleaned_pink = None
-                if include_pink_seq and pink is not None:
-                    cleaned_pink = (
-                        pink[kept_index] if kept_index.size else np.zeros(0, dtype=np.int64)
+                cleaned_pink = (
+                    pink[kept_index]
+                    if include_pink_seq and pink is not None and kept_index.size
+                    else (
+                        np.zeros(0, dtype=np.int64)
+                        if include_pink_seq and pink is not None
+                        else None
                     )
+                )
+                cleaned_iaf = (
+                    iaf[kept_index]
+                    if include_iaf and iaf is not None and kept_index.size
+                    else (
+                        np.zeros(0, dtype=np.int64)
+                        if include_iaf and iaf is not None
+                        else None
+                    )
+                )
                 with cleaned_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(header)
                     for index, value in enumerate(cleaned_raw):
-                        if cleaned_pink is not None:
-                            seq_v = (
-                                int(cleaned_pink[index])
-                                if index < cleaned_pink.size
-                                else -1
-                            )
-                            writer.writerow(
-                                [index, index / sample_rate, int(value), seq_v]
-                            )
-                        else:
-                            writer.writerow([index, index / sample_rate, int(value)])
+                        seq_v = (
+                            int(cleaned_pink[index])
+                            if cleaned_pink is not None and index < cleaned_pink.size
+                            else -1
+                        )
+                        iaf_v = (
+                            int(cleaned_iaf[index])
+                            if cleaned_iaf is not None and index < cleaned_iaf.size
+                            else -1
+                        )
+                        writer.writerow(_row(index, int(value), seq_v, iaf_v))
                 out_cleaned = cleaned_path
                 self._log(
                     f"EEG raw 删减后已保存: {cleaned_path} "
@@ -6561,6 +6628,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 channel_column=f"ch{index + 1}_raw",
                 save_cleaned=True,
                 include_pink_seq=False,
+                include_iaf=False,
             )
             if result is None:
                 continue
@@ -6589,37 +6657,41 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
 
             parts: List[np.ndarray] = []
             pink_parts: List[np.ndarray] = []
+            iaf_parts: List[np.ndarray] = []
             rates: List[float] = []
             # (full_path, concat_start, concat_end)
             spans: List[Tuple[Path, int, int]] = []
             offset = 0
+
+            def _side_col(frame, name: str, n_i: int) -> np.ndarray:
+                if name not in frame.columns:
+                    return np.full(n_i, -1, dtype=np.int64)
+                col = (
+                    pd.to_numeric(frame[name], errors="coerce")
+                    .fillna(-1)
+                    .to_numpy(dtype=np.int64)
+                )
+                if col.size >= n_i:
+                    return col[:n_i]
+                return np.pad(col, (0, n_i - col.size), constant_values=-1)
+
             for full_path in full_files:
                 raw_i, fs_i = load_eeg_csv_with_rate(full_path)
                 raw_i = np.asarray(raw_i, dtype=np.float64)
                 n_i = int(raw_i.size)
                 frame = pd.read_csv(full_path)
-                if "pink_seq" in frame.columns:
-                    pink_i = (
-                        pd.to_numeric(frame["pink_seq"], errors="coerce")
-                        .fillna(-1)
-                        .to_numpy(dtype=np.int64)
-                    )
-                    if pink_i.size >= n_i:
-                        pink_i = pink_i[:n_i]
-                    else:
-                        pink_i = np.pad(
-                            pink_i, (0, n_i - pink_i.size), constant_values=-1
-                        )
-                else:
-                    pink_i = np.full(n_i, -1, dtype=np.int64)
+                pink_i = _side_col(frame, "pink_seq", n_i)
+                iaf_i = _side_col(frame, "iaf_cHz", n_i)
                 parts.append(raw_i)
                 pink_parts.append(pink_i)
+                iaf_parts.append(iaf_i)
                 rates.append(float(fs_i))
                 spans.append((full_path, offset, offset + n_i))
                 offset += n_i
 
             raw = np.concatenate(parts)
             pink_all = np.concatenate(pink_parts)
+            iaf_all = np.concatenate(iaf_parts)
             sample_rate = float(np.median(np.asarray(rates, dtype=np.float64)))
             quality = build_threshold_rejection(raw, sample_rate)
             cleaned, kept_index, n_removed = clean_raw_signal(
@@ -6633,6 +6705,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 mask = (kept_index >= i0) & (kept_index < i1)
                 seg = cleaned[mask]
                 seg_pink = pink_all[kept_index[mask]] if np.any(mask) else np.zeros(0, dtype=np.int64)
+                seg_iaf = iaf_all[kept_index[mask]] if np.any(mask) else np.zeros(0, dtype=np.int64)
                 name = full_path.name
                 if name.lower().endswith("_full.csv"):
                     out_name = name[: -len("_full.csv")] + ".csv"
@@ -6641,11 +6714,12 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 out_path = session_dir / out_name
                 with out_path.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
-                    writer.writerow(["index", "time_s", "ch1_raw", "pink_seq"])
+                    writer.writerow(["index", "time_s", "ch1_raw", "pink_seq", "iaf_cHz"])
                     for index, value in enumerate(seg):
                         seq_v = int(seg_pink[index]) if index < seg_pink.size else -1
+                        iaf_v = int(seg_iaf[index]) if index < seg_iaf.size else -1
                         writer.writerow(
-                            [index, index / sample_rate, int(value), seq_v]
+                            [index, index / sample_rate, int(value), seq_v, iaf_v]
                         )
                 saved.append(out_path)
                 self._log(
@@ -6743,7 +6817,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         path = self._long_session_dir / f"eeg_chunk_{self._long_chunks_saved:03d}_full.csv"
         handle = path.open("w", newline="", encoding="utf-8")
         writer = csv.writer(handle)
-        writer.writerow(["index", "time_s", "ch1_raw", "pink_seq"])
+        writer.writerow(["index", "time_s", "ch1_raw", "pink_seq", "iaf_cHz"])
         self._long_full_handle = handle
         self._long_full_writer = writer
         self._long_full_path = path
@@ -6759,7 +6833,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         fs = float(MCU_SAMPLE_RATE)
         idx = self._long_sample_index
         self._long_full_writer.writerow(
-            [idx, idx / fs, int(sample.channel1), self._sample_pink_seq(sample)]
+            [
+                idx,
+                idx / fs,
+                int(sample.channel1),
+                self._sample_pink_seq(sample),
+                self._current_iaf_cHz_for_record(),
+            ]
         )
         self._long_sample_index += 1
         self._long_pending_since_flush += 1
@@ -6925,6 +7005,18 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         if btn is None:
             return
         btn.clicked.connect(self._on_alpha_phase_clicked)
+
+    def _wire_post_stim_alpha_button(self) -> None:
+        btn = getattr(self.ui, "pushButton_post_stim_alpha", None)
+        if btn is None:
+            return
+        btn.clicked.connect(self._on_post_stim_alpha_clicked)
+
+    def _wire_afv_button(self) -> None:
+        btn = getattr(self.ui, "pushButton_afv", None)
+        if btn is None:
+            return
+        btn.clicked.connect(self._on_afv_clicked)
 
     @QtCore.pyqtSlot()
     def _on_erp_analyze_clicked(self) -> None:
@@ -7178,7 +7270,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             color="#6A1B9A",
             ls=":",
             lw=1.4,
-            label=f"P1 {result.p1_latency_ms:.0f} ms",
+            label=f"P1 {result.p1_latency_ms:.1f} ms",
         )
         ax2.set_xlabel("Latency (ms)")
         ax2.set_ylabel("α (filtered)")
@@ -7211,6 +7303,395 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(dialog, "导出失败", str(exc))
                 return
             self._log(f"α 锁相结果已导出: {out_path}")
+            QtWidgets.QMessageBox.information(dialog, "导出成功", f"已保存:\n{out_path}")
+
+        export_btn.clicked.connect(_export)
+        close_btn.clicked.connect(dialog.accept)
+        dialog.exec_()
+
+    @QtCore.pyqtSlot()
+    def _on_post_stim_alpha_clicked(self) -> None:
+        start_dir = ""
+        if self._last_eeg_session_dir is not None:
+            start_dir = str(self._last_eeg_session_dir)
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择含 pink_seq 的 EEG CSV（α 功率前后对比）",
+            start_dir,
+            "CSV (*.csv);;All (*.*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            result = analyze_post_stim_alpha_csv(path)
+        except Exception as exc:
+            self._log(f"α 功率前后对比失败: {exc}")
+            QtWidgets.QMessageBox.warning(self, "α 功率前后", f"分析失败:\n{exc}")
+            return
+        for line in format_post_stim_alpha_report(result).splitlines():
+            self._log(line)
+        self._show_post_stim_alpha_result_dialog(path, result)
+
+    def _show_post_stim_alpha_result_dialog(
+        self, source_path: Path, result: PostStimAlphaAnalysis
+    ) -> None:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"α 功率前后对比 — {source_path.name}")
+        dialog.resize(960, 720)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        report = QtWidgets.QPlainTextEdit()
+        report.setReadOnly(True)
+        report.setMaximumBlockCount(80)
+        report.setPlainText(format_post_stim_alpha_report(result))
+        report.setMaximumHeight(180)
+        layout.addWidget(report)
+
+        fig = Figure(figsize=(9.4, 5.6), tight_layout=True)
+        canvas = FigureCanvasQTAgg(fig)
+
+        m_stim = np.asarray(result.matched_stim.values_db, dtype=np.float64)
+        m_sham = np.asarray(result.matched_sham.values_db, dtype=np.float64)
+        matched_ok = m_stim.size >= 8 and m_sham.size >= 8
+
+        ## 左上：匹配刺激 ΔdB 直方图（无匹配则退回全体刺激）
+        ax0 = fig.add_subplot(221)
+        vals0 = m_stim if matched_ok else np.asarray(result.stim.values_db, dtype=np.float64)
+        med0 = result.matched_stim.median_db if matched_ok else result.stim.median_db
+        frac0 = result.matched_stim.frac_pos if matched_ok else result.stim.frac_pos
+        n0 = result.matched_stim.n if matched_ok else result.stim.n
+        if vals0.size:
+            ax0.hist(vals0, bins=40, color="#0d6e6e", alpha=0.85, edgecolor="none")
+            ax0.axvline(0.0, color="#94a3b8", ls=":", lw=1.0)
+            if np.isfinite(med0):
+                ax0.axvline(
+                    med0,
+                    color="#C62828",
+                    ls="--",
+                    lw=1.5,
+                    label=f"中位 {med0:.2f} dB",
+                )
+                ax0.legend(loc="upper right", fontsize=8)
+        ax0.set_xlabel("ΔdB = 10·log10(P_post/P_pre)")
+        ax0.set_ylabel("事件数")
+        ax0.set_title(
+            f"{'匹配刺激' if matched_ok else '全体刺激'} ΔdB"
+            f"（增强 {frac0:.0%}，n={n0}）"
+        )
+        ax0.grid(True, alpha=0.3)
+
+        ## 右上：匹配刺激 vs 匹配伪Sham（主对照）；附未匹配正峰
+        ax1 = fig.add_subplot(222)
+        box_data = []
+        box_labels = []
+        colors = []
+        if matched_ok:
+            box_data.extend([m_stim, m_sham])
+            box_labels.extend(
+                [
+                    f"匹配刺激\n{result.matched_stim.n}",
+                    f"匹配伪Sham\n{result.matched_sham.n}",
+                ]
+            )
+            colors.extend(["#99d6d6", "#fbbf24"])
+        else:
+            all_stim = np.asarray(result.stim.values_db, dtype=np.float64)
+            if all_stim.size:
+                box_data.append(all_stim)
+                box_labels.append(f"真实粉噪\n{result.stim.n}")
+                colors.append("#99d6d6")
+        sham_all = np.asarray(result.sham_peak.values_db, dtype=np.float64)
+        if sham_all.size >= 8:
+            box_data.append(sham_all)
+            box_labels.append(f"未匹配正峰\n{result.sham_peak.n}")
+            colors.append("#e5e7eb")
+        if not box_data:
+            box_data = [[0.0]]
+            box_labels = ["无数据"]
+            colors = ["#e5e7eb"]
+        try:
+            bp = ax1.boxplot(
+                box_data, tick_labels=box_labels, patch_artist=True, showfliers=False
+            )
+        except TypeError:
+            bp = ax1.boxplot(
+                box_data, labels=box_labels, patch_artist=True, showfliers=False
+            )
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+        ax1.axhline(0.0, color="#94a3b8", ls=":", lw=1.0)
+        ax1.set_ylabel("ΔdB")
+        if matched_ok and np.isfinite(result.match_delta_db_diff):
+            ax1.set_title(
+                f"主对照：Stim−Sham={result.match_delta_db_diff:+.2f} dB"
+                f"（P_pre比 {result.match_pre_ratio_median:.2f}）"
+            )
+        elif sham_all.size >= 8 and np.isfinite(result.sham_peak.median_db):
+            ax1.set_title(
+                f"未匹配对照：刺激 {result.stim.median_db:.2f} / "
+                f"正峰 {result.sham_peak.median_db:.2f} dB"
+            )
+        else:
+            ax1.set_title("匹配伪Sham 不足（刺激过密时常见）")
+        ax1.grid(True, axis="y", alpha=0.3)
+
+        ## 左下：刺激 vs 匹配伪Sham 包络
+        ax2 = fig.add_subplot(223)
+        t = result.times_ms
+        lo = result.envelope_average - result.envelope_sem
+        hi = result.envelope_average + result.envelope_sem
+        ax2.fill_between(t, lo, hi, color="#0d6e6e", alpha=0.22, linewidth=0)
+        ax2.plot(t, result.envelope_average, color="#0d6e6e", lw=1.6, label="刺激")
+        if matched_ok and np.any(np.abs(result.matched_envelope_average) > 0):
+            mlo = result.matched_envelope_average - result.matched_envelope_sem
+            mhi = result.matched_envelope_average + result.matched_envelope_sem
+            ax2.fill_between(t, mlo, mhi, color="#b45309", alpha=0.18, linewidth=0)
+            ax2.plot(
+                t,
+                result.matched_envelope_average,
+                color="#b45309",
+                lw=1.4,
+                ls="--",
+                label="匹配伪Sham",
+            )
+        ax2.axvline(0.0, color="#C62828", ls="--", lw=1.2, label="α 正峰")
+        ax2.axvspan(-result.window_ms, 0.0, color="#94a3b8", alpha=0.12)
+        ax2.axvspan(0.0, result.window_ms, color="#38bdf8", alpha=0.12)
+        ax2.set_xlabel("相对 α 正峰 (ms)")
+        ax2.set_ylabel("α 包络")
+        lag = result.onset_minus_peak_median_ms
+        lag_tip = (
+            f"；onset−峰中位 {lag:+.0f} ms" if np.isfinite(lag) else ""
+        )
+        ax2.set_title(f"锁定 α 包络（两边均对齐正峰）{lag_tip}")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="upper right", fontsize=8)
+
+        ## 右下：匹配伪Sham ΔdB 直方图
+        ax3 = fig.add_subplot(224)
+        if matched_ok:
+            ax3.hist(m_sham, bins=40, color="#b45309", alpha=0.85, edgecolor="none")
+            ax3.axvline(0.0, color="#94a3b8", ls=":", lw=1.0)
+            ax3.axvline(
+                result.matched_sham.median_db,
+                color="#C62828",
+                ls="--",
+                lw=1.5,
+                label=f"中位 {result.matched_sham.median_db:.2f} dB",
+            )
+            ax3.legend(loc="upper right", fontsize=8)
+            ax3.set_title(
+                f"匹配伪Sham ΔdB（增强 {result.matched_sham.frac_pos:.0%}，"
+                f"n={result.matched_sham.n}）"
+            )
+        else:
+            ax3.text(
+                0.5,
+                0.5,
+                "匹配伪Sham 不足\n（需远离粉噪且 P_pre±20% 的正峰）",
+                ha="center",
+                va="center",
+                transform=ax3.transAxes,
+                color="#64748b",
+                fontsize=11,
+            )
+            ax3.set_title("匹配伪Sham ΔdB")
+        ax3.set_xlabel("ΔdB = 10·log10(P_post/P_pre)")
+        ax3.set_ylabel("事件数")
+        ax3.grid(True, alpha=0.3)
+
+        layout.addWidget(canvas)
+
+        buttons = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("导出结果 CSV")
+        close_btn = QtWidgets.QPushButton("关闭")
+        buttons.addStretch(1)
+        buttons.addWidget(export_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        def _export() -> None:
+            default_name = f"{source_path.stem}_post_stim_alpha_summary.csv"
+            out_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dialog,
+                "导出 α 功率前后结果",
+                str(source_path.with_name(default_name)),
+                "CSV (*.csv)",
+            )
+            if not out_str:
+                return
+            try:
+                out_path = export_post_stim_alpha_summary_csv(Path(out_str), result)
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(dialog, "导出失败", str(exc))
+                return
+            self._log(f"α 功率前后结果已导出: {out_path}")
+            QtWidgets.QMessageBox.information(dialog, "导出成功", f"已保存:\n{out_path}")
+
+        export_btn.clicked.connect(_export)
+        close_btn.clicked.connect(dialog.accept)
+        dialog.exec_()
+
+    @QtCore.pyqtSlot()
+    def _on_afv_clicked(self) -> None:
+        start_dir = ""
+        if self._last_eeg_session_dir is not None:
+            start_dir = str(self._last_eeg_session_dir)
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择 EEG CSV（AFV / α 频率变异）",
+            start_dir,
+            "CSV (*.csv);;All (*.*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            result = analyze_afv_csv(path)
+        except Exception as exc:
+            self._log(f"AFV 分析失败: {exc}")
+            QtWidgets.QMessageBox.warning(self, "AFV 变化率", f"分析失败:\n{exc}")
+            return
+        for line in format_afv_report(result).splitlines():
+            self._log(line)
+        self._show_afv_result_dialog(path, result)
+
+    def _show_afv_result_dialog(self, source_path: Path, result: AfvAnalysis) -> None:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"AFV 变化率 — {source_path.name}")
+        dialog.resize(960, 720)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        report = QtWidgets.QPlainTextEdit()
+        report.setReadOnly(True)
+        report.setMaximumBlockCount(80)
+        report.setPlainText(format_afv_report(result))
+        report.setMaximumHeight(140)
+        layout.addWidget(report)
+
+        fig = Figure(figsize=(9.4, 5.6), tight_layout=True)
+        canvas = FigureCanvasQTAgg(fig)
+
+        ## 左上：滑动窗 AFV 随时间（变化过程）
+        ax0 = fig.add_subplot(221)
+        if result.slide_times_s.size:
+            ax0.plot(
+                result.slide_times_s,
+                result.slide_afv_hz,
+                color="#0d6e6e",
+                lw=1.6,
+                label="滑动 AFV",
+            )
+            ax0.axhline(
+                result.afv_hz,
+                color="#94a3b8",
+                ls=":",
+                lw=1.0,
+                label=f"全段 {result.afv_hz:.3f} Hz",
+            )
+            if np.isfinite(result.paper_afv_hz):
+                ax0.axhline(
+                    result.paper_afv_hz,
+                    color="#C62828",
+                    ls="--",
+                    lw=1.2,
+                    label=f"前{result.paper_window_s:.0f}s {result.paper_afv_hz:.3f}",
+                )
+            ax0.legend(loc="upper right", fontsize=8)
+        ax0.set_xlabel("时间 (s)")
+        ax0.set_ylabel("AFV (Hz)")
+        ax0.set_title("滑动窗 AFV（30 s 窗）")
+        ax0.grid(True, alpha=0.3)
+
+        ## 右上：早/晚 AFV + 变化率
+        ax1 = fig.add_subplot(222)
+        bars = [result.early_afv_hz, result.late_afv_hz]
+        colors = ["#99d6d6", "#fde68a"]
+        ax1.bar([0, 1], bars, color=colors, width=0.55)
+        ax1.set_xticks([0, 1])
+        ax1.set_xticklabels(["早半段", "晚半段"])
+        ax1.set_ylabel("AFV (Hz)")
+        cr = result.change_rate
+        cr_txt = f"{cr:+.1%}" if np.isfinite(cr) else "N/A"
+        ax1.set_title(f"早→晚变化率 {cr_txt}")
+        ax1.grid(True, axis="y", alpha=0.3)
+        for i, v in enumerate(bars):
+            if np.isfinite(v):
+                ax1.text(i, v, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+
+        ## 左下：瞬时频率散点 / 轨迹
+        ax2 = fig.add_subplot(223)
+        if result.inst_times_s.size:
+            ax2.plot(
+                result.inst_times_s,
+                result.inst_freq_hz,
+                color="#0369a1",
+                lw=0.6,
+                alpha=0.55,
+            )
+            ax2.axhline(
+                result.median_freq_hz,
+                color="#C62828",
+                ls="--",
+                lw=1.2,
+                label=f"中位 {result.median_freq_hz:.2f} Hz",
+            )
+            ax2.legend(loc="upper right", fontsize=8)
+        ax2.set_xlabel("时间 (s)")
+        ax2.set_ylabel("瞬时频率 (Hz)")
+        ax2.set_title(f"α 瞬时频率（n={result.n_intervals}）")
+        ax2.set_ylim(6.5, 13.5)
+        ax2.grid(True, alpha=0.3)
+
+        ## 右下：瞬时频率直方图
+        ax3 = fig.add_subplot(224)
+        if result.inst_freq_hz.size:
+            ax3.hist(
+                result.inst_freq_hz,
+                bins=40,
+                color="#0d6e6e",
+                alpha=0.85,
+                edgecolor="none",
+            )
+            ax3.axvline(result.median_freq_hz, color="#C62828", ls="--", lw=1.5)
+        ax3.set_xlabel("瞬时频率 (Hz)")
+        ax3.set_ylabel("间隔数")
+        ax3.set_title(f"频率分布 · AFV={result.afv_hz:.4f} Hz")
+        ax3.grid(True, alpha=0.3)
+
+        layout.addWidget(canvas)
+
+        buttons = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("导出结果 CSV")
+        close_btn = QtWidgets.QPushButton("关闭")
+        buttons.addStretch(1)
+        buttons.addWidget(export_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        def _export() -> None:
+            default_name = f"{source_path.stem}_afv_summary.csv"
+            out_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dialog,
+                "导出 AFV 结果",
+                str(source_path.with_name(default_name)),
+                "CSV (*.csv)",
+            )
+            if not out_str:
+                return
+            try:
+                out_path = export_afv_summary_csv(Path(out_str), result)
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(dialog, "导出失败", str(exc))
+                return
+            self._log(f"AFV 结果已导出: {out_path}")
             QtWidgets.QMessageBox.information(dialog, "导出成功", f"已保存:\n{out_path}")
 
         export_btn.clicked.connect(_export)
@@ -7386,10 +7867,10 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             self._assr_raw.append(int(raw))
 
     def _set_audio_panel_visible(self, visible: bool) -> None:
-        """音频面板只在振子页显示，不出现在 EEG 界面。"""
+        """音频面板（含 ERP / α / AFV）在 EEG 与振子页均保持显示。"""
         panel = getattr(self.ui, "groupBox_2", None)
         if panel is not None:
-            panel.setVisible(visible)
+            panel.setVisible(True)
 
     def _set_eeg_analysis_panels_visible(self, visible: bool) -> None:
         """离线查看 / 功率对比只在 EEG 页显示，不出现在振子界面。"""
@@ -8230,16 +8711,21 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             mode = self._current_display_mode()
             rx = self._rhythm.measured_sample_rate
             rx_text = f"{rx:.0f}" if rx is not None else "—"
+            if self._last_iaf_cHz is not None:
+                iaf_text = f"  |  IAF {self._last_iaf_cHz / 100.0:.2f} Hz"
+            else:
+                iaf_text = ""
             if mode == "raw":
                 self.ui.statusbar.showMessage(
-                    f"RAW CH1 (串口)  |  显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
+                    f"RAW CH1 (串口)  |  显示≈{RAW_DISPLAY_RATE} Hz  |  "
+                    f"接收≈{rx_text} Hz{iaf_text}"
                 )
             else:
                 label = BAND_LABELS[mode]
                 low_hz, high_hz = EEG_BANDS[mode]
                 self.ui.statusbar.showMessage(
                     f"{label} {low_hz:g}-{high_hz:g} Hz (串口)  |  "
-                    f"显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz"
+                    f"显示≈{RAW_DISPLAY_RATE} Hz  |  接收≈{rx_text} Hz{iaf_text}"
                 )
 
     @QtCore.pyqtSlot()
@@ -8302,6 +8788,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 flushed = self._link.flush_input_buffer()
                 self._link.bytes_received = 0
                 self._sample_count = 0
+                self._last_iaf_cHz = None
+                self._last_iaf_logged_cHz = None
                 self._no_data_ticks = 0
                 self._decim_counter = 0
                 self._last_status_update = 0.0
@@ -8341,6 +8829,13 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
             return
         if not self._running:
             return
+        iaf_updates = self._link.take_iaf_updates()
+        if iaf_updates:
+            latest = iaf_updates[-1]
+            self._last_iaf_cHz = latest.iaf_cHz
+            if latest.iaf_cHz != self._last_iaf_logged_cHz:
+                self._last_iaf_logged_cHz = latest.iaf_cHz
+                self._log(f"IAF 更新: {latest.iaf_hz:.2f} Hz")
         samples = self._eeg_pump.take_all() if self._eeg_pump is not None else []
         got_bytes = self._link.bytes_received
 

@@ -1202,7 +1202,7 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
            <property name="minimumSize">
             <size>
              <width>0</width>
-             <height>280</height>
+             <height>340</height>
             </size>
            </property>
            <property name="title">
@@ -1372,7 +1372,72 @@ QScrollArea &gt; QWidget &gt; QWidget { background: transparent; }</string>
                </widget>
               </item>
               <item>
+               <widget class="QPushButton" name="pushButton_post_stim_alpha">
+                <property name="minimumSize">
+                 <size>
+                  <width>120</width>
+                  <height>40</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>选择含 pink_seq 的 CSV，对比粉噪刺激前后 α 功率（ΔdB / 包络图）</string>
+                </property>
+                <property name="text">
+                 <string>α 功率前后...</string>
+                </property>
+               </widget>
+              </item>
+              <item>
                <spacer name="horizontalSpacer_audioButtonsRight">
+                <property name="orientation">
+                 <enum>Qt::Horizontal</enum>
+                </property>
+                <property name="sizeHint" stdset="0">
+                 <size>
+                  <width>40</width>
+                  <height>20</height>
+                 </size>
+                </property>
+               </spacer>
+              </item>
+             </layout>
+            </item>
+            <item row="7" column="0" colspan="3">
+             <layout class="QHBoxLayout" name="horizontalLayout_audioButtons2">
+              <property name="spacing">
+               <number>12</number>
+              </property>
+              <item>
+               <spacer name="horizontalSpacer_audioButtons2Left">
+                <property name="orientation">
+                 <enum>Qt::Horizontal</enum>
+                </property>
+                <property name="sizeHint" stdset="0">
+                 <size>
+                  <width>40</width>
+                  <height>20</height>
+                 </size>
+                </property>
+               </spacer>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pushButton_afv">
+                <property name="minimumSize">
+                 <size>
+                  <width>120</width>
+                  <height>40</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>选择 EEG CSV，查看 α 频率变异（AFV）及早/晚段变化率</string>
+                </property>
+                <property name="text">
+                 <string>AFV 变化率...</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <spacer name="horizontalSpacer_audioButtons2Right">
                 <property name="orientation">
                  <enum>Qt::Horizontal</enum>
                 </property>

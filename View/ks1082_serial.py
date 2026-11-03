@@ -1,10 +1,14 @@
 """
 KS1082 / 上位机串口协议。
 
-单通道（HostUart_SendEeg，每采样 1 帧 9 字节）：
-  AA 55 | 01 | 04 | seq_L seq_H | eeg_L eeg_H | xor
-  xor = 01 ^ 04 ^ payload[0..3]
-  seq / eeg 均为小端 uint16。
+单通道成帧（每帧 9 字节）：
+  AA 55 | type | len | payload[len] | xor
+  xor = type ^ len ^ payload[0..len-1]
+
+  type=0x01 EEG（HostUart_SendEeg）：
+    payload = seq_L seq_H | eeg_L eeg_H（小端 uint16）
+  type=0x02 IAF（HostUart_SendIaf）：
+    payload = iaf_L iaf_H | 0x00 0x00（iaf 单位 0.01 Hz）
 
 多通道（≥2）仍使用旧线格式：
   send_data_cnt == 0 时先发校位 0xFF，再发各通道 L/H；
@@ -27,12 +31,14 @@ except ImportError as exc:  # pragma: no cover
 else:
     _SERIAL_IMPORT_ERROR = None
 
-# 单通道成帧协议（与 HostUart_SendEeg 一致）
+# 单通道成帧协议（与 HostUart_SendEeg / HostUart_SendIaf 一致）
 HOST_UART_SYNC0 = 0xAA
 HOST_UART_SYNC1 = 0x55
 HOST_UART_TYPE_EEG = 0x01
+HOST_UART_TYPE_IAF = 0x02
 HOST_UART_LEN_EEG = 0x04
-HOST_UART_FRAME_SIZE = 2 + 1 + 1 + HOST_UART_LEN_EEG + 1  ## 9
+HOST_UART_LEN_IAF = 0x04
+HOST_UART_FRAME_SIZE = 2 + 1 + 1 + HOST_UART_LEN_EEG + 1  ## 9（EEG/IAF 同长）
 
 # 多通道旧协议
 SYNC_BYTE = 0xFF
@@ -100,9 +106,25 @@ class AdcSample:
         return cls(channel1=values[0] if values else 0, channels=values)
 
 
+@dataclass(frozen=True)
+class IafUpdate:
+    """下位机 HostUart_SendIaf 一帧；iaf_cHz 单位为 0.01 Hz。"""
+
+    iaf_cHz: int
+
+    @property
+    def iaf_hz(self) -> float:
+        return float(self.iaf_cHz) / 100.0
+
+    @classmethod
+    def from_framed_payload(cls, payload: bytes) -> "IafUpdate":
+        iaf_cHz = AdcSample.decode_u16_le(payload[0], payload[1], escape=False)
+        return cls(iaf_cHz=iaf_cHz)
+
+
 class AdcStreamParser:
     """
-    单通道：解析 AA 55 | 01 | 04 | seq | eeg | xor。
+    单通道：解析 AA 55 | type | len | payload | xor（EEG / IAF）。
     多通道：旧 send_data_cnt + 0xFF 校位协议。
     """
 
@@ -113,6 +135,8 @@ class AdcStreamParser:
         self._buf = bytearray()
         self._ticks_in_group = 0
         self._channel_count = getattr(self, "_channel_count", 1)
+        self.last_iaf_cHz: Optional[int] = None
+        self._pending_iaf: List[IafUpdate] = []
 
     def set_channel_count(self, channel_count: int) -> None:
         """Switch between single-channel, two-channel and six-channel wire protocols."""
@@ -166,9 +190,14 @@ class AdcStreamParser:
         if CH2_BYTES_ON_WIRE > 0 and len(self._buf) >= CH2_BYTES_ON_WIRE:
             del self._buf[:CH2_BYTES_ON_WIRE]
 
+    def take_pending_iaf(self) -> List[IafUpdate]:
+        out = self._pending_iaf
+        self._pending_iaf = []
+        return out
+
     @staticmethod
-    def _framed_xor(payload: bytes) -> int:
-        xorv = HOST_UART_TYPE_EEG ^ HOST_UART_LEN_EEG
+    def _framed_xor(frame_type: int, length: int, payload: bytes) -> int:
+        xorv = int(frame_type) ^ int(length)
         for value in payload:
             xorv ^= value
         return xorv & 0xFF
@@ -202,18 +231,24 @@ class AdcStreamParser:
             length = self._buf[3]
             payload = bytes(self._buf[4:8])
             checksum = self._buf[8]
-            if (
-                frame_type != HOST_UART_TYPE_EEG
-                or length != HOST_UART_LEN_EEG
-                or checksum != self._framed_xor(payload)
-            ):
-                # 坏帧：丢掉当前 AA，从下一个字节继续找头
+            if checksum != self._framed_xor(frame_type, length, payload):
+                # 坏校验：丢掉当前 AA，从下一个字节继续找头
                 del self._buf[0]
                 continue
-            seq = AdcSample.decode_u16_le(payload[0], payload[1], escape=False)
-            eeg = AdcSample.decode_u16_le(payload[2], payload[3], escape=False)
-            out.append(AdcSample.from_framed_eeg(seq, eeg))
-            del self._buf[:HOST_UART_FRAME_SIZE]
+            if frame_type == HOST_UART_TYPE_EEG and length == HOST_UART_LEN_EEG:
+                seq = AdcSample.decode_u16_le(payload[0], payload[1], escape=False)
+                eeg = AdcSample.decode_u16_le(payload[2], payload[3], escape=False)
+                out.append(AdcSample.from_framed_eeg(seq, eeg))
+                del self._buf[:HOST_UART_FRAME_SIZE]
+                continue
+            if frame_type == HOST_UART_TYPE_IAF and length == HOST_UART_LEN_IAF:
+                update = IafUpdate.from_framed_payload(payload)
+                self.last_iaf_cHz = update.iaf_cHz
+                self._pending_iaf.append(update)
+                del self._buf[:HOST_UART_FRAME_SIZE]
+                continue
+            # 未知 type/len：丢掉当前 AA，继续找头
+            del self._buf[0]
         return out
 
     def _parse_legacy_multi(self) -> List[AdcSample]:
@@ -293,6 +328,20 @@ class Ks1082Serial:
         self.bytes_received = 0
         self._recent_raw.clear()
         self._io_enabled = True
+
+    @property
+    def last_iaf_cHz(self) -> Optional[int]:
+        return self._parser.last_iaf_cHz
+
+    @property
+    def last_iaf_hz(self) -> Optional[float]:
+        value = self._parser.last_iaf_cHz
+        return None if value is None else float(value) / 100.0
+
+    def take_iaf_updates(self) -> List[IafUpdate]:
+        """取出自上次调用以来解析到的 IAF 帧（线程安全）。"""
+        with self._io_lock:
+            return self._parser.take_pending_iaf()
 
     def close(self) -> None:
         # Disable I/O first so any in-flight drain exits quickly, then close under lock.

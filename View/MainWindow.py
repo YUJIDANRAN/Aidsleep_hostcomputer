@@ -480,7 +480,7 @@ class Ui_MainWindow(object):
         self.gridLayout_compare.addWidget(self.checkBox_reject_mask_power, 5, 0, 1, 5)
         self.verticalLayout_functionScrollContent.addWidget(self.groupBox_compare)
         self.groupBox_2 = QtWidgets.QGroupBox(self.functionScrollContent)
-        self.groupBox_2.setMinimumSize(QtCore.QSize(0, 280))
+        self.groupBox_2.setMinimumSize(QtCore.QSize(0, 340))
         self.groupBox_2.setObjectName("groupBox_2")
         self.gridLayout_audio = QtWidgets.QGridLayout(self.groupBox_2)
         self.gridLayout_audio.setContentsMargins(14, 22, 14, 14)
@@ -543,9 +543,25 @@ class Ui_MainWindow(object):
         self.pushButton_alpha_phase.setMinimumSize(QtCore.QSize(108, 40))
         self.pushButton_alpha_phase.setObjectName("pushButton_alpha_phase")
         self.horizontalLayout_audioButtons.addWidget(self.pushButton_alpha_phase)
+        self.pushButton_post_stim_alpha = QtWidgets.QPushButton(self.groupBox_2)
+        self.pushButton_post_stim_alpha.setMinimumSize(QtCore.QSize(120, 40))
+        self.pushButton_post_stim_alpha.setObjectName("pushButton_post_stim_alpha")
+        self.horizontalLayout_audioButtons.addWidget(self.pushButton_post_stim_alpha)
         spacerItem4 = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
         self.horizontalLayout_audioButtons.addItem(spacerItem4)
         self.gridLayout_audio.addLayout(self.horizontalLayout_audioButtons, 6, 0, 1, 3)
+        self.horizontalLayout_audioButtons2 = QtWidgets.QHBoxLayout()
+        self.horizontalLayout_audioButtons2.setSpacing(12)
+        self.horizontalLayout_audioButtons2.setObjectName("horizontalLayout_audioButtons2")
+        spacerItem_afv_l = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+        self.horizontalLayout_audioButtons2.addItem(spacerItem_afv_l)
+        self.pushButton_afv = QtWidgets.QPushButton(self.groupBox_2)
+        self.pushButton_afv.setMinimumSize(QtCore.QSize(120, 40))
+        self.pushButton_afv.setObjectName("pushButton_afv")
+        self.horizontalLayout_audioButtons2.addWidget(self.pushButton_afv)
+        spacerItem_afv_r = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+        self.horizontalLayout_audioButtons2.addItem(spacerItem_afv_r)
+        self.gridLayout_audio.addLayout(self.horizontalLayout_audioButtons2, 7, 0, 1, 3)
         self.verticalLayout_functionScrollContent.addWidget(self.groupBox_2)
         spacerItem5 = QtWidgets.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding)
         self.verticalLayout_functionScrollContent.addItem(spacerItem5)
@@ -789,6 +805,20 @@ class Ui_MainWindow(object):
             )
         )
         self.pushButton_alpha_phase.setText(_translate("MainWindow", "α 锁相验证..."))
+        self.pushButton_post_stim_alpha.setToolTip(
+            _translate(
+                "MainWindow",
+                "选择含 pink_seq 的 CSV，对比粉噪刺激前后 α 功率（ΔdB / 包络图）",
+            )
+        )
+        self.pushButton_post_stim_alpha.setText(_translate("MainWindow", "α 功率前后..."))
+        self.pushButton_afv.setToolTip(
+            _translate(
+                "MainWindow",
+                "选择 EEG CSV，查看 α 频率变异（AFV）及早/晚段变化率",
+            )
+        )
+        self.pushButton_afv.setText(_translate("MainWindow", "AFV 变化率..."))
         self.bottomPanel.setTitle(_translate("MainWindow", "采集、保存与串口"))
         self.groupBox_log.setTitle(_translate("MainWindow", "运行日志"))
         self.groupBox_record.setTitle(_translate("MainWindow", "定时记录"))

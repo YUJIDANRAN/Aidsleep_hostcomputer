@@ -18,8 +18,8 @@ from erp import (
 )
 
 ALPHA_BANDPASS_HZ = (7.5, 12.5)
-## 标定 P1 潜伏期（ms）；锁相验证严格按此取样，不从同文件 ERP 自动改写
-ALPHA_CALIBRATED_P1_MS = 45.0
+## 与下位机提前发送相位对齐的取样潜伏期（ms）；锁相验证严格按此取样
+ALPHA_CALIBRATED_P1_MS = 47.8
 ALPHA_MIN_EVENTS = 8
 ## 相位约定：0° = α 正峰，±180° = 波谷（Hilbert 角）
 ALPHA_TROUGH_DEG = 180.0
@@ -147,10 +147,10 @@ def _phase_stats(
 
 
 def _resolve_p1_ms(p1_latency_ms: Optional[float]) -> Tuple[float, str]:
-    """严格使用标定 45 ms；仅当调用方显式传入时才覆盖。"""
+    """严格使用下位机对齐潜伏期 47.8 ms；仅当调用方显式传入时才覆盖。"""
     if p1_latency_ms is not None and np.isfinite(p1_latency_ms) and p1_latency_ms >= 0:
         return float(p1_latency_ms), "调用方指定"
-    return float(ALPHA_CALIBRATED_P1_MS), f"标定 {ALPHA_CALIBRATED_P1_MS:.0f} ms"
+    return float(ALPHA_CALIBRATED_P1_MS), f"下位机对齐 {ALPHA_CALIBRATED_P1_MS:.1f} ms"
 
 
 def analyze_alpha_phase_lock(
