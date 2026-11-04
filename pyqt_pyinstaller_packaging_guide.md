@@ -1,1 +1,0 @@
-pyinstaller --noconfirm --clean packaging\HostComputer6.spec

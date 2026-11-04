@@ -1,33 +1,47 @@
-# Runtime outputs
+# ========== 运行输出、数据目录 ==========
 /Result/
-
-# Sample inputs
 /Sample/
 
-# PyInstaller outputs
+# ========== PyInstaller 打包产物 ==========
 /build/
 /dist/
 /packaging/sync_dist.ps1
-
 *.spec.bak
 
-# Local backup folders
+# ========== 本地备份（匹配所有以这个前缀的文件夹） ==========
 /Host_computer_6_nested_backup_*/
 
-# Python cache
+# ========== Python 缓存字节码（你原来的已经够用，保持兼容） ==========
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environments
+# ========== Python 虚拟环境 ==========
 .venv/
 venv/
 env/
 
-# IDE / editor
+# ========== IDE 配置文件 ==========
 .idea/
 .vscode/
 
-# Matlab / Code
+# ========== 外部无关源码目录 ==========
 Closed-Loop-Sleep-Motor-Memory-main/
+
+# ========== 【推荐新增】上位机项目常用补充 ==========
+*.log
+*.csv
+*.txt
+*.mat
+*.edf
+*.xdf
+*.bdf
+*.fif
+*.pkl
+*.npy
+*.npz
+
+# 系统文件
+.DS_Store
+Thumbs.db
