@@ -14,6 +14,7 @@ from pathlib import Path  ## 项目根路径
 from typing import Deque, Dict, Iterable, List, Optional, Tuple  ## 类型标注
 
 import numpy as np
+import pandas as pd
 from scipy.signal import welch
 from PyQt5 import QtCore, QtGui, QtWidgets  ## Qt 界面
 
@@ -10428,7 +10429,7 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
                 self._log("pink 仅在离线查看模式下生效（请先加载含 pink_seq 的 CSV）")
             return
         if checked and self._offline_pink_event_times_s.size == 0:
-            self._log("当前离线数据没有粉噪事件（CSV 需含 pink_seq 列）")
+            self._log("当前离线数据没有粉噪发射点（pink_seq 在本段没有编号跳变）")
         self._refresh_offline_visible_channels()
         if self._active_view != "eeg":
             self._switch_to_eeg_view()
@@ -10438,7 +10439,8 @@ class Ks1082MainWindow(QtWidgets.QMainWindow):
         """读取 CSV 的 pink_seq 列；缺失则返回 None。"""
         try:
             frame = pd.read_csv(path)
-        except Exception:
+        except Exception as exc:
+            self._log(f"读取 pink_seq 失败 ({path.name}): {exc}")
             return None
         columns_lower = {str(col).strip().lower(): col for col in frame.columns}
         if "pink_seq" not in columns_lower:
